@@ -36,7 +36,7 @@ import type { PriceTable } from "../analytics";
 // ---------------------------------------------------------------------------
 
 /** Directories tracetap writes captured logs into, per harness. */
-export const TRACE_DIRS = [".claude-trace", ".codex-trace", ".gemini-trace"];
+export const TRACE_DIRS = [".claude-trace", ".codex-trace", ".gemini-trace", ".devin-trace"];
 
 /** Which per-step text columns a query is matched against. */
 export type SearchField = "message" | "reasoning" | "tool-input" | "tool-output" | "all";
@@ -577,7 +577,7 @@ export class Store {
    * unchanged since the last index it is a no-op (the watermark). Otherwise all
    * prior rows for this source path are dropped and rebuilt in one transaction.
    */
-  indexFile(jsonlPath: string): IndexFileResult {
+  indexFile(jsonlPath: string, opts?: { projectCwd?: string }): IndexFileResult {
     const sourcePath = path.resolve(jsonlPath);
     const st = fs.statSync(sourcePath);
     const content = fs.readFileSync(sourcePath, "utf-8");
@@ -599,7 +599,7 @@ export class Store {
       let steps = 0;
       for (const group of groups) {
         const traj = buildTrajectory(group);
-        steps += this.insertTrajectory(traj, group, sourcePath, contentHash);
+        steps += this.insertTrajectory(traj, group, sourcePath, contentHash, opts?.projectCwd);
         sessions += 1;
       }
       this.db
@@ -633,6 +633,7 @@ export class Store {
     group: PairGroup,
     sourcePath: string,
     contentHash: string,
+    projectCwdOverride?: string,
   ): number {
     const stats = analyze(traj, this.prices ? { prices: this.prices } : {});
 
@@ -666,7 +667,7 @@ export class Store {
         traj.sessionId,
         traj.agent?.name ?? "unknown",
         traj.agent?.model ?? "",
-        projectCwdFor(sourcePath),
+        projectCwdOverride && projectCwdOverride.trim() ? projectCwdOverride : projectCwdFor(sourcePath),
         startedAt,
         endedAt,
         stats.wallClockMs,

@@ -37,6 +37,7 @@ tracetap claude -p "hello"                   # one-shot prompt
 tracetap codex exec "summarize this repo"    # non-interactive codex run
 tracetap codex "refactor this module"        # interactive codex session
 tracetap gemini -p "summarize this repo"     # non-interactive gemini run
+tracetap devin import                        # import Devin CLI sessions from its local store
 tracetap claude --generate-html log.jsonl    # re-render an existing log into HTML
 
 tracetap index                               # fold all logs into the local store
@@ -48,7 +49,7 @@ tracetap search "rate limit retry"           # full-text search across sessions
 
 Everything after the `<tool>` selector is handled by that tool's tracer: a small set of trace flags (below), and **any flag we don't recognize is forwarded verbatim to the underlying binary** — so most `claude`/`codex`/`gemini` invocations work just by prefixing them with `tracetap claude`/`tracetap codex`/`tracetap gemini`. Trace flags may also go *before* the tool (`tracetap --log demo codex exec …`). Use `--run-with` if an agent flag ever collides with one of ours.
 
-Output lands in `./.claude-trace/` (claude), `./.codex-trace/` (codex), or `./.gemini-trace/` (gemini), as `<basename>.{jsonl,html}`, next to wherever you ran the command.
+Output lands in `./.claude-trace/` (claude), `./.codex-trace/` (codex), or `./.gemini-trace/` (gemini), as `<basename>.{jsonl,html}`, next to wherever you ran the command. **Devin** is the exception: it can't be proxied, so `tracetap devin import` reconstructs sessions from Devin's local store into `./.devin-trace/` (see [Importing Devin sessions](#importing-devin-sessions)).
 
 ```
 $ tracetap claude
@@ -310,6 +311,39 @@ Run as `tracetap gemini [flag…] [gemini args…]`.
 By default only the model-inference calls (`:generateContent` / `:streamGenerateContent`) are logged. Pass `--include-all-requests` to also capture the Gemini CLI's `:countTokens` probes and any other endpoints it hits.
 
 ---
+
+## Importing Devin sessions
+
+`tracetap devin` records the **[Devin CLI](https://cli.devin.ai)** (Cognition) — but *by import, not by proxy*. Devin's CLI is a native Rust binary that talks to a proprietary cloud backend (Cognition's Windsurf inference) over an in-house protocol behind pinned TLS, so the base-URL-override trick the other tracers use can't see its model traffic. Instead the CLI persists the **full structured trajectory locally** (`~/.local/share/devin/cli/sessions.db`), for every backend including the default hosted models — so `tracetap devin` reconstructs sessions from that store:
+
+```bash
+tracetap devin list                          # list sessions in the Devin store (no writes)
+tracetap devin import                         # reconstruct all sessions → .devin-trace/ + index
+tracetap devin import --session trail-bongo    # just one session (or pass the id positionally)
+tracetap devin import --here --no-index        # write into ./.devin-trace, skip the store
+tracetap devin import --generate-html s.jsonl  # re-render an existing devin log to HTML
+```
+
+For each session it walks the active branch of Devin's message forest (following `main_chain_id` back to the root, dropping abandoned regenerations), then emits one canonical request/response pair per assistant turn — carrying the cumulative transcript, the assistant output, tool calls and their stitched results, per-turn token usage (including cache read/creation), and the **real underlying model** the Adaptive router picked (e.g. `claude-sonnet-4-6`, even when the session model reads `adaptive`). Those flow through the same trajectory pipeline as the live tracers, so imported sessions are first-class everywhere — searchable, servable, and priced under `--agent devin`.
+
+Output lands in each session's `<workdir>/.devin-trace/<session-id>.{jsonl,html}` by default (so `search --project` and the dashboard attribute it to the real project), or into one directory with `--out <dir>` / the current directory with `--here`. The HTML viewer is self-contained and rendered server-side from the reconstructed trajectory (no external JS bundle). Unless `--no-index` is passed, imported sessions are folded into the local store automatically — browse them with `tracetap serve` / `tracetap explore`.
+
+> **What's captured vs not.** This is a post-hoc import of what Devin persisted locally (its own normalized transcript view), not the literal bytes on the wire to the model API — that's the cost of Devin's un-proxyable architecture, and the reason it's an importer rather than a live tracer. Only the **active** conversation branch is imported; hidden/deleted sessions are skipped to match `tracetap devin list`.
+
+### Devin import flags
+
+Run as `tracetap devin [import|list] [flag…]`.
+
+| Flag                       | Purpose                                                          |
+| -------------------------- | ---------------------------------------------------------------- |
+| `--session <id>`           | Import only this session (repeatable; ids may also be positional). Default: all. |
+| `--db <path>`              | Path to `sessions.db` (default: `$DEVIN_SESSIONS_DB` or the standard install location). |
+| `--out <dir>`              | Write all `.jsonl`/`.html` into `<dir>` instead of each session's working directory. |
+| `--here`                   | Write into `./.devin-trace` in the current directory.           |
+| `--no-index`               | Don't fold the imported sessions into `~/.tracetap/index.db`.    |
+| `--no-html`                | Skip the HTML viewer (JSONL only).                              |
+| `--no-open`                | Don't open the report on a single-session import.               |
+| `--generate-html <jsonl>`  | Render an existing devin JSONL to HTML and exit. Optional `[output.html]`. |
 
 ## Token & cost analytics
 

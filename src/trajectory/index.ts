@@ -12,11 +12,13 @@ import type {
 import { AnthropicAdapter } from "./anthropic";
 import { OpenAIAdapter } from "./openai";
 import { GeminiAdapter } from "./gemini";
+import { DevinAdapter } from "./devin";
 
 export * from "./types";
 export { AnthropicAdapter } from "./anthropic";
 export { OpenAIAdapter } from "./openai";
 export { GeminiAdapter } from "./gemini";
+export { DevinAdapter } from "./devin";
 
 /**
  * Registered wire-format adapters, checked in order. Mirrors hivemind's
@@ -26,6 +28,10 @@ export { GeminiAdapter } from "./gemini";
  * `messages[]`.
  */
 const ADAPTERS: AgentAdapter[] = [
+  // Devin first: its `provider: "devin"` marker is strict, and checking it
+  // ahead of Anthropic guarantees the synthetic `transcript[]` wire is never
+  // mistaken for the Messages API's `messages[]`.
+  new DevinAdapter(),
   new OpenAIAdapter(),
   new GeminiAdapter(),
   new AnthropicAdapter(),

@@ -54,6 +54,9 @@ ${colors.yellow}TOOLS:${colors.reset}
   gemini    Trace the Gemini CLI (proxies GOOGLE_GEMINI_BASE_URL)
 
 ${colors.yellow}COMMANDS:${colors.reset}
+  devin [import|list]         Import Devin CLI (Cognition) sessions from its
+                              local store (it can't be proxied). Reconstructs
+                              JSONL + HTML and indexes them (\`tracetap devin --help\`)
   diff <a.jsonl> <b.jsonl>    Structurally diff two captured runs
                               (system prompt, tool defs, model id, shape)
   index [path...]             Index trace logs into a local cross-session
@@ -76,6 +79,7 @@ ${colors.yellow}EXAMPLES:${colors.reset}
   tracetap codex exec "summarize the repo"
   tracetap codex --log my-session exec -m gpt-5.1 "write tests"
   tracetap gemini -p "summarize the repo"
+  tracetap devin import                            # import local Devin sessions
   tracetap claude --generate-html .claude-trace/log-….jsonl
   tracetap codex --generate-html .codex-trace/log-….jsonl
   tracetap gemini --generate-html .gemini-trace/log-….jsonl
@@ -84,6 +88,7 @@ ${colors.yellow}OUTPUT:${colors.reset}
   claude → ./.claude-trace/<basename>.{jsonl,html}
   codex  → ./.codex-trace/<basename>.{jsonl,html}
   gemini → ./.gemini-trace/<basename>.{jsonl,html}
+  devin  → <workdir>/.devin-trace/<session-id>.{jsonl,html}
 
 ${colors.yellow}OPTIONS:${colors.reset}
   --help, -h        Show this help
@@ -134,6 +139,15 @@ async function main(): Promise<void> {
   if (argv[0] === "serve") {
     const { runServe } = await import("./store/serve");
     await runServe(argv.slice(1));
+    return;
+  }
+
+  // `devin` imports the Devin CLI's local session store (it can't be proxied
+  // like the other harnesses). Lazy-loaded so its native better-sqlite3 read
+  // path only loads when this command runs.
+  if (argv[0] === "devin") {
+    const { run: runDevin } = await import("./devin-cli");
+    await runDevin(argv.slice(1));
     return;
   }
 

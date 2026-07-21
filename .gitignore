@@ -1,5 +1,6 @@
 node_modules
 /dist
 .claude-trace
+.devin-trace
 *.tgz
 .DS_Store
