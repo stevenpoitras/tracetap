@@ -54,6 +54,13 @@ export interface ContextTimeline {
   peakApproxTokens: number;
 }
 
+/** Context composition for one call, as stored at index time. */
+export interface ContextMetrics {
+  totalChars: number;
+  totalApproxTokens: number;
+  buckets: Record<string, number>;
+}
+
 function findCompactions(
   requests: ContextTimelineRequest[],
 ): { seq: number; from: number; to: number }[] {
@@ -74,6 +81,12 @@ export function buildContextTimeline(opts: {
   requests: ContextTimelineRequest[];
   /** seq → RawPair-like when source JSONL is available. */
   pairsBySeq?: Map<number, ContextTimelinePair>;
+  /**
+   * seq → composition computed at index time. Preferred over `pairsBySeq`:
+   * re-deriving it means reading and segmenting every request body in the
+   * session, which is the dominant cost of building this timeline.
+   */
+  precomputedBySeq?: Map<number, ContextMetrics>;
   /** Optional xray builder injected to avoid circular imports in tests. */
   xrayFor?: (seq: number, pair: ContextTimelinePair, promptHash: string) => {
     totalChars: number;
@@ -93,7 +106,12 @@ export function buildContextTimeline(opts: {
     let approxChars = 0;
     let approxTokens = 0;
     let buckets: Record<string, number> | undefined;
-    if (pair && opts.xrayFor) {
+    const pre = opts.precomputedBySeq?.get(r.seq);
+    if (pre) {
+      approxChars = pre.totalChars;
+      approxTokens = pre.totalApproxTokens;
+      buckets = pre.buckets;
+    } else if (pair && opts.xrayFor) {
       const xray = opts.xrayFor(r.seq, pair, r.promptHash);
       approxChars = xray.totalChars;
       approxTokens = xray.totalApproxTokens;

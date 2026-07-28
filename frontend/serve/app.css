@@ -1664,3 +1664,22 @@ button.xray-seg {
   font: inherit;
 }
 button.xray-seg:hover { border-color: var(--accent); }
+
+/* A pane the server could not build. Distinct from .empty-pane, which means
+   "nothing to show" — this means "this broke, and here is why". */
+.section-errors {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--err);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--err);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.section-errors b {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}

@@ -277,11 +277,61 @@ test("GET /api/session/<id> returns transcript, requests, hooks, flow, compactio
   assert.ok(body.hooks.length >= 2, "time-correlated hook events expected");
   assert.ok(body.flow && Array.isArray(body.flow.nodes));
   assert.ok(body.flow.nodes.length >= 3);
-  assert.ok(body.contextTimeline && Array.isArray(body.contextTimeline.points));
-  assert.ok(body.contextTimeline.points.length >= 1);
+  // The timeline is deliberately NOT here: building it can require reading every
+  // request body in the session, so it moved to its own endpoint rather than
+  // stalling all four panes.
+  assert.equal(body.contextTimeline, undefined, "timeline must not block the session load");
   assert.equal(typeof body.reportAvailable, "boolean");
 
   const missing = await get("/api/session/nope");
+  assert.equal(missing.status, 404);
+});
+
+test("GET /api/session/<id>/timeline serves the context timeline separately", async () => {
+  const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
+  const id = list.sessions[0].sessionId;
+  const r = await get("/api/session/" + encodeURIComponent(id) + "/timeline");
+  assert.equal(r.status, 200);
+  const tl = JSON.parse(r.text);
+  assert.ok(Array.isArray(tl.points));
+  assert.ok(tl.points.length >= 1);
+  assert.equal(typeof tl.compactionCount, "number");
+  assert.equal(typeof tl.peakPromptTokens, "number");
+  // Every point carries composition, whether precomputed at index time or
+  // recovered by the fallback — the pane renders off these numbers.
+  assert.ok(tl.points.every((p) => typeof p.approxTokens === "number"));
+
+  const missing = await get("/api/session/nope/timeline");
+  assert.equal(missing.status, 404);
+});
+
+test("flow node detail is previewed in the graph and fetched per node", async () => {
+  const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
+  const id = list.sessions[0].sessionId;
+  const body = JSON.parse((await get("/api/session/" + encodeURIComponent(id))).text);
+
+  // Whatever the fixture's payload sizes, no node may carry both forms, and a
+  // trimmed node must say how much was withheld so the UI can label it.
+  for (const n of body.flow.nodes) {
+    assert.ok(!(n.detail && n.detailPreview), "node " + n.id + " carries both detail and preview");
+    if (n.detailPreview) {
+      assert.equal(typeof n.detailChars, "number");
+      assert.ok(n.detailChars > n.detailPreview.length);
+    }
+  }
+
+  const withDetail = body.flow.nodes.find((n) => n.detail || n.detailPreview);
+  if (withDetail) {
+    const r = await get(
+      "/api/session/" + encodeURIComponent(id) + "/flow/" + encodeURIComponent(withDetail.id),
+    );
+    assert.equal(r.status, 200);
+    const full = JSON.parse(r.text);
+    assert.equal(full.id, withDetail.id);
+    assert.ok(full.detail, "per-node endpoint returns the untrimmed detail");
+  }
+
+  const missing = await get("/api/session/" + encodeURIComponent(id) + "/flow/no-such-node");
   assert.equal(missing.status, 404);
 });
 

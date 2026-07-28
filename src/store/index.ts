@@ -17,7 +17,7 @@ import type { FlowGraph } from "../flow/derive";
 import { buildContextXray } from "../context/xray";
 import type { ContextXray } from "../context/xray";
 import { buildContextTimeline } from "../context/timeline";
-import type { ContextTimeline } from "../context/timeline";
+import type { ContextMetrics, ContextTimeline } from "../context/timeline";
 
 /**
  * Local cross-session trace store + search.
@@ -281,7 +281,7 @@ const SORTABLE_COLUMNS = new Set([
   "cost_usd",
 ]);
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 // ---------------------------------------------------------------------------
 // Paths / discovery
@@ -541,7 +541,13 @@ export class Store {
         transcript_items INTEGER NOT NULL DEFAULT 0,
         prompt_hash      TEXT NOT NULL DEFAULT '',
         agent_step_index INTEGER,
-        source_path      TEXT NOT NULL
+        source_path      TEXT NOT NULL,
+        -- Context composition, computed once here rather than on every read.
+        -- Rebuilding it at serve time meant re-reading and re-segmenting every
+        -- request body in the session; see sessionContextTimeline.
+        ctx_total_chars  INTEGER,
+        ctx_total_tokens INTEGER,
+        ctx_buckets_json TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id, seq);
       CREATE INDEX IF NOT EXISTS idx_requests_ts      ON requests(ts);
@@ -759,8 +765,9 @@ export class Store {
          session_id, seq, ts, model, status, duration_ms, ttft_ms,
          prompt_tokens, completion_tokens, cache_read, cache_creation,
          reasoning_tokens, stop_reason, errored, transcript_items,
-         prompt_hash, agent_step_index, source_path
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         prompt_hash, agent_step_index, source_path,
+         ctx_total_chars, ctx_total_tokens, ctx_buckets_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const upsertPrompt = this.db.prepare(
       `INSERT INTO prompts(prompt_hash, agent, content, first_seen, last_seen)
@@ -810,6 +817,10 @@ export class Store {
       const u = resp.usage;
       const producedStep = resp.items.length > 0 || resp.usage != null;
       const agentStepIndex = producedStep ? (agentSteps[agentCursor++]?.index ?? null) : null;
+      // Segment the prompt once, here. Doing it lazily meant every dashboard
+      // load re-read and re-parsed every body in the session. A body that will
+      // not segment is stored as NULL, and the read path falls back for it.
+      const ctx = contextMetricsForPair(seq, pair, promptHash);
       ins.run(
         group.sessionId,
         seq,
@@ -829,6 +840,9 @@ export class Store {
         promptHash,
         agentStepIndex,
         sourcePath,
+        ctx?.totalChars ?? null,
+        ctx?.totalApproxTokens ?? null,
+        ctx ? JSON.stringify(ctx.buckets) : null,
       );
     });
   }
@@ -1535,15 +1549,52 @@ export class Store {
    * Context-size timeline across API calls, with compaction pre/post markers.
    * Reads source JSONL when present so approx tokens / buckets are real.
    */
+  /**
+   * Context composition per call, as recorded at index time.
+   *
+   * Deliberately its own narrow query rather than extra fields on
+   * {@link listRequests}: the bucket JSON is only wanted by the timeline, and
+   * `requests` is sent to the dashboard on every session load.
+   */
+  private contextMetricsFor(sessionId: string): Map<number, ContextMetrics> {
+    const out = new Map<number, ContextMetrics>();
+    const rows = this.db
+      .prepare(
+        `SELECT seq, ctx_total_chars, ctx_total_tokens, ctx_buckets_json
+           FROM requests WHERE session_id = ? AND ctx_total_tokens IS NOT NULL`,
+      )
+      .all(sessionId) as any[];
+    for (const r of rows) {
+      let buckets: Record<string, number> = {};
+      try {
+        buckets = JSON.parse(String(r.ctx_buckets_json || "{}"));
+      } catch {
+        continue; // a corrupt row falls back to live computation below
+      }
+      out.set(Number(r.seq), {
+        totalChars: Number(r.ctx_total_chars ?? 0),
+        totalApproxTokens: Number(r.ctx_total_tokens ?? 0),
+        buckets,
+      });
+    }
+    return out;
+  }
+
   sessionContextTimeline(sessionId: string): ContextTimeline {
     const requests = this.listRequests(sessionId);
+    const precomputedBySeq = this.contextMetricsFor(sessionId);
+    // Only read bodies for calls the index run could not segment — normally
+    // none. Before this, every call was read back and re-parsed on every load,
+    // which dominated the session endpoint's latency.
     const pairsBySeq = new Map<number, RawPair>();
     for (const r of requests) {
+      if (precomputedBySeq.has(r.seq)) continue;
       const pair = this.getRawPair(sessionId, r.seq);
       if (pair) pairsBySeq.set(r.seq, pair);
     }
     return buildContextTimeline({
       requests,
+      precomputedBySeq,
       pairsBySeq,
       xrayFor: (seq, pair, promptHash) => {
         const x = buildContextXray({
@@ -1558,6 +1609,31 @@ export class Store {
         };
       },
     });
+  }
+}
+
+/**
+ * Context composition for one captured pair, or null when the body cannot be
+ * segmented (no request body, or an unrecognized shape). Never throws: a single
+ * unparseable pair must not fail the whole index run.
+ */
+function contextMetricsForPair(
+  seq: number,
+  pair: RawPair,
+  promptHash: string,
+): ContextMetrics | null {
+  try {
+    const x = buildContextXray({ seq, pair, promptHash });
+    if (!x || !x.buckets.length) return null;
+    const buckets: Record<string, number> = {};
+    for (const b of x.buckets) buckets[b.bucket] = b.approxTokens;
+    return {
+      totalChars: x.totalChars,
+      totalApproxTokens: x.totalApproxTokens,
+      buckets,
+    };
+  } catch {
+    return null;
   }
 }
 

@@ -906,13 +906,41 @@
     elStep.classList.add("flash");
   }
 
+  /**
+   * Report panes the server could not build.
+   *
+   * `paneSection` isolates a failing section so one bad row cannot 500 the whole
+   * endpoint — but the isolated section arrives as null, which renders as an
+   * ordinary empty pane. Without this the user cannot tell "nothing to show"
+   * from "this broke", which is the whole point of having isolated it.
+   */
+  function sectionErrorBanner(errors) {
+    if (!errors) return "";
+    var names = Object.keys(errors);
+    if (!names.length) return "";
+    return (
+      '<div class="section-errors">' +
+      names
+        .map(function (n) {
+          return (
+            "<div><b>" +
+            esc(n) +
+            "</b> pane failed to load — " +
+            esc(String(errors[n])) +
+            "</div>"
+          );
+        })
+        .join("") +
+      "</div>"
+    );
+  }
+
   function drawSession(data, stepN, initialPane) {
     var s = data.session,
       reqs = data.requests,
       steps = data.steps;
     var hooks = data.hooks || [];
     var flow = data.flow || { nodes: [], edges: [] };
-    var contextTimeline = data.contextTimeline || null;
     var compactSeqs = {};
     var compactionList = data.compactions || [];
     compactionList.forEach(function (c) {
@@ -994,6 +1022,7 @@
       '<div class="cards">' +
       cards +
       "</div>" +
+      sectionErrorBanner(data.sectionErrors) +
       '<nav class="session-subnav" id="session-subnav">' +
       subnavBtn("flow", "Flow") +
       subnavBtn("hooks", "Hooks", hooks.length) +
@@ -1014,7 +1043,7 @@
       '<section class="session-pane' +
       (pane === "xray" ? " active" : "") +
       '" id="pane-xray">' +
-      renderXrayPane(s.sessionId, reqs, contextTimeline) +
+      renderXrayPane(s.sessionId, reqs) +
       "</section>" +
       '<section class="session-pane' +
       (pane === "wire" ? " active" : "") +
@@ -1038,7 +1067,7 @@
       '<div id="payload-pop" class="payload-pop" hidden></div>';
     setView(html);
     bindSessionInteractions(reqs, compactSeqs, steps);
-    bindSessionPanes(s.sessionId, reqs, contextTimeline);
+    bindSessionPanes(s.sessionId, reqs);
     bindPayloadPopovers();
     if (stepN != null) {
       activatePane("wire");
@@ -1067,7 +1096,7 @@
     }
   }
 
-  function bindSessionPanes(sessionId, reqs, contextTimeline) {
+  function bindSessionPanes(sessionId, reqs) {
     var nav = document.getElementById("session-subnav");
     if (nav) {
       nav.addEventListener("click", function (e) {
@@ -1093,6 +1122,7 @@
           "</span> " +
           esc(label) +
           "</div>";
+        var preview = node.getAttribute("data-detail-preview");
         if (raw) {
           try {
             html +=
@@ -1102,6 +1132,16 @@
           } catch (err) {
             html += '<pre class="payload">' + esc(raw) + "</pre>";
           }
+        } else if (preview) {
+          // Show the preview immediately so the pane never looks empty, then
+          // swap in the full payload when it arrives.
+          html +=
+            '<pre class="payload" id="flow-detail-body">' +
+            esc(preview) +
+            "…</pre>" +
+            '<div class="dim" id="flow-detail-note">loading full payload (' +
+            fmtTok(Number(node.getAttribute("data-detail-chars") || 0)) +
+            " chars)…</div>";
         }
         var seq = node.getAttribute("data-seq");
         if (seq != null && seq !== "") {
@@ -1117,6 +1157,29 @@
             '<button type="button" class="btn-xray" data-goto-hooks="1">Open Hooks pane</button>';
         }
         detail.innerHTML = html;
+        if (!raw && preview) {
+          var nodeId = node.getAttribute("data-node-id");
+          fetchJSON(
+            "/api/session/" +
+              encodeURIComponent(sessionId) +
+              "/flow/" +
+              encodeURIComponent(nodeId),
+          )
+            .then(function (full) {
+              var body = document.getElementById("flow-detail-body");
+              var note = document.getElementById("flow-detail-note");
+              // The user may have clicked another node while this was in
+              // flight; only write if this node's placeholder is still shown.
+              if (!body || detail.getAttribute("data-showing") !== nodeId) return;
+              body.textContent = JSON.stringify(full.detail, null, 2);
+              if (note) note.remove();
+            })
+            .catch(function (err) {
+              var note = document.getElementById("flow-detail-note");
+              if (note) note.textContent = "full payload unavailable — " + (err.message || err);
+            });
+        }
+        detail.setAttribute("data-showing", node.getAttribute("data-node-id") || "");
         var btn = detail.querySelector(".btn-xray[data-seq]");
         if (btn) {
           btn.addEventListener("click", function () {
@@ -1139,25 +1202,8 @@
       });
       if (reqs && reqs.length) loadXray(sessionId, reqs[reqs.length - 1].seq);
     }
-    var tl = document.getElementById("context-timeline");
-    document
-      .querySelectorAll(".compaction-card .btn-xray[data-seq]")
-      .forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          activatePane("xray");
-          loadXray(sessionId, Number(btn.getAttribute("data-seq")));
-        });
-      });
-
-    if (tl && contextTimeline) {
-      tl.addEventListener("click", function (e) {
-        var bar = e.target.closest("[data-seq]");
-        if (!bar) return;
-        var seq = Number(bar.getAttribute("data-seq"));
-        activatePane("xray");
-        loadXray(sessionId, seq);
-      });
-    }
+    // The timeline arrives on its own endpoint; it renders and binds itself.
+    if (reqs && reqs.length) loadTimeline(sessionId);
   }
 
   function bindPayloadPopovers() {
@@ -1454,7 +1500,7 @@
     return html;
   }
 
-  function renderXrayPane(sessionId, reqs, contextTimeline) {
+  function renderXrayPane(sessionId, reqs) {
     if (!reqs.length) {
       return '<div class="empty-pane">No API calls to x-ray.</div>';
     }
@@ -1474,7 +1520,9 @@
       })
       .join("");
     return (
-      renderContextTimeline(contextTimeline) +
+      // Filled in by loadTimeline once /timeline responds — the session payload
+      // no longer carries it.
+      '<div id="timeline-host"><div class="dim">loading context timeline…</div></div>' +
       '<div class="xray-controls">' +
       '<label class="chrome">API call <select id="xray-seq">' +
       opts +
@@ -1502,10 +1550,22 @@
         esc(n.kind) +
         '" data-label="' +
         esc(n.label) +
+        '" data-node-id="' +
+        esc(n.id) +
         '"' +
         (n.requestSeq != null ? ' data-seq="' + n.requestSeq + '"' : "") +
+        // Large payloads arrive as a preview only; the rest is fetched on click.
+        // Inlining every node's full detail put hundreds of KB into DOM
+        // attributes for text the user may never open.
         (n.detail
           ? ' data-detail="' + esc(JSON.stringify(n.detail)) + '"'
+          : "") +
+        (n.detailPreview
+          ? ' data-detail-preview="' +
+            esc(n.detailPreview) +
+            '" data-detail-chars="' +
+            (n.detailChars || 0) +
+            '"'
           : "") +
         ' style="--i:' +
         i +
@@ -1525,7 +1585,58 @@
     return html;
   }
 
+  /**
+   * Fetch the context timeline and render it into the X-Ray pane.
+   *
+   * The markup and its click handlers are deliberately in one function. The
+   * timeline arrives after the pane is drawn, so binding it anywhere else means
+   * binding before the elements exist — the failure mode that left the Wire
+   * pane's handlers pointing at markup that was no longer emitted.
+   */
+  function loadTimeline(sessionId) {
+    var host = document.getElementById("timeline-host");
+    if (!host) return;
+    fetchJSON("/api/session/" + encodeURIComponent(sessionId) + "/timeline")
+      .then(function (tl) {
+        host.innerHTML = renderContextTimeline(tl);
+        host
+          .querySelectorAll(".compaction-card .btn-xray[data-seq]")
+          .forEach(function (btn) {
+            btn.addEventListener("click", function () {
+              activatePane("xray");
+              loadXray(sessionId, Number(btn.getAttribute("data-seq")));
+            });
+          });
+        var tlEl = host.querySelector("#context-timeline");
+        if (tlEl) {
+          tlEl.addEventListener("click", function (e) {
+            var bar = e.target.closest("[data-seq]");
+            if (!bar) return;
+            activatePane("xray");
+            loadXray(sessionId, Number(bar.getAttribute("data-seq")));
+          });
+        }
+      })
+      .catch(function (err) {
+        host.innerHTML =
+          '<div class="dim">context timeline unavailable — ' +
+          esc(String(err.message || err)) +
+          "</div>";
+      });
+  }
+
+  /**
+   * Monotonic token for the in-flight x-ray request.
+   *
+   * `bindSessionPanes` auto-loads the last request as soon as the pane renders,
+   * so there is always one fetch in flight the moment the inspect buttons become
+   * clickable. Responses are not ordered, so without this the auto-load can land
+   * after a click and overwrite it — the button appears to do nothing.
+   */
+  var xrayToken = 0;
+
   function loadXray(sessionId, seq) {
+    var token = ++xrayToken;
     var status = document.getElementById("xray-status");
     var viewEl = document.getElementById("xray-view");
     var sel = document.getElementById("xray-seq");
@@ -1536,6 +1647,7 @@
       "/api/session/" + encodeURIComponent(sessionId) + "/context/" + seq,
     )
       .then(function (x) {
+        if (token !== xrayToken) return; // a newer click already won
         if (status) {
           status.textContent =
             fmtTok(x.totalApproxTokens) +
@@ -1559,6 +1671,10 @@
         }
       })
       .catch(function (err) {
+        // A stale failure must not clobber a newer success either: a request
+        // whose body was never captured 404s, and that error would otherwise
+        // land on top of whatever the user had just clicked.
+        if (token !== xrayToken) return;
         if (status) status.textContent = "error";
         if (viewEl)
           viewEl.innerHTML =

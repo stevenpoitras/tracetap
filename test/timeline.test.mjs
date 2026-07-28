@@ -53,3 +53,48 @@ test("buildContextTimeline marks compaction pre/post sizes", () => {
   assert.equal(tl.points[2].compaction.postPromptTokens, 80);
   assert.equal(tl.peakPromptTokens, 200);
 });
+
+const req = (seq, promptTokens, transcriptItems) => ({
+  seq,
+  ts: 100 * (seq + 1),
+  model: "m",
+  promptTokens,
+  completionTokens: 10,
+  cacheRead: 0,
+  cacheCreation: 0,
+  transcriptItems,
+  promptHash: "h" + seq,
+  errored: false,
+});
+
+test("precomputed composition is preferred over re-reading request bodies", () => {
+  let xrayCalls = 0;
+  const tl = buildContextTimeline({
+    requests: [req(0, 100, 5), req(1, 200, 8)],
+    precomputedBySeq: new Map([
+      [0, { totalChars: 4000, totalApproxTokens: 1000, buckets: { system: 400, user: 600 } }],
+    ]),
+    // seq 1 has no precomputed row, so it must still fall back to the body.
+    pairsBySeq: new Map([[1, { request: { body: {} } }]]),
+    xrayFor: () => {
+      xrayCalls++;
+      return { totalChars: 8000, totalApproxTokens: 2000, buckets: [{ bucket: "user", approxTokens: 2000 }] };
+    },
+  });
+
+  assert.equal(tl.points[0].approxTokens, 1000, "seq 0 used the precomputed value");
+  assert.equal(tl.points[0].approxChars, 4000);
+  assert.deepEqual(tl.points[0].buckets, { system: 400, user: 600 });
+  assert.equal(xrayCalls, 1, "the body was read only for the seq lacking a precomputed row");
+  assert.equal(tl.points[1].approxTokens, 2000, "seq 1 fell back to segmenting the body");
+  assert.equal(tl.peakApproxTokens, 2000);
+});
+
+test("a session with no bodies and no precompute still yields a timeline", () => {
+  // Wire token counts are always present; composition is the optional part.
+  const tl = buildContextTimeline({ requests: [req(0, 100, 5), req(1, 250, 9)] });
+  assert.equal(tl.points.length, 2);
+  assert.equal(tl.points[1].approxTokens, 250);
+  assert.equal(tl.points[1].buckets, undefined);
+  assert.equal(tl.peakPromptTokens, 250);
+});

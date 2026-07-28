@@ -11,6 +11,8 @@ import { aggregateUsage, parseWhen } from "../usage";
 import type { Granularity } from "../usage";
 import { auditFilePaths } from "../audit";
 import type { AuditReport } from "../audit";
+import type { FlowGraph } from "../flow/derive";
+import type { ContextTimeline } from "../context/timeline";
 
 /**
  * `tracetap serve` — the local observatory over the cross-session store.
@@ -374,6 +376,60 @@ async function auditIndexedFiles(
   return report;
 }
 
+/** Cached context timelines for the current index state (see timelineFor). */
+const timelineMemo = new Map<string, ContextTimeline>();
+let timelineMemoSig = "";
+
+/**
+ * A session's context timeline, memoized until the index changes.
+ *
+ * Normally this is a cheap read of composition recorded at index time. It falls
+ * back to reading and segmenting request bodies for any call the index run
+ * could not segment, and that fallback is what the memo protects: it is linear
+ * in the session's wire traffic and would otherwise be repaid on every visit.
+ *
+ * Invalidated on the same db+WAL mtime signal the SSE poller already uses, so a
+ * re-index refreshes the dashboard and this cache together.
+ */
+function timelineFor(store: Store, sessionId: string): ContextTimeline {
+  const sig = dbMtimeSignature(store.dbPath);
+  if (sig !== timelineMemoSig) {
+    timelineMemo.clear(); // only the latest index state is worth caching
+    timelineMemoSig = sig;
+  }
+  const hit = timelineMemo.get(sessionId);
+  if (hit) return hit;
+  const timeline = store.sessionContextTimeline(sessionId);
+  timelineMemo.set(sessionId, timeline);
+  return timeline;
+}
+
+/**
+ * Node detail is the bulk of the flow payload — full message text on every one
+ * of what can be hundreds of nodes, inlined into DOM attributes by the frontend.
+ * Send a preview and let the detail pane fetch the rest for the one node the
+ * user actually clicked.
+ */
+export const FLOW_DETAIL_PREVIEW_CHARS = 400;
+
+export function trimFlowDetail(flow: FlowGraph): FlowGraph {
+  return {
+    ...flow,
+    nodes: flow.nodes.map((n) => {
+      const raw = n.detail == null ? "" : JSON.stringify(n.detail);
+      if (raw.length <= FLOW_DETAIL_PREVIEW_CHARS) return n;
+      // Drop `detail` entirely rather than blanking it: the frontend keys off
+      // its presence to decide whether it must fetch.
+      const { detail: _elided, ...rest } = n;
+      return {
+        ...rest,
+        detailPreview: raw.slice(0, FLOW_DETAIL_PREVIEW_CHARS),
+        detailChars: raw.length,
+      };
+    }),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
@@ -584,6 +640,40 @@ export async function handleRequest(
         return;
       }
 
+      // /api/session/<id>/timeline — fetched when the X-Ray pane opens, not on
+      // every session load, so an un-precomputed session cannot stall the page.
+      const timelineMatch = rest.match(/^(.*)\/timeline$/);
+      if (timelineMatch) {
+        const sessionId = timelineMatch[1];
+        const session = store.getSession(sessionId);
+        if (!session) {
+          sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
+          return;
+        }
+        sendJson(res, 200, timelineFor(store, sessionId));
+        return;
+      }
+
+      // /api/session/<id>/flow/<nodeId> — full detail for one node, since the
+      // graph payload only carries previews.
+      const flowMatch = rest.match(/^(.*)\/flow\/(.+)$/);
+      if (flowMatch) {
+        const sessionId = flowMatch[1];
+        const nodeId = flowMatch[2];
+        const session = store.getSession(sessionId);
+        if (!session) {
+          sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
+          return;
+        }
+        const node = store.sessionFlow(sessionId).nodes.find((n) => n.id === nodeId);
+        if (!node) {
+          sendJson(res, 404, { error: `No flow node '${nodeId}' in session '${sessionId}'.` });
+          return;
+        }
+        sendJson(res, 200, { id: node.id, kind: node.kind, label: node.label, detail: node.detail ?? null });
+        return;
+      }
+
       const sessionId = rest;
       const session = store.getSession(sessionId);
       if (!session) {
@@ -599,17 +689,17 @@ export async function handleRequest(
       const hooks = paneSection(sectionErrors, "hooks", () =>
         store.listHooksForSession(sessionId),
       );
-      const flow = paneSection(sectionErrors, "flow", () => store.sessionFlow(sessionId));
-      const contextTimeline = paneSection(sectionErrors, "contextTimeline", () =>
-        store.sessionContextTimeline(sessionId),
+      const flow = paneSection(sectionErrors, "flow", () =>
+        trimFlowDetail(store.sessionFlow(sessionId)),
       );
+      // contextTimeline is NOT here: it moved to /api/session/<id>/timeline so
+      // the four panes render without waiting on it.
       sendJson(res, 200, {
         session,
         steps,
         requests,
         hooks,
         flow,
-        contextTimeline,
         compactions: findCompactions(requests),
         reportAvailable: fs.existsSync(reportPathFor(session.sourcePath)),
         ...(Object.keys(sectionErrors).length ? { sectionErrors } : {}),

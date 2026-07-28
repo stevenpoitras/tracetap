@@ -53,6 +53,12 @@ export interface FlowNode {
   /** Child lane for Task/Agent subagent branches. */
   lane?: number;
   detail?: Record<string, unknown>;
+  /**
+   * Set instead of `detail` when the transport elided a large payload. The
+   * dashboard fetches the full detail for the one node the user clicks.
+   */
+  detailPreview?: string;
+  detailChars?: number;
   errored?: boolean;
 }
 
