@@ -1554,9 +1554,21 @@ h2.sec small {
   text-align: left;
   background: var(--surface);
 }
-/* Row shaded to its own share of the context: the fill stops at --share, so
-   what is eating the window is visible without reading the number. */
-.xray-seg {
+/* Segment rows are ALSO `.payload-hotspot`, a generic affordance declared later
+   in this file with `display:block`, a transparent background, a dashed border
+   and zero padding. Equal specificity + later in source = it silently won and
+   flattened these rows into running text. The compound selector both outranks
+   it and states the rule honestly: when a hotspot is a segment row, the row
+   wins. Everything re-asserted here is a property .payload-hotspot sets.
+
+   Shaded to its own share of the context — the fill stops at --share, so what
+   is eating the window is visible without reading the number. */
+.xray-seg,
+.xray-seg.payload-hotspot {
+  display: grid;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-left: 3px solid rgb(var(--bkt));
   background:
     linear-gradient(
       90deg,
@@ -1564,6 +1576,10 @@ h2.sec small {
       transparent var(--share, 0%)
     ),
     var(--surface);
+}
+.xray-seg.payload-hotspot:hover {
+  border-color: var(--accent);
+  border-left-color: rgb(var(--bkt));
 }
 .xray-delta-item {
   grid-template-columns: 68px 88px 58px minmax(0, 1fr);
