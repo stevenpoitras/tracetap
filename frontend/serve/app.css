@@ -1451,83 +1451,159 @@ h2.sec small {
   font-family: var(--font-data);
   font-size: 12px;
 }
+/* -- Context X-Ray rows ---------------------------------------------------
+   One colour per bucket, declared ONCE as an RGB triple and consumed by the
+   composition bars, the segment rows and the delta rows alike. Previously the
+   colours lived only on .xray-bar, so a bucket read amber in the stack and
+   colourless in the rows below it. */
+/* Neutral default first, so a bucket the segmenter invents that has no colour
+   here still renders. The .bucket-* rules below have equal specificity and come
+   later, so they win — do NOT write `--bkt: var(--bkt, ...)`, a custom property
+   referring to itself is cyclic and resolves to nothing at all. */
+.xray-row,
+.xray-seg,
+.xray-delta-item { --bkt: 148, 163, 184; }
+
+.bucket-system      { --bkt: 127, 143, 255; }
+.bucket-tools       { --bkt: 251, 191, 36; }
+.bucket-skills      { --bkt: 192, 132, 252; }
+.bucket-hook_inject { --bkt: 244, 114, 182; }
+.bucket-user        { --bkt: 45, 212, 191; }
+.bucket-assistant   { --bkt: 74, 222, 128; }
+.bucket-thinking    { --bkt: 167, 139, 250; }
+.bucket-tool_result { --bkt: 56, 189, 248; }
+
 .xray-stack {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-bottom: 18px;
+  gap: 4px;
+  margin-bottom: 20px;
 }
-.xray-bar {
-  display: flex;
-  justify-content: space-between;
+
+/* Label | proportional track | tokens | share. Fixed columns so every row's
+   bar starts at the same x and the numbers form real columns. */
+.xray-row {
+  display: grid;
+  grid-template-columns: 96px 1fr 60px 52px;
   align-items: center;
+  gap: 10px;
   min-height: 26px;
-  padding: 4px 10px;
+  padding: 2px 4px;
   border-radius: 4px;
-  background: linear-gradient(
-    90deg,
-    rgba(127, 143, 255, 0.25),
-    rgba(127, 143, 255, 0.08)
-  );
-  border: 1px solid var(--border);
 }
-.xray-bar.bucket-system {
-  background: linear-gradient(90deg, rgba(127, 143, 255, 0.35), transparent);
+.xray-row:hover {
+  background: var(--surface);
 }
-.xray-bar.bucket-tools {
-  background: linear-gradient(90deg, rgba(251, 191, 36, 0.3), transparent);
-}
-.xray-bar.bucket-skills {
-  background: linear-gradient(90deg, rgba(192, 132, 252, 0.3), transparent);
-}
-.xray-bar.bucket-hook_inject {
-  background: linear-gradient(90deg, rgba(244, 114, 182, 0.3), transparent);
-}
-.xray-bar.bucket-user {
-  background: linear-gradient(90deg, rgba(45, 212, 191, 0.3), transparent);
-}
-.xray-bar.bucket-assistant {
-  background: linear-gradient(90deg, rgba(74, 222, 128, 0.28), transparent);
-}
-.xray-bar.bucket-thinking {
-  background: linear-gradient(90deg, rgba(192, 132, 252, 0.25), transparent);
-}
-.xray-bar.bucket-tool_result {
-  background: linear-gradient(90deg, rgba(45, 212, 191, 0.2), transparent);
-}
-.xray-bar-label {
+.xray-row-label {
   font-family: var(--font-chrome);
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  color: rgb(var(--bkt));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.xray-bar-n {
-  color: var(--dim);
+.xray-track {
+  position: relative;
+  height: 14px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.xray-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, rgba(var(--bkt), 0.95), rgba(var(--bkt), 0.55));
+}
+.xray-row-n {
   font-size: 11px;
+  color: var(--fg);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
+.xray-row-pct {
+  font-size: 11px;
+  color: var(--dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .xray-delta-list,
 .xray-segs {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 3px;
 }
-.xray-delta-item,
-.xray-seg {
-  display: flex;
-  gap: 8px;
-  align-items: baseline;
-  flex-wrap: wrap;
-  padding: 6px 8px;
-  background: var(--surface);
+
+/* bucket | tokens | share | preview — one line each, never wrapping, so the
+   list scans vertically instead of reflowing per row. */
+.xray-seg,
+.xray-delta-item {
+  display: grid;
+  grid-template-columns: 88px 58px 50px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 5px 8px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-left: 3px solid rgb(var(--bkt));
+  border-radius: 5px;
   font-size: 12px;
+  text-align: left;
+  background: var(--surface);
 }
-.xray-delta-item.kind-new {
-  border-left: 3px solid var(--green);
+/* Row shaded to its own share of the context: the fill stops at --share, so
+   what is eating the window is visible without reading the number. */
+.xray-seg {
+  background:
+    linear-gradient(
+      90deg,
+      rgba(var(--bkt), 0.22) var(--share, 0%),
+      transparent var(--share, 0%)
+    ),
+    var(--surface);
 }
-.xray-delta-item.kind-dropped {
-  border-left: 3px solid var(--red);
+.xray-delta-item {
+  grid-template-columns: 68px 88px 58px minmax(0, 1fr);
+}
+.xray-seg-bucket,
+.xray-delta-kind {
+  font-family: var(--font-chrome);
+  font-size: 9.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: rgb(var(--bkt));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xray-delta-kind {
+  color: var(--dim);
+}
+.xray-seg-n {
+  color: var(--fg);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.xray-seg-pct {
+  color: var(--dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+/* The preview is the only elastic column; it truncates instead of wrapping. */
+.xray-seg-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+}
+.xray-delta-item.kind-new .xray-delta-kind {
+  color: var(--green);
+}
+.xray-delta-item.kind-dropped .xray-delta-kind {
+  color: var(--red);
 }
 .xray-head {
   margin-bottom: 10px;
@@ -1538,7 +1614,7 @@ h2.sec small {
 .session-subnav a,
 .flow-kind,
 .hook-body h3,
-.xray-bar-label {
+.xray-row-label {
   font-family: var(--font-chrome);
 }
 
@@ -1657,13 +1733,19 @@ h2.sec small {
   font-size: 12px;
 }
 button.xray-seg {
-  width: 100%;
   color: inherit;
   cursor: pointer;
-  text-align: left;
-  font: inherit;
+  /* NOT `font: inherit` — that resets font-size, and the row's grid columns are
+     sized in px against the 12px set on .xray-seg. */
+  font-family: inherit;
 }
-button.xray-seg:hover { border-color: var(--accent); }
+button.xray-seg:hover {
+  border-color: var(--accent);
+}
+button.xray-seg:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 
 /* A pane the server could not build. Distinct from .empty-pane, which means
    "nothing to show" — this means "this broke, and here is why". */

@@ -1684,29 +1684,55 @@
       });
   }
 
+  /** Percent of the whole context, to one decimal below 10% so small slices stay legible. */
+  function sharePct(n, total) {
+    if (!total) return 0;
+    return (n / total) * 100;
+  }
+  function fmtShare(pct) {
+    if (pct >= 10) return Math.round(pct) + "%";
+    if (pct >= 1) return pct.toFixed(1) + "%";
+    return pct < 0.1 ? "<0.1%" : pct.toFixed(1) + "%";
+  }
+
   function drawXray(x) {
-    var maxTok = 1;
+    var total = 0;
     x.buckets.forEach(function (b) {
-      if (b.approxTokens > maxTok) maxTok = b.approxTokens;
+      total += b.approxTokens;
     });
+
+    // Bars are share of the WHOLE context, not of the largest bucket. Scaling to
+    // the max made the biggest bucket 100% wide whether it was 90% or 30% of the
+    // context, which is exactly the question this pane exists to answer.
     var stack =
       '<div class="xray-stack">' +
       x.buckets
         .map(function (b) {
-          var pct = Math.max(2, Math.round((b.approxTokens / maxTok) * 100));
+          var pct = sharePct(b.approxTokens, total);
           return (
-            '<div class="xray-bar bucket-' +
+            '<div class="xray-row bucket-' +
             esc(b.bucket) +
-            '" style="width:' +
-            pct +
-            '%" title="' +
+            '" title="' +
             esc(b.label) +
-            '">' +
-            '<span class="xray-bar-label">' +
+            " · " +
+            fmtTok(b.approxTokens) +
+            " approx tokens · " +
+            b.segments +
+            ' segment(s)">' +
+            '<span class="xray-row-label">' +
             esc(b.label) +
             "</span>" +
-            '<span class="xray-bar-n">' +
+            '<span class="xray-track">' +
+            // Floor the fill so a sub-percent bucket is still a visible sliver
+            // rather than nothing at all.
+            '<span class="xray-fill" style="width:' +
+            Math.max(0.6, pct).toFixed(2) +
+            '%"></span></span>' +
+            '<span class="xray-row-n">' +
             fmtTok(b.approxTokens) +
+            "</span>" +
+            '<span class="xray-row-pct">' +
+            fmtShare(pct) +
             "</span></div>"
           );
         })
@@ -1736,18 +1762,26 @@
             return (
               '<div class="xray-delta-item kind-' +
               esc(i.kind) +
-              '">' +
-              '<span class="pill">' +
+              " bucket-" +
+              esc(i.bucket) +
+              '" title="' +
+              esc(i.kind) +
+              " · " +
+              esc(i.bucket) +
+              " · " +
+              fmtTok(i.approxTokens) +
+              ' approx tokens">' +
+              '<span class="xray-delta-kind">' +
               esc(i.kind) +
               "</span>" +
-              '<span class="pill">' +
+              '<span class="xray-seg-bucket">' +
               esc(i.bucket) +
               "</span>" +
-              "<span>" +
-              esc(i.preview) +
-              "</span>" +
-              '<span class="dim">' +
+              '<span class="xray-seg-n">' +
               fmtTok(i.approxTokens) +
+              "</span>" +
+              '<span class="xray-seg-text">' +
+              esc(i.preview) +
               "</span></div>"
             );
           })
@@ -1765,19 +1799,33 @@
         .map(function (s) {
           var full = s.preview; // preview already truncated; prefer longer if present
           if (s.full) full = s.full;
+          var pct = sharePct(s.approxTokens, total);
           return (
             '<button type="button" class="xray-seg bucket-' +
             esc(s.bucket) +
             ' payload-hotspot" data-full-payload="' +
             esc(full) +
-            '" title="Hover for full text">' +
-            '<span class="pill">' +
+            // The row is shaded to its own share of the context, so the segments
+            // actually eating the window are visible without reading a number.
+            '" style="--share:' +
+            Math.min(100, pct).toFixed(2) +
+            '%" title="' +
+            esc(s.bucket) +
+            " · " +
+            fmtTok(s.approxTokens) +
+            " approx tokens · " +
+            fmtShare(pct) +
+            ' of context — hover for full text">' +
+            '<span class="xray-seg-bucket">' +
             esc(s.bucket) +
             "</span>" +
-            '<span class="dim">' +
+            '<span class="xray-seg-n">' +
             fmtTok(s.approxTokens) +
             "</span>" +
-            "<span>" +
+            '<span class="xray-seg-pct">' +
+            fmtShare(pct) +
+            "</span>" +
+            '<span class="xray-seg-text">' +
             esc(s.preview) +
             "</span></button>"
           );
