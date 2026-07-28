@@ -9,8 +9,8 @@ import type { PriceTable } from "../analytics";
 import { loadPrices } from "../pricing";
 import { aggregateUsage, parseWhen } from "../usage";
 import type { Granularity } from "../usage";
-import { auditFilePaths } from "../audit";
-import type { AuditReport } from "../audit";
+import { auditOneFilePath, reportFromScans } from "../audit";
+import type { AuditFileScan, AuditReport } from "../audit";
 import type { FlowGraph } from "../flow/derive";
 import type { ContextTimeline } from "../context/timeline";
 
@@ -355,10 +355,24 @@ const auditMemo = new Map<string, AuditReport>();
 
 /**
  * Run the egress-secret audit over every source file the index knows about.
- * Memoized on (mode + per-file content hashes), so repeat dashboard visits
- * are free until a re-index changes a file.
+ *
+ * Scanning is linear in log bytes, and wire logs are large — hundreds of MB is
+ * ordinary. So the scan is cached PER FILE, in SQLite, keyed on that file's
+ * content hash: capturing a new session rescans only the new log, not every
+ * log. The in-process memo on top of that keeps repeat visits within a run
+ * free; the SQLite layer is what survives a restart.
+ *
+ * Caching the aggregate report instead would not work — one new log changes the
+ * combined key and invalidates everything, which is what made this a 40s+ wait
+ * on every server start.
  */
-async function auditIndexedFiles(
+export function clearAuditMemo(): void {
+  // The in-process memo would mask the persistent layer underneath it, so tests
+  // that assert on caching-across-processes need to drop it first.
+  auditMemo.clear();
+}
+
+export async function auditIndexedFiles(
   store: Store,
   mode: "standard" | "strict",
 ): Promise<AuditReport> {
@@ -369,8 +383,21 @@ async function auditIndexedFiles(
   const hit = auditMemo.get(memoKey);
   if (hit) return hit;
 
-  // Streamed line-by-line — wire logs can be GBs; never load them whole.
-  const report = await auditFilePaths(rows.map((r) => r.p), { mode, redactCheck: true });
+  const scans: AuditFileScan[] = [];
+  for (const r of rows) {
+    const cached = store.getAuditScan(r.p, r.h, mode, true);
+    if (cached) {
+      scans.push(cached);
+      continue;
+    }
+    // Streamed line-by-line — wire logs can be GBs; never load them whole.
+    const scan = await auditOneFilePath(r.p, { mode, redactCheck: true });
+    if (!scan) continue; // moved or deleted since indexing
+    store.putAuditScan(scan, r.h, mode, true);
+    scans.push(scan);
+  }
+
+  const report = reportFromScans(scans, { mode, redactCheck: true });
   auditMemo.clear(); // only the latest index state is worth caching
   auditMemo.set(memoKey, report);
   return report;

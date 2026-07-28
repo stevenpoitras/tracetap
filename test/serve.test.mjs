@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 
 import { Store } from "../dist/store/index.js";
 import {
+    auditIndexedFiles,
+    clearAuditMemo,
     handleRequest,
     parseServeArgs,
     reportPathFor,
@@ -446,4 +448,44 @@ test("GET /api/audit scans indexed source files (memoized)", async () => {
   assert.ok(report.redactCheck, "serve audit always includes redact-check");
   const strict = JSON.parse((await get("/api/audit?mode=strict")).text);
   assert.equal(strict.mode, "strict");
+});
+
+test("audit scans are cached per file and survive a new process", async () => {
+  const baseline = JSON.parse((await get("/api/audit")).text);
+  assert.ok(baseline.filesScanned >= 1);
+
+  const cached = store.db
+    .prepare("SELECT source_path, content_hash, mode FROM audit_scans WHERE mode = 'standard'")
+    .all();
+  assert.equal(
+    cached.length,
+    baseline.filesScanned,
+    "one cached scan row per scanned file, not one per report",
+  );
+  const hashes = store.db
+    .prepare("SELECT source_path AS p, content_hash AS h FROM files")
+    .all();
+  for (const row of cached) {
+    const f = hashes.find((x) => x.p === row.source_path);
+    assert.ok(f, "cached scan references an indexed file");
+    assert.equal(row.content_hash, f.h, "cache is keyed on the file's indexed content hash");
+  }
+
+  // The point of persisting: a fresh process must not rescan. Prove it by
+  // making the log unreadable — a rescan would silently drop it from the
+  // report, a cache hit keeps it.
+  const moved = claudeSource + ".moved";
+  fs.renameSync(claudeSource, moved);
+  clearAuditMemo(); // drop the in-process layer so SQLite is what answers
+  try {
+    const fresh = await auditIndexedFiles(store, "standard");
+    assert.equal(
+      fresh.filesScanned,
+      baseline.filesScanned,
+      "unreadable-but-cached file still counted — it was not rescanned",
+    );
+    assert.equal(fresh.pairsScanned, baseline.pairsScanned);
+  } finally {
+    fs.renameSync(moved, claudeSource);
+  }
 });

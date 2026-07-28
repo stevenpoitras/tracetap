@@ -16,6 +16,7 @@ import { deriveFlow } from "../flow/derive";
 import type { FlowGraph } from "../flow/derive";
 import { buildContextXray } from "../context/xray";
 import type { ContextXray } from "../context/xray";
+import type { AuditFileScan } from "../audit";
 import { buildContextTimeline } from "../context/timeline";
 import type { ContextMetrics, ContextTimeline } from "../context/timeline";
 
@@ -479,6 +480,7 @@ export class Store {
         DROP TABLE IF EXISTS prompts;
         DROP TABLE IF EXISTS hooks;
         DROP TABLE IF EXISTS hook_files;
+        DROP TABLE IF EXISTS audit_scans;
       `);
     }
 
@@ -576,6 +578,22 @@ export class Store {
         content     TEXT NOT NULL,
         first_seen  REAL,
         last_seen   REAL
+      );
+      -- One cached secret-scan per (log, content, detector mode). Scanning is
+      -- linear in log bytes and wire logs run to hundreds of MB, so a file whose
+      -- content hash is unchanged must never be rescanned — the same watermark
+      -- contract indexFile uses, applied to the audit.
+      CREATE TABLE IF NOT EXISTS audit_scans (
+        source_path   TEXT NOT NULL,
+        content_hash  TEXT NOT NULL,
+        mode          TEXT NOT NULL,
+        redact_check  INTEGER NOT NULL,
+        pairs_scanned INTEGER NOT NULL,
+        standard_masked INTEGER NOT NULL,
+        strict_masked INTEGER NOT NULL,
+        occurrences_json TEXT NOT NULL,
+        scanned_at    TEXT NOT NULL,
+        PRIMARY KEY (source_path, content_hash, mode, redact_check)
       );
       CREATE TABLE IF NOT EXISTS hook_files (
         source_path  TEXT PRIMARY KEY,
@@ -1549,6 +1567,70 @@ export class Store {
    * Context-size timeline across API calls, with compaction pre/post markers.
    * Reads source JSONL when present so approx tokens / buckets are real.
    */
+  /**
+   * A previously cached secret-scan for one log, or null on a miss.
+   *
+   * Keyed on the file's content hash, so an edited or rotated log misses and is
+   * rescanned. Rows for superseded hashes are harmless — {@link putAuditScan}
+   * clears them on write.
+   */
+  getAuditScan(
+    sourcePath: string,
+    contentHash: string,
+    mode: string,
+    redactCheck: boolean,
+  ): AuditFileScan | null {
+    const row = this.db
+      .prepare(
+        `SELECT pairs_scanned, standard_masked, strict_masked, occurrences_json
+           FROM audit_scans
+          WHERE source_path = ? AND content_hash = ? AND mode = ? AND redact_check = ?`,
+      )
+      .get(sourcePath, contentHash, mode, redactCheck ? 1 : 0) as any;
+    if (!row) return null;
+    try {
+      return {
+        path: sourcePath,
+        pairsScanned: Number(row.pairs_scanned ?? 0),
+        standardMasked: Number(row.standard_masked ?? 0),
+        strictMasked: Number(row.strict_masked ?? 0),
+        occurrences: JSON.parse(String(row.occurrences_json || "[]")),
+      };
+    } catch {
+      return null; // corrupt row — treat as a miss and rescan
+    }
+  }
+
+  putAuditScan(
+    scan: AuditFileScan,
+    contentHash: string,
+    mode: string,
+    redactCheck: boolean,
+  ): void {
+    // Drop stale hashes for this file so the table tracks the log, not its history.
+    this.db
+      .prepare("DELETE FROM audit_scans WHERE source_path = ? AND mode = ? AND redact_check = ?")
+      .run(scan.path, mode, redactCheck ? 1 : 0);
+    this.db
+      .prepare(
+        `INSERT INTO audit_scans(
+           source_path, content_hash, mode, redact_check,
+           pairs_scanned, standard_masked, strict_masked, occurrences_json, scanned_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        scan.path,
+        contentHash,
+        mode,
+        redactCheck ? 1 : 0,
+        scan.pairsScanned,
+        scan.standardMasked,
+        scan.strictMasked,
+        JSON.stringify(scan.occurrences),
+        new Date().toISOString(),
+      );
+  }
+
   /**
    * Context composition per call, as recorded at index time.
    *
