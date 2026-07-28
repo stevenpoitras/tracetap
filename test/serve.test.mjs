@@ -1,13 +1,17 @@
-import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as http from "node:http";
+import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { Store } from "../dist/store/index.js";
-import { handleRequest, parseServeArgs, reportPathFor } from "../dist/store/serve.js";
+import {
+    handleRequest,
+    parseServeArgs,
+    reportPathFor,
+} from "../dist/store/serve.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -23,19 +27,67 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-serve-"));
   const claudeDir = path.join(tmp, "proj", ".claude-trace");
   const codexDir = path.join(tmp, "proj", ".codex-trace");
+  const hooksDir = path.join(tmp, "hooks");
   fs.mkdirSync(claudeDir, { recursive: true });
   fs.mkdirSync(codexDir, { recursive: true });
+  fs.mkdirSync(hooksDir, { recursive: true });
   claudeSource = path.join(claudeDir, "claude.jsonl");
   fs.copyFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), claudeSource);
-  fs.copyFileSync(path.join(TRAJ_FIX, "codex-tooluse.jsonl"), path.join(codexDir, "codex.jsonl"));
+  fs.copyFileSync(
+    path.join(TRAJ_FIX, "codex-tooluse.jsonl"),
+    path.join(codexDir, "codex.jsonl"),
+  );
+
+  // Hook events timed to overlap the claude fixture (timestamps ~1700000000).
+  const hookLines = [
+    {
+      v: 1,
+      ts: "2023-11-14T22:13:19.000Z",
+      session_id: "hook-sess-demo",
+      event: "UserPromptSubmit",
+      hook_name: "posture",
+      duration_ms: 3,
+      decision: null,
+      stdin_digest: "a".repeat(64),
+      stdin_preview: {
+        session_id: "hook-sess-demo",
+        hook_event_name: "UserPromptSubmit",
+      },
+      stdout_preview: { chars: 0 },
+      outcome: "ok",
+      exit_code: 0,
+    },
+    {
+      v: 1,
+      ts: "2023-11-14T22:13:21.000Z",
+      session_id: "hook-sess-demo",
+      event: "PreToolUse",
+      hook_name: "pre-tool",
+      duration_ms: 5,
+      decision: "allow",
+      stdin_digest: "b".repeat(64),
+      stdin_preview: { tool_name: "Read", session_id: "hook-sess-demo" },
+      stdout_preview: { decision: "allow" },
+      outcome: "ok",
+      exit_code: 0,
+    },
+  ];
+  fs.writeFileSync(
+    path.join(hooksDir, "hook-sess-demo.jsonl"),
+    hookLines.map((e) => JSON.stringify(e)).join("\n") + "\n",
+  );
 
   const dbPath = path.join(tmp, "index.db");
   store = new Store(dbPath);
   store.indexPaths([path.join(tmp, "proj")]);
+  store.indexHooks(hooksDir);
 
   // Write a sibling HTML report for the claude session so the report route
   // can serve real bytes for a known session.
-  fs.writeFileSync(reportPathFor(path.resolve(claudeSource)), "<html><body>claude report</body></html>");
+  fs.writeFileSync(
+    reportPathFor(path.resolve(claudeSource)),
+    "<html><body>claude report</body></html>",
+  );
 
   server = http.createServer((req, res) => handleRequest(store, req, res));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -53,11 +105,22 @@ after(async () => {
 async function get(p) {
   const res = await fetch(baseUrl + p);
   const text = await res.text();
-  return { status: res.status, contentType: res.headers.get("content-type") || "", text };
+  return {
+    status: res.status,
+    contentType: res.headers.get("content-type") || "",
+    text,
+  };
 }
 
 test("parseServeArgs parses port/host/db and rejects junk", () => {
-  const o = parseServeArgs(["--port", "4123", "--host", "0.0.0.0", "--db", "/tmp/x.db"]);
+  const o = parseServeArgs([
+    "--port",
+    "4123",
+    "--host",
+    "0.0.0.0",
+    "--db",
+    "/tmp/x.db",
+  ]);
   assert.equal(o.port, 4123);
   assert.equal(o.host, "0.0.0.0");
   assert.equal(o.dbPath, "/tmp/x.db");
@@ -85,7 +148,10 @@ test("GET / returns a self-contained HTML page", async () => {
   // are progressive enhancement with ui-monospace fallbacks — page works offline.)
   assert.match(r.text, /<style>/);
   assert.match(r.text, /\/api\/sessions/);
-  assert.ok(!/<script[^>]+src=/.test(r.text), "page must not load external scripts");
+  assert.ok(
+    !/<script[^>]+src=/.test(r.text),
+    "page must not load external scripts",
+  );
 });
 
 test("GET /api/sessions returns the seeded sessions", async () => {
@@ -98,7 +164,18 @@ test("GET /api/sessions returns the seeded sessions", async () => {
   const agents = body.sessions.map((s) => s.agent).sort();
   assert.deepEqual(agents, ["claude", "codex"]);
   // documented shape
-  for (const key of ["sessionId", "agent", "model", "startedAt", "durationMs", "totalInTokens", "totalOutTokens", "costUsd", "toolHistogram", "sourcePath"]) {
+  for (const key of [
+    "sessionId",
+    "agent",
+    "model",
+    "startedAt",
+    "durationMs",
+    "totalInTokens",
+    "totalOutTokens",
+    "costUsd",
+    "toolHistogram",
+    "sourcePath",
+  ]) {
     assert.ok(key in body.sessions[0], `session should expose '${key}'`);
   }
 });
@@ -121,7 +198,11 @@ test("GET /api/search returns a hit for a known term", async () => {
   assert.equal(body.query, "foo.txt");
   assert.ok(body.count >= 1, "expected at least one hit for foo.txt");
   assert.ok(body.hits[0].sessionId);
-  assert.match(body.hits[0].snippet, /\[/, "snippet should carry highlight markers");
+  assert.match(
+    body.hits[0].snippet,
+    /\[/,
+    "snippet should carry highlight markers",
+  );
 
   // empty query -> empty result, no error.
   const empty = JSON.parse((await get("/api/search?q=")).text);
@@ -181,7 +262,7 @@ test("GET /api/meta reports db counts and price source", async () => {
   assert.ok(["litellm", "litellm-cache", "builtin"].includes(body.priceSource));
 });
 
-test("GET /api/session/<id> returns transcript, requests, compactions", async () => {
+test("GET /api/session/<id> returns transcript, requests, hooks, flow, compactions", async () => {
   const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
   const id = list.sessions[0].sessionId;
   const r = await get("/api/session/" + encodeURIComponent(id));
@@ -192,9 +273,40 @@ test("GET /api/session/<id> returns transcript, requests, compactions", async ()
   assert.ok(body.requests.length >= 2, "per-pair wire rows expected");
   assert.equal(body.requests[0].seq, 0);
   assert.ok(Array.isArray(body.compactions));
+  assert.ok(Array.isArray(body.hooks), "hooks array expected");
+  assert.ok(body.hooks.length >= 2, "time-correlated hook events expected");
+  assert.ok(body.flow && Array.isArray(body.flow.nodes));
+  assert.ok(body.flow.nodes.length >= 3);
+  assert.ok(body.contextTimeline && Array.isArray(body.contextTimeline.points));
+  assert.ok(body.contextTimeline.points.length >= 1);
   assert.equal(typeof body.reportAvailable, "boolean");
 
   const missing = await get("/api/session/nope");
+  assert.equal(missing.status, 404);
+});
+
+test("GET /api/session/<id>/context/<seq> returns Context X-Ray with delta", async () => {
+  const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
+  const id = list.sessions[0].sessionId;
+  const r0 = await get("/api/session/" + encodeURIComponent(id) + "/context/0");
+  assert.equal(r0.status, 200);
+  const x0 = JSON.parse(r0.text);
+  assert.equal(x0.seq, 0);
+  assert.ok(Array.isArray(x0.buckets));
+  assert.ok(x0.buckets.length >= 1);
+  assert.ok(Array.isArray(x0.segments));
+
+  const r1 = await get("/api/session/" + encodeURIComponent(id) + "/context/1");
+  assert.equal(r1.status, 200);
+  const x1 = JSON.parse(r1.text);
+  assert.equal(x1.seq, 1);
+  assert.ok(x1.delta, "second call should include delta vs prior");
+  assert.equal(x1.delta.prevSeq, 0);
+  assert.ok(typeof x1.delta.newCount === "number");
+
+  const missing = await get(
+    "/api/session/" + encodeURIComponent(id) + "/context/99",
+  );
   assert.equal(missing.status, 404);
 });
 
@@ -207,7 +319,9 @@ test("GET /api/usage aggregates priced buckets", async () => {
   assert.ok(body.totals.events >= 2);
   assert.ok(body.totals.costUsd > 0, "fixture models are priced");
 
-  const breakdown = JSON.parse((await get("/api/usage?granularity=total&breakdown=1")).text);
+  const breakdown = JSON.parse(
+    (await get("/api/usage?granularity=total&breakdown=1")).text,
+  );
   assert.ok(breakdown.rows.length >= 2, "per-model rows expected");
   assert.ok(breakdown.rows.every((row) => row.group));
 });
@@ -249,7 +363,9 @@ test("GET /api/prompts + /api/prompt/<hash> expose the registry", async () => {
   assert.equal(first.promptHash.length, 64);
   assert.ok(first.requestCount >= 1);
 
-  const detail = JSON.parse((await get("/api/prompt/" + first.promptHash.slice(0, 10))).text);
+  const detail = JSON.parse(
+    (await get("/api/prompt/" + first.promptHash.slice(0, 10))).text,
+  );
   assert.equal(detail.promptHash, first.promptHash);
   assert.ok(detail.content.length > 0);
   assert.ok(Array.isArray(detail.sessionIds) && detail.sessionIds.length >= 1);

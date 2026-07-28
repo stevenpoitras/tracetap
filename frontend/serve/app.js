@@ -7,21 +7,41 @@
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+      return {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[c];
     });
   }
   function fetchJSON(url) {
     return fetch(url).then(function (r) {
-      if (!r.ok) return r.json().then(function (b) { throw new Error(b.error || r.status); });
+      if (!r.ok)
+        return r.json().then(function (b) {
+          throw new Error(b.error || r.status);
+        });
       return r.json();
     });
   }
   function fmtTime(epoch) {
     if (!epoch) return "—";
     var d = new Date(epoch * 1000);
-    var pad = function (n) { return String(n).padStart(2, "0"); };
-    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
-      " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+    var pad = function (n) {
+      return String(n).padStart(2, "0");
+    };
+    return (
+      d.getFullYear() +
+      "-" +
+      pad(d.getMonth() + 1) +
+      "-" +
+      pad(d.getDate()) +
+      " " +
+      pad(d.getHours()) +
+      ":" +
+      pad(d.getMinutes())
+    );
   }
   function fmtDur(ms) {
     if (ms == null) return "—";
@@ -40,10 +60,17 @@
   }
   function fmtCost(c, plus) {
     if (c == null) return "—";
-    var s = c >= 100 ? "$" + c.toFixed(0) : c >= 0.01 || c === 0 ? "$" + c.toFixed(2) : "$" + c.toFixed(4);
+    var s =
+      c >= 100
+        ? "$" + c.toFixed(0)
+        : c >= 0.01 || c === 0
+          ? "$" + c.toFixed(2)
+          : "$" + c.toFixed(4);
     return plus ? s + "+" : s;
   }
-  function fmtPct(x) { return (x * 100).toFixed(x >= 0.1 ? 0 : 1) + "%"; }
+  function fmtPct(x) {
+    return (x * 100).toFixed(x >= 0.1 ? 0 : 1) + "%";
+  }
   function basename(p) {
     if (!p) return "";
     var parts = String(p).split("/");
@@ -57,8 +84,11 @@
     var t;
     return function () {
       clearTimeout(t);
-      var args = arguments, self = this;
-      t = setTimeout(function () { fn.apply(self, args); }, ms);
+      var args = arguments,
+        self = this;
+      t = setTimeout(function () {
+        fn.apply(self, args);
+      }, ms);
     };
   }
 
@@ -68,87 +98,172 @@
     var h = "";
     if (opts.cards) {
       h += '<div class="skel-cards">';
-      for (var c = 0; c < opts.cards; c++) h += '<div class="skel skel-card"></div>';
+      for (var c = 0; c < opts.cards; c++)
+        h += '<div class="skel skel-card"></div>';
       h += "</div>";
     }
-    for (var i = 0; i < (opts.rows || 6); i++) h += '<div class="skel skel-row"></div>';
+    for (var i = 0; i < (opts.rows || 6); i++)
+      h += '<div class="skel skel-row"></div>';
     return h;
   }
   function skelRows(n, cols) {
     var out = "";
     for (var i = 0; i < n; i++) {
-      out += '<tr><td colspan="' + cols + '"><div class="skel skel-line"></div></td></tr>';
+      out +=
+        '<tr><td colspan="' +
+        cols +
+        '"><div class="skel skel-line"></div></td></tr>';
     }
     return out;
   }
 
   // Status bar: db path, index counts, price source (refreshed on SSE change).
   function loadMeta() {
-    fetchJSON("/api/meta").then(function (m) {
-      var db = document.getElementById("sb-db");
-      var counts = document.getElementById("sb-counts");
-      var prices = document.getElementById("sb-prices");
-      if (db) { db.textContent = m.dbPath; db.title = m.dbPath; }
-      if (counts) {
-        counts.textContent = m.counts.sessions + " sessions · " + m.counts.requests +
-          " calls · " + m.counts.prompts + " prompts · " + m.counts.events + " events";
-      }
-      if (prices) prices.textContent = "prices: " + m.priceSource;
-    }).catch(function () {});
+    fetchJSON("/api/meta")
+      .then(function (m) {
+        var db = document.getElementById("sb-db");
+        var counts = document.getElementById("sb-counts");
+        var prices = document.getElementById("sb-prices");
+        if (db) {
+          db.textContent = m.dbPath;
+          db.title = m.dbPath;
+        }
+        if (counts) {
+          counts.textContent =
+            m.counts.sessions +
+            " sessions · " +
+            m.counts.requests +
+            " calls · " +
+            m.counts.prompts +
+            " prompts · " +
+            m.counts.events +
+            " events";
+        }
+        if (prices) prices.textContent = "prices: " + m.priceSource;
+      })
+      .catch(function () {});
   }
 
   // ------------------------------------------------------------- svg charts
   /** Vertical column chart. items: [{label, value, title?, warn?}] */
   function columnChart(items, opts) {
     opts = opts || {};
-    var H = opts.height || 120, PAD = 4, LABEL_H = opts.labels ? 16 : 0;
+    var H = opts.height || 120,
+      PAD = 4,
+      LABEL_H = opts.labels ? 16 : 0;
     var W = Math.max(80, items.length * (opts.colWidth || 18));
     var max = 0;
-    items.forEach(function (it) { if (it.value > max) max = it.value; });
+    items.forEach(function (it) {
+      if (it.value > max) max = it.value;
+    });
     if (max <= 0) max = 1;
     var cw = W / items.length;
     var bars = items.map(function (it, i) {
-      var h = Math.max(it.value > 0 ? 2 : 0, (it.value / max) * (H - PAD - LABEL_H));
+      var h = Math.max(
+        it.value > 0 ? 2 : 0,
+        (it.value / max) * (H - PAD - LABEL_H),
+      );
       var x = i * cw + 1.5;
-      var color = it.warn ? "var(--warn)" : (it.color || "var(--accent)");
-      var rect = '<rect x="' + x.toFixed(1) + '" y="' + (H - LABEL_H - h).toFixed(1) +
-        '" width="' + Math.max(1, cw - 3).toFixed(1) + '" height="' + h.toFixed(1) +
-        '" rx="1.5" fill="' + color + '" opacity="0.85"><title>' + esc(it.title || it.label + ": " + it.value) + "</title></rect>";
+      var color = it.warn ? "var(--warn)" : it.color || "var(--accent)";
+      var rect =
+        '<rect x="' +
+        x.toFixed(1) +
+        '" y="' +
+        (H - LABEL_H - h).toFixed(1) +
+        '" width="' +
+        Math.max(1, cw - 3).toFixed(1) +
+        '" height="' +
+        h.toFixed(1) +
+        '" rx="1.5" fill="' +
+        color +
+        '" opacity="0.85"><title>' +
+        esc(it.title || it.label + ": " + it.value) +
+        "</title></rect>";
       var label = "";
-      if (opts.labels && (items.length <= 16 || i % Math.ceil(items.length / 16) === 0)) {
-        label = '<text x="' + (i * cw + cw / 2).toFixed(1) + '" y="' + (H - 3) +
-          '" font-size="9" fill="var(--dim)" text-anchor="middle">' + esc(it.label) + "</text>";
+      if (
+        opts.labels &&
+        (items.length <= 16 || i % Math.ceil(items.length / 16) === 0)
+      ) {
+        label =
+          '<text x="' +
+          (i * cw + cw / 2).toFixed(1) +
+          '" y="' +
+          (H - 3) +
+          '" font-size="9" fill="var(--dim)" text-anchor="middle">' +
+          esc(it.label) +
+          "</text>";
       }
       return rect + label;
     });
-    return '<svg viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" height="' + H + '">' + bars.join("") + "</svg>";
+    return (
+      '<svg viewBox="0 0 ' +
+      W +
+      " " +
+      H +
+      '" preserveAspectRatio="none" height="' +
+      H +
+      '">' +
+      bars.join("") +
+      "</svg>"
+    );
   }
 
   /** Stacked column chart. items: [{label, parts:[{value,color,name}], title}] */
   function stackedChart(items, opts) {
     opts = opts || {};
-    var H = opts.height || 120, PAD = 4;
+    var H = opts.height || 120,
+      PAD = 4;
     var W = Math.max(80, items.length * (opts.colWidth || 18));
     var max = 0;
     items.forEach(function (it) {
       var sum = 0;
-      it.parts.forEach(function (p) { sum += p.value; });
+      it.parts.forEach(function (p) {
+        sum += p.value;
+      });
       if (sum > max) max = sum;
     });
     if (max <= 0) max = 1;
     var cw = W / items.length;
     var out = items.map(function (it, i) {
-      var x = i * cw + 1.5, y = H;
+      var x = i * cw + 1.5,
+        y = H;
       var rects = it.parts.map(function (p) {
         var h = (p.value / max) * (H - PAD);
         y -= h;
         if (h <= 0) return "";
-        return '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + Math.max(1, cw - 3).toFixed(1) +
-          '" height="' + h.toFixed(1) + '" fill="' + p.color + '" opacity="0.9"></rect>';
+        return (
+          '<rect x="' +
+          x.toFixed(1) +
+          '" y="' +
+          y.toFixed(1) +
+          '" width="' +
+          Math.max(1, cw - 3).toFixed(1) +
+          '" height="' +
+          h.toFixed(1) +
+          '" fill="' +
+          p.color +
+          '" opacity="0.9"></rect>'
+        );
       });
-      return '<g>' + rects.join("") + "<title>" + esc(it.title || it.label) + "</title></g>";
+      return (
+        "<g>" +
+        rects.join("") +
+        "<title>" +
+        esc(it.title || it.label) +
+        "</title></g>"
+      );
     });
-    return '<svg viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" height="' + H + '">' + out.join("") + "</svg>";
+    return (
+      '<svg viewBox="0 0 ' +
+      W +
+      " " +
+      H +
+      '" preserveAspectRatio="none" height="' +
+      H +
+      '">' +
+      out.join("") +
+      "</svg>"
+    );
   }
 
   // ---------------------------------------------------------------- router
@@ -157,8 +272,19 @@
   function route() {
     var h = location.hash.replace(/^#/, "") || "sessions";
     var m;
-    if ((m = h.match(/^session\/([^/]+)(?:\/step-(\d+))?$/))) renderSession(decodeURIComponent(m[1]), m[2] ? Number(m[2]) : null);
-    else if ((m = h.match(/^prompt\/(.+)$/))) renderPrompt(decodeURIComponent(m[1]));
+    // session/<id>[/flow|hooks|xray|wire][/step-N]
+    if (
+      (m = h.match(
+        /^session\/([^/]+)(?:\/(flow|hooks|xray|wire))?(?:\/step-(\d+))?$/,
+      ))
+    ) {
+      renderSession(
+        decodeURIComponent(m[1]),
+        m[3] ? Number(m[3]) : null,
+        m[2] || "flow",
+      );
+    } else if ((m = h.match(/^prompt\/(.+)$/)))
+      renderPrompt(decodeURIComponent(m[1]));
     else if (h === "usage") renderUsage();
     else if (h === "analytics") renderAnalytics();
     else if (h === "prompts") renderPrompts();
@@ -174,13 +300,291 @@
   }
   window.addEventListener("hashchange", route);
 
-  function setView(html) { view.innerHTML = html; }
+  function setView(html) {
+    view.innerHTML = html;
+  }
   function fail(err) {
     setView('<div class="empty">Error: ' + esc(err.message || err) + "</div>");
   }
+  function card(k, v, alert) {
+    return (
+      '<div class="card' +
+      (alert ? " alert" : "") +
+      '"><div class="k">' +
+      k +
+      '</div><div class="v">' +
+      v +
+      "</div></div>"
+    );
+  }
+
+  // --------------------------------------------------------- wire pane (FIG/waterfall)
+
+  function bindSessionInteractions(reqs, compactSeqs, steps) {
+    var wf = document.getElementById("wf");
+    if (wf) {
+      var bySeq = {};
+      reqs.forEach(function (r) {
+        bySeq[r.seq] = r;
+      });
+      TT.bind(wf, ".wf-row", function (rowEl) {
+        var r = bySeq[rowEl.getAttribute("data-seq")];
+        return r ? wfTooltip(r, compactSeqs[r.seq]) : null;
+      });
+      wf.addEventListener("click", function (e) {
+        var rowEl = e.target.closest(".wf-row");
+        if (!rowEl) return;
+        var step = rowEl.getAttribute("data-step");
+        if (step) flashStep(step);
+      });
+    }
+
+    var mm = document.getElementById("minimap");
+    if (mm) {
+      mm.addEventListener("click", function (e) {
+        var tick = e.target.closest(".mm-tick");
+        if (!tick) return;
+        e.preventDefault();
+        flashStep(tick.getAttribute("data-step"));
+      });
+      // Scroll spy: light up the rail segment for the topmost visible step.
+      var visible = new Set();
+      var spy = new IntersectionObserver(
+        function (entries) {
+          entries.forEach(function (en) {
+            var idx = en.target.id.replace("step-", "");
+            if (en.isIntersecting) visible.add(idx);
+            else visible.delete(idx);
+          });
+          var top = null;
+          visible.forEach(function (idx) {
+            var n = Number(idx);
+            if (top == null || n < top) top = n;
+          });
+          mm.querySelectorAll(".mm-tick").forEach(function (t) {
+            t.classList.toggle("on", Number(t.getAttribute("data-step")) === top);
+          });
+        },
+        { rootMargin: "-64px 0px -40% 0px" },
+      );
+      document.querySelectorAll(".step[id^=step-]").forEach(function (st) {
+        spy.observe(st);
+      });
+    }
+  }
+
+  function wfTooltip(r, compaction) {
+    var stream = r.durationMs != null && r.ttftMs != null ? r.durationMs - r.ttftMs : null;
+    var h = TT.title("call " + r.seq + (r.model ? " · " + r.model : ""));
+    h += TT.row(
+      "status",
+      r.status == null
+        ? '<span class="warn-text">no response</span>'
+        : r.status >= 400
+          ? '<span class="warn-text">' + r.status + "</span>"
+          : String(r.status),
+    );
+    if (r.ttftMs != null) h += TT.row("ttft", fmtDur(r.ttftMs));
+    if (stream != null) h += TT.row("stream", fmtDur(stream));
+    h += TT.row("total", fmtDur(r.durationMs));
+    h += TT.row("fresh in", fmtTok(r.promptTokens));
+    h += TT.row("cache read", fmtTok(r.cacheRead));
+    if (r.cacheCreation) h += TT.row("cache write", fmtTok(r.cacheCreation));
+    h += TT.row("output", fmtTok(r.completionTokens));
+    if (r.reasoningTokens) h += TT.row("reasoning", fmtTok(r.reasoningTokens));
+    if (r.stopReason) h += TT.row("stop", TT.esc(r.stopReason));
+    h += TT.row("transcript", r.transcriptItems + " items");
+    if (compaction)
+      h += TT.row(
+        "compaction",
+        '<span class="warn-text">' + compaction.from + " → " + compaction.to + " items</span>",
+      );
+    if (r.promptHash) h += TT.row("prompt", r.promptHash.slice(0, 8));
+    if (r.agentStepIndex != null) h += TT.row("step", "#" + r.agentStepIndex + " · click to jump");
+    return h;
+  }
+
+  function minimapHtml(steps) {
+    if (steps.length < 8) return "";
+    return (
+      '<nav class="minimap" id="minimap" aria-label="transcript minimap">' +
+      steps
+        .map(function (st) {
+          var cls = st.errored
+            ? "e"
+            : st.role === "user"
+              ? "u"
+              : st.role === "agent"
+                ? "a"
+                : "s";
+          var label =
+            "#" +
+            st.stepIndex +
+            " " +
+            st.role +
+            (st.toolName ? " · " + st.toolName.split(/\s+/)[0] : "");
+          return (
+            '<a class="mm-tick ' +
+            cls +
+            '" href="#" data-step="' +
+            st.stepIndex +
+            '" title="' +
+            esc(label) +
+            '"></a>'
+          );
+        })
+        .join("") +
+      "</nav>"
+    );
+  }
+
+  function laneSection(reqs, compactSeqs) {
+    if (!reqs.length) return "";
+    var ctxItems = reqs.map(function (r) {
+      var c = compactSeqs[r.seq];
+      return {
+        label: String(r.seq),
+        value: r.transcriptItems,
+        warn: !!c,
+        title:
+          "call " +
+          r.seq +
+          ": " +
+          r.transcriptItems +
+          " transcript items" +
+          (c ? " — COMPACTION (was " + c.from + ")" : ""),
+      };
+    });
+    var tokItems = reqs.map(function (r) {
+      return {
+        label: String(r.seq),
+        title:
+          "call " +
+          r.seq +
+          ": fresh in " +
+          fmtTok(r.promptTokens) +
+          " · cache read " +
+          fmtTok(r.cacheRead) +
+          " · cache write " +
+          fmtTok(r.cacheCreation) +
+          " · out " +
+          fmtTok(r.completionTokens),
+        parts: [
+          { value: r.cacheRead, color: "var(--cache)" },
+          { value: r.cacheCreation, color: "var(--purple)" },
+          { value: r.promptTokens, color: "var(--accent)" },
+          { value: r.completionTokens, color: "var(--ok)" },
+        ],
+      };
+    });
+    return (
+      '<div class="split">' +
+      '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Context growth — transcript items per call · amber = mid-task compaction</div>' +
+      columnChart(ctxItems, { height: 110, labels: false }) +
+      "</div>" +
+      '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.2</span>Token flow per call</div>' +
+      stackedChart(tokItems, { height: 110 }) +
+      '<div class="legend">' +
+      '<span><span class="sw" style="background:var(--cache)"></span>cache read</span>' +
+      '<span><span class="sw" style="background:var(--purple)"></span>cache write</span>' +
+      '<span><span class="sw" style="background:var(--accent)"></span>fresh input</span>' +
+      '<span><span class="sw" style="background:var(--ok)"></span>output</span>' +
+      "</div></div></div>"
+    );
+  }
+
+  function waterfall(reqs, compactSeqs) {
+    if (!reqs.length)
+      return '<div class="dim">No wire data (re-index with tracetap ≥ 0.3).</div>';
+    var t0 = Infinity,
+      t1 = -Infinity;
+    reqs.forEach(function (r) {
+      if (r.ts > 0) t0 = Math.min(t0, r.ts);
+      var end = r.ts + (r.durationMs || 0) / 1000;
+      t1 = Math.max(t1, end);
+    });
+    if (!isFinite(t0) || t1 <= t0) {
+      t0 = 0;
+      t1 = 1;
+    }
+    var span = t1 - t0;
+    return reqs
+      .map(function (r) {
+        var left = r.ts > 0 ? ((r.ts - t0) / span) * 100 : 0;
+        var durW =
+          r.durationMs != null ? Math.max(0.4, (r.durationMs / 1000 / span) * 100) : 0.6;
+        var ttftW = r.ttftMs != null ? (r.ttftMs / 1000 / span) * 100 : 0;
+        var bars = "";
+        if (ttftW > 0) {
+          bars +=
+            '<div class="wf-bar wait" style="left:' +
+            left.toFixed(2) +
+            "%;width:" +
+            ttftW.toFixed(2) +
+            '%"></div>';
+          bars +=
+            '<div class="wf-bar' +
+            (r.errored ? " errored" : "") +
+            '" style="left:' +
+            (left + ttftW).toFixed(2) +
+            "%;width:" +
+            Math.max(0.3, durW - ttftW).toFixed(2) +
+            '%"></div>';
+        } else {
+          bars +=
+            '<div class="wf-bar' +
+            (r.errored ? " errored" : "") +
+            '" style="left:' +
+            left.toFixed(2) +
+            "%;width:" +
+            durW.toFixed(2) +
+            '%"></div>';
+        }
+        var c = compactSeqs[r.seq];
+        var meta =
+          (r.status == null ? "no response" : r.status) +
+          " · " +
+          fmtDur(r.durationMs) +
+          (r.ttftMs != null ? " · ttft " + fmtDur(r.ttftMs) : "") +
+          " · " +
+          fmtTok(r.completionTokens) +
+          " out" +
+          (r.stopReason ? " · " + esc(r.stopReason) : "");
+        var linked = r.agentStepIndex != null;
+        return (
+          '<div class="wf-row' +
+          (linked ? " click" : "") +
+          '" data-seq="' +
+          r.seq +
+          '"' +
+          (linked ? ' data-step="' + r.agentStepIndex + '"' : "") +
+          ">" +
+          '<div class="wf-label">' +
+          r.seq +
+          (c ? ' <span class="wf-compact">⇣</span>' : "") +
+          "</div>" +
+          '<div class="wf-track">' +
+          bars +
+          "</div>" +
+          '<div class="wf-meta">' +
+          meta +
+          "</div>" +
+          "</div>"
+        );
+      })
+      .join("");
+  }
 
   // ------------------------------------------------------------- sessions
-  var sess = { sort: "started_at", order: "desc", q: "", agent: "", model: "", project: "", errored: false };
+  var sess = {
+    sort: "started_at",
+    order: "desc",
+    q: "",
+    agent: "",
+    model: "",
+    project: "",
+    errored: false,
+  };
 
   var SESSION_COLS = [
     { key: "agent", label: "Agent", sortable: true },
@@ -193,28 +597,44 @@
     { key: "total_out_tokens", label: "Out", sortable: true, num: true },
     { key: "cache", label: "Cache hit", num: true },
     { key: "errors", label: "Errs", num: true },
-    { key: "cost_usd", label: "Cost", sortable: true, num: true }
+    { key: "cost_usd", label: "Cost", sortable: true, num: true },
   ];
 
   function renderSessions() {
     current = { name: "sessions" };
     var controls =
       '<div class="controls">' +
-      '<input id="q" type="search" placeholder="Full-text search every session (FTS5) — try an error message, a file name, a tool name…" value="' + esc(sess.q) + '" />' +
-      '<input id="f-agent" class="filter" type="text" placeholder="agent" value="' + esc(sess.agent) + '" />' +
-      '<input id="f-model" class="filter" type="text" placeholder="model" value="' + esc(sess.model) + '" />' +
-      '<input id="f-project" class="filter" type="text" placeholder="project" value="' + esc(sess.project) + '" />' +
-      '<label class="check"><input id="f-errored" type="checkbox"' + (sess.errored ? " checked" : "") + "/> errored only</label>" +
+      '<input id="q" type="search" placeholder="Full-text search every session (FTS5) — try an error message, a file name, a tool name…" value="' +
+      esc(sess.q) +
+      '" />' +
+      '<input id="f-agent" class="filter" type="text" placeholder="agent" value="' +
+      esc(sess.agent) +
+      '" />' +
+      '<input id="f-model" class="filter" type="text" placeholder="model" value="' +
+      esc(sess.model) +
+      '" />' +
+      '<input id="f-project" class="filter" type="text" placeholder="project" value="' +
+      esc(sess.project) +
+      '" />' +
+      '<label class="check"><input id="f-errored" type="checkbox"' +
+      (sess.errored ? " checked" : "") +
+      "/> errored only</label>" +
       "</div>" +
       '<div class="meta-line" id="meta">Loading…</div>' +
-      '<div class="tbl-wrap"><table><thead><tr id="head"></tr></thead><tbody id="rows">' + skelRows(8, SESSION_COLS.length) + '</tbody></table></div>' +
+      '<div class="tbl-wrap"><table><thead><tr id="head"></tr></thead><tbody id="rows">' +
+      skelRows(8, SESSION_COLS.length) +
+      "</tbody></table></div>" +
       '<div class="empty" id="empty" style="display:none"></div>';
     setView(controls);
 
     ["q", "f-agent", "f-model", "f-project"].forEach(function (id) {
-      document.getElementById(id).addEventListener("input", debounce(onSessionControls, 200));
+      document
+        .getElementById(id)
+        .addEventListener("input", debounce(onSessionControls, 200));
     });
-    document.getElementById("f-errored").addEventListener("change", onSessionControls);
+    document
+      .getElementById("f-errored")
+      .addEventListener("change", onSessionControls);
     loadSessionData();
   }
 
@@ -243,32 +663,58 @@
     var p = sessionParams();
     p.set("sort", sess.sort);
     p.set("order", sess.order);
-    fetchJSON("/api/sessions?" + p).then(function (data) {
-      var meta = document.getElementById("meta");
-      if (meta) meta.textContent = data.count + " session" + (data.count === 1 ? "" : "s");
-      renderSessionRows(data.sessions);
-    }).catch(fail);
+    fetchJSON("/api/sessions?" + p)
+      .then(function (data) {
+        var meta = document.getElementById("meta");
+        if (meta)
+          meta.textContent =
+            data.count + " session" + (data.count === 1 ? "" : "s");
+        renderSessionRows(data.sessions);
+      })
+      .catch(fail);
   }
 
   function renderSessionHead() {
     var head = document.getElementById("head");
     if (!head) return;
     head.innerHTML = SESSION_COLS.map(function (c) {
-      var arrow = c.key === sess.sort ? ' <span class="arrow">' + (sess.order === "asc" ? "▲" : "▼") + "</span>" : "";
-      return '<th class="' + (c.num ? "num " : "") + (c.sortable ? "sortable" : "") + '" data-key="' + c.key + '" data-sortable="' + (c.sortable ? 1 : 0) + '">' + esc(c.label) + arrow + "</th>";
+      var arrow =
+        c.key === sess.sort
+          ? ' <span class="arrow">' +
+            (sess.order === "asc" ? "▲" : "▼") +
+            "</span>"
+          : "";
+      return (
+        '<th class="' +
+        (c.num ? "num " : "") +
+        (c.sortable ? "sortable" : "") +
+        '" data-key="' +
+        c.key +
+        '" data-sortable="' +
+        (c.sortable ? 1 : 0) +
+        '">' +
+        esc(c.label) +
+        arrow +
+        "</th>"
+      );
     }).join("");
     head.querySelectorAll("th[data-sortable='1']").forEach(function (th) {
       th.addEventListener("click", function () {
         var key = th.getAttribute("data-key");
-        if (sess.sort === key) sess.order = sess.order === "asc" ? "desc" : "asc";
-        else { sess.sort = key; sess.order = "desc"; }
+        if (sess.sort === key)
+          sess.order = sess.order === "asc" ? "desc" : "asc";
+        else {
+          sess.sort = key;
+          sess.order = "desc";
+        }
         loadSessionData();
       });
     });
   }
 
   function cacheRate(s) {
-    var denom = (s.totalInTokens || 0) + (s.cacheRead || 0) + (s.cacheCreation || 0);
+    var denom =
+      (s.totalInTokens || 0) + (s.cacheRead || 0) + (s.cacheCreation || 0);
     return denom > 0 ? (s.cacheRead || 0) / denom : 0;
   }
 
@@ -279,28 +725,62 @@
     if (!sessions.length) {
       rows.innerHTML = "";
       empty.style.display = "block";
-      empty.innerHTML = "No indexed sessions. Capture with <code>tracetap claude|codex|gemini</code>, then run <code>tracetap index</code>.";
+      empty.innerHTML =
+        "No indexed sessions. Capture with <code>tracetap claude|codex|gemini</code>, then run <code>tracetap index</code>.";
       return;
     }
     empty.style.display = "none";
-    rows.innerHTML = sessions.map(function (s) {
-      return '<tr class="click" data-id="' + esc(s.sessionId) + '">' +
-        "<td>" + agentPill(s.agent) + "</td>" +
-        "<td>" + esc(s.model || "—") + "</td>" +
-        '<td class="dim" title="' + esc(s.projectCwd) + '">' + esc(basename(s.projectCwd)) + "</td>" +
-        "<td>" + fmtTime(s.startedAt) + "</td>" +
-        '<td class="num">' + fmtDur(s.durationMs) + "</td>" +
-        '<td class="num">' + (s.turns || 0) + "</td>" +
-        '<td class="num">' + fmtTok(s.totalInTokens) + "</td>" +
-        '<td class="num">' + fmtTok(s.totalOutTokens) + "</td>" +
-        '<td class="num">' + fmtPct(cacheRate(s)) + "</td>" +
-        '<td class="num">' + (s.errorCount ? '<span class="pill err">' + s.errorCount + "</span>" : "0") + "</td>" +
-        '<td class="num">' + fmtCost(s.costUsd) + "</td>" +
-        "</tr>";
-    }).join("");
+    rows.innerHTML = sessions
+      .map(function (s) {
+        return (
+          '<tr class="click" data-id="' +
+          esc(s.sessionId) +
+          '">' +
+          "<td>" +
+          agentPill(s.agent) +
+          "</td>" +
+          "<td>" +
+          esc(s.model || "—") +
+          "</td>" +
+          '<td class="dim" title="' +
+          esc(s.projectCwd) +
+          '">' +
+          esc(basename(s.projectCwd)) +
+          "</td>" +
+          "<td>" +
+          fmtTime(s.startedAt) +
+          "</td>" +
+          '<td class="num">' +
+          fmtDur(s.durationMs) +
+          "</td>" +
+          '<td class="num">' +
+          (s.turns || 0) +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(s.totalInTokens) +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(s.totalOutTokens) +
+          "</td>" +
+          '<td class="num">' +
+          fmtPct(cacheRate(s)) +
+          "</td>" +
+          '<td class="num">' +
+          (s.errorCount
+            ? '<span class="pill err">' + s.errorCount + "</span>"
+            : "0") +
+          "</td>" +
+          '<td class="num">' +
+          fmtCost(s.costUsd) +
+          "</td>" +
+          "</tr>"
+        );
+      })
+      .join("");
     rows.querySelectorAll("tr[data-id]").forEach(function (tr) {
       tr.addEventListener("click", function () {
-        location.hash = "#session/" + encodeURIComponent(tr.getAttribute("data-id"));
+        location.hash =
+          "#session/" + encodeURIComponent(tr.getAttribute("data-id"));
       });
     });
   }
@@ -309,54 +789,112 @@
     var p = sessionParams();
     p.set("q", sess.q);
     p.set("limit", "50");
-    fetchJSON("/api/search?" + p).then(function (data) {
-      var meta = document.getElementById("meta");
-      if (meta) meta.textContent = data.count + " hit" + (data.count === 1 ? "" : "s") + " for “" + sess.q + "”";
-      var head = document.getElementById("head");
-      head.innerHTML = "<th>Session</th><th>Model</th><th>Match</th><th>When</th>";
-      var rows = document.getElementById("rows");
-      var empty = document.getElementById("empty");
-      if (!data.hits.length) {
-        rows.innerHTML = "";
-        empty.style.display = "block";
-        empty.textContent = "No matches.";
-        return;
-      }
-      empty.style.display = "none";
-      rows.innerHTML = data.hits.map(function (h) {
-        var snip = esc(h.snippet).replace(/\[([^\]]*)\]/g, "<b>$1</b>");
-        return '<tr class="click" data-id="' + esc(h.sessionId) + '" data-step="' + h.stepIndex + '">' +
-          "<td>" + agentPill(h.agent) + ' <span class="pill">#' + h.stepIndex + "</span>" +
-          (h.errored ? ' <span class="pill err">errored</span>' : "") + "</td>" +
-          "<td>" + esc(h.model) + "</td>" +
-          '<td><div class="snippet">' + snip + "</div>" +
-          (h.toolName ? '<div class="hash">↳ ' + esc(h.toolName) + "</div>" : "") + "</td>" +
-          '<td class="dim">' + fmtTime(h.startedAt) + "</td>" +
-          "</tr>";
-      }).join("");
-      rows.querySelectorAll("tr[data-id]").forEach(function (tr) {
-        tr.addEventListener("click", function () {
-          // Deep-link straight to the matching transcript step.
-          location.hash = "#session/" + encodeURIComponent(tr.getAttribute("data-id")) +
-            "/step-" + tr.getAttribute("data-step");
+    fetchJSON("/api/search?" + p)
+      .then(function (data) {
+        var meta = document.getElementById("meta");
+        if (meta)
+          meta.textContent =
+            data.count +
+            " hit" +
+            (data.count === 1 ? "" : "s") +
+            " for “" +
+            sess.q +
+            "”";
+        var head = document.getElementById("head");
+        head.innerHTML =
+          "<th>Session</th><th>Model</th><th>Match</th><th>When</th>";
+        var rows = document.getElementById("rows");
+        var empty = document.getElementById("empty");
+        if (!data.hits.length) {
+          rows.innerHTML = "";
+          empty.style.display = "block";
+          empty.textContent = "No matches.";
+          return;
+        }
+        empty.style.display = "none";
+        rows.innerHTML = data.hits
+          .map(function (h) {
+            var snip = esc(h.snippet).replace(/\[([^\]]*)\]/g, "<b>$1</b>");
+            return (
+              '<tr class="click" data-id="' +
+              esc(h.sessionId) +
+              '" data-step="' +
+              h.stepIndex +
+              '">' +
+              "<td>" +
+              agentPill(h.agent) +
+              ' <span class="pill">#' +
+              h.stepIndex +
+              "</span>" +
+              (h.errored ? ' <span class="pill err">errored</span>' : "") +
+              "</td>" +
+              "<td>" +
+              esc(h.model) +
+              "</td>" +
+              '<td><div class="snippet">' +
+              snip +
+              "</div>" +
+              (h.toolName
+                ? '<div class="hash">↳ ' + esc(h.toolName) + "</div>"
+                : "") +
+              "</td>" +
+              '<td class="dim">' +
+              fmtTime(h.startedAt) +
+              "</td>" +
+              "</tr>"
+            );
+          })
+          .join("");
+        rows.querySelectorAll("tr[data-id]").forEach(function (tr) {
+          tr.addEventListener("click", function () {
+            // Deep-link straight to the matching transcript step.
+            location.hash =
+              "#session/" +
+              encodeURIComponent(tr.getAttribute("data-id")) +
+              "/step-" +
+              tr.getAttribute("data-step");
+          });
         });
-      });
-    }).catch(fail);
+      })
+      .catch(fail);
   }
 
   // -------------------------------------------------------- session detail
-  function renderSession(id, stepN) {
-    if (current.name === "session" && current.arg === id && stepN != null) {
+  function renderSession(id, stepN, pane) {
+    if (
+      current.name === "session" &&
+      current.arg === id &&
+      stepN != null &&
+      !pane
+    ) {
       // Same session, new step anchor (e.g. minimap click) — just scroll.
       flashStep(stepN);
       return;
     }
-    current = { name: "session", arg: id };
+    // Same session, only pane change — don't reload.
+    if (
+      current.name === "session" &&
+      current.arg === id &&
+      pane &&
+      document.getElementById("pane-" + pane)
+    ) {
+      activatePane(pane);
+      if (stepN != null) {
+        activatePane("wire");
+        setTimeout(function () {
+          flashStep(stepN);
+        }, 30);
+      }
+      return;
+    }
+    current = { name: "session", arg: id, pane: pane || "flow" };
     setView(skeleton({ cards: 8, rows: 6 }));
-    fetchJSON("/api/session/" + encodeURIComponent(id)).then(function (data) {
-      if (current.name !== "session" || current.arg !== id) return;
-      drawSession(data, stepN);
-    }).catch(fail);
+    fetchJSON("/api/session/" + encodeURIComponent(id))
+      .then(function (data) {
+        if (current.name !== "session" || current.arg !== id) return;
+        drawSession(data, stepN, current.pane || "flow");
+      })
+      .catch(fail);
   }
 
   function flashStep(stepIndex) {
@@ -368,216 +906,823 @@
     elStep.classList.add("flash");
   }
 
-  function drawSession(data, stepN) {
-    var s = data.session, reqs = data.requests, steps = data.steps;
+  function drawSession(data, stepN, initialPane) {
+    var s = data.session,
+      reqs = data.requests,
+      steps = data.steps;
+    var hooks = data.hooks || [];
+    var flow = data.flow || { nodes: [], edges: [] };
+    var contextTimeline = data.contextTimeline || null;
     var compactSeqs = {};
-    data.compactions.forEach(function (c) { compactSeqs[c.seq] = c; });
+    var compactionList = data.compactions || [];
+    compactionList.forEach(function (c) {
+      compactSeqs[c.seq] = c;
+    });
 
-    var ttfts = reqs.map(function (r) { return r.ttftMs; }).filter(function (v) { return v != null; }).sort(function (a, b) { return a - b; });
-    var ttftP50 = ttfts.length ? ttfts[Math.floor((ttfts.length - 1) * 0.5)] : null;
-    var errReqs = reqs.filter(function (r) { return r.errored; }).length;
+    var ttfts = reqs
+      .map(function (r) {
+        return r.ttftMs;
+      })
+      .filter(function (v) {
+        return v != null;
+      })
+      .sort(function (a, b) {
+        return a - b;
+      });
+    var ttftP50 = ttfts.length
+      ? ttfts[Math.floor((ttfts.length - 1) * 0.5)]
+      : null;
+    var errReqs = reqs.filter(function (r) {
+      return r.errored;
+    }).length;
 
     var cards =
       card("Cost", fmtCost(s.costUsd)) +
       card("Duration", fmtDur(s.durationMs)) +
       card("Turns", s.turns || 0) +
-      card("API calls", reqs.length + (errReqs ? ' <small class="warn-text">' + errReqs + " failed</small>" : "")) +
-      card("Tokens in/out", fmtTok(s.totalInTokens) + " <small>/</small> " + fmtTok(s.totalOutTokens)) +
+      card(
+        "API calls",
+        reqs.length +
+          (errReqs
+            ? ' <small class="warn-text">' + errReqs + " failed</small>"
+            : ""),
+      ) +
+      card(
+        "Tokens in/out",
+        fmtTok(s.totalInTokens) +
+          " <small>/</small> " +
+          fmtTok(s.totalOutTokens),
+      ) +
       card("Cache hit", fmtPct(cacheRate(s))) +
       card("TTFT p50", ttftP50 != null ? fmtDur(ttftP50) : "—") +
-      card("Compactions", data.compactions.length, data.compactions.length > 0);
+      card("Hooks", hooks.length) +
+      card("Compactions", compactionList.length, compactionList.length > 0);
+
+    var pane = initialPane || "flow";
+    function subnavBtn(name, label, count) {
+      return (
+        '<button type="button" class="subnav-btn' +
+        (pane === name ? " active" : "") +
+        '" data-pane="' +
+        name +
+        '">' +
+        label +
+        (count != null ? " <small>" + count + "</small>" : "") +
+        "</button>"
+      );
+    }
 
     var html =
       '<div class="crumb"><a href="#sessions">← sessions</a></div>' +
-      '<div class="detail-head"><h1>' + agentPill(s.agent) + " " + esc(s.model) + "</h1>" +
-      '<span class="dim">' + esc(s.projectCwd) + " · " + fmtTime(s.startedAt) + "</span>" +
+      '<div class="detail-head"><h1>' +
+      agentPill(s.agent) +
+      " " +
+      esc(s.model) +
+      "</h1>" +
+      '<span class="dim">' +
+      esc(s.projectCwd) +
+      " · " +
+      fmtTime(s.startedAt) +
+      "</span>" +
       '<span class="actions">' +
-      (data.reportAvailable ? '<a href="/report?session=' + encodeURIComponent(s.sessionId) + '" target="_blank" rel="noopener">wire report ↗</a>' : "") +
+      (data.reportAvailable
+        ? '<a href="/report?session=' +
+          encodeURIComponent(s.sessionId) +
+          '" target="_blank" rel="noopener">wire report ↗</a>'
+        : "") +
       "</span></div>" +
-      '<div class="cards">' + cards + "</div>" +
+      '<div class="cards">' +
+      cards +
+      "</div>" +
+      '<nav class="session-subnav" id="session-subnav">' +
+      subnavBtn("flow", "Flow") +
+      subnavBtn("hooks", "Hooks", hooks.length) +
+      subnavBtn("xray", "Context X-Ray") +
+      subnavBtn("wire", "Wire") +
+      "</nav>" +
+      '<div class="session-panes">' +
+      '<section class="session-pane' +
+      (pane === "flow" ? " active" : "") +
+      '" id="pane-flow">' +
+      renderFlowPane(flow) +
+      "</section>" +
+      '<section class="session-pane' +
+      (pane === "hooks" ? " active" : "") +
+      '" id="pane-hooks">' +
+      renderHooksPane(hooks) +
+      "</section>" +
+      '<section class="session-pane' +
+      (pane === "xray" ? " active" : "") +
+      '" id="pane-xray">' +
+      renderXrayPane(s.sessionId, reqs, contextTimeline) +
+      "</section>" +
+      '<section class="session-pane' +
+      (pane === "wire" ? " active" : "") +
+      '" id="pane-wire">' +
       laneSection(reqs, compactSeqs) +
-      '<h2 class="sec">Request waterfall <small>(' + reqs.length + " API calls · hover for wire metrics · click to jump to the step)</small></h2>" +
-      '<div class="chart-box waterfall" id="wf">' + waterfall(reqs, compactSeqs) + "</div>" +
-      '<h2 class="sec">Transcript <small>(' + steps.length + " steps)</small></h2>" +
-      '<div class="steps">' + steps.map(stepCard).join("") + "</div>" +
-      minimapHtml(steps);
+      '<h2 class="sec">Request waterfall <small>(' +
+      reqs.length +
+      " API calls · hover for wire metrics · click to jump to the step)</small></h2>" +
+      '<div class="chart-box waterfall" id="wf">' +
+      waterfall(reqs, compactSeqs) +
+      "</div>" +
+      '<h2 class="sec">Transcript <small>(' +
+      steps.length +
+      " steps)</small></h2>" +
+      '<div class="steps">' +
+      steps.map(stepCard).join("") +
+      "</div>" +
+      minimapHtml(steps) +
+      "</section>" +
+      "</div>" +
+      '<div id="payload-pop" class="payload-pop" hidden></div>';
     setView(html);
     bindSessionInteractions(reqs, compactSeqs, steps);
-    if (stepN != null) setTimeout(function () { flashStep(stepN); }, 30);
-  }
-
-  function bindSessionInteractions(reqs, compactSeqs, steps) {
-    var wf = document.getElementById("wf");
-    if (wf) {
-      var bySeq = {};
-      reqs.forEach(function (r) { bySeq[r.seq] = r; });
-      TT.bind(wf, ".wf-row", function (rowEl) {
-        var r = bySeq[rowEl.getAttribute("data-seq")];
-        return r ? wfTooltip(r, compactSeqs[r.seq]) : null;
-      });
-      wf.addEventListener("click", function (e) {
-        var rowEl = e.target.closest(".wf-row");
-        if (!rowEl) return;
-        var step = rowEl.getAttribute("data-step");
-        if (step) flashStep(step);
-      });
-    }
-
-    var mm = document.getElementById("minimap");
-    if (mm) {
-      mm.addEventListener("click", function (e) {
-        var tick = e.target.closest(".mm-tick");
-        if (!tick) return;
-        e.preventDefault();
-        flashStep(tick.getAttribute("data-step"));
-      });
-      // Scroll spy: light up the rail segment for the topmost visible step.
-      var visible = new Set();
-      var spy = new IntersectionObserver(function (entries) {
-        entries.forEach(function (en) {
-          var idx = en.target.id.replace("step-", "");
-          if (en.isIntersecting) visible.add(idx);
-          else visible.delete(idx);
-        });
-        var top = null;
-        visible.forEach(function (idx) {
-          var n = Number(idx);
-          if (top == null || n < top) top = n;
-        });
-        mm.querySelectorAll(".mm-tick").forEach(function (t) {
-          t.classList.toggle("on", Number(t.getAttribute("data-step")) === top);
-        });
-      }, { rootMargin: "-64px 0px -40% 0px" });
-      document.querySelectorAll(".step[id^=step-]").forEach(function (st) { spy.observe(st); });
+    bindSessionPanes(s.sessionId, reqs, contextTimeline);
+    bindPayloadPopovers();
+    if (stepN != null) {
+      activatePane("wire");
+      setTimeout(function () {
+        flashStep(stepN);
+      }, 30);
     }
   }
 
-  function wfTooltip(r, compaction) {
-    var stream = r.durationMs != null && r.ttftMs != null ? r.durationMs - r.ttftMs : null;
-    var h = TT.title("call " + r.seq + (r.model ? " · " + r.model : ""));
-    h += TT.row("status", r.status == null ? '<span class="warn-text">no response</span>' : r.status >= 400 ? '<span class="warn-text">' + r.status + "</span>" : String(r.status));
-    if (r.ttftMs != null) h += TT.row("ttft", fmtDur(r.ttftMs));
-    if (stream != null) h += TT.row("stream", fmtDur(stream));
-    h += TT.row("total", fmtDur(r.durationMs));
-    h += TT.row("fresh in", fmtTok(r.promptTokens));
-    h += TT.row("cache read", fmtTok(r.cacheRead));
-    if (r.cacheCreation) h += TT.row("cache write", fmtTok(r.cacheCreation));
-    h += TT.row("output", fmtTok(r.completionTokens));
-    if (r.reasoningTokens) h += TT.row("reasoning", fmtTok(r.reasoningTokens));
-    if (r.stopReason) h += TT.row("stop", TT.esc(r.stopReason));
-    h += TT.row("transcript", r.transcriptItems + " items");
-    if (compaction) h += TT.row("compaction", '<span class="warn-text">' + compaction.from + " → " + compaction.to + " items</span>");
-    if (r.promptHash) h += TT.row("prompt", r.promptHash.slice(0, 8));
-    if (r.agentStepIndex != null) h += TT.row("step", "#" + r.agentStepIndex + " · click to jump");
-    return h;
-  }
-
-  function minimapHtml(steps) {
-    if (steps.length < 8) return "";
-    return '<nav class="minimap" id="minimap" aria-label="transcript minimap">' +
-      steps.map(function (st) {
-        var cls = st.errored ? "e" : st.role === "user" ? "u" : st.role === "agent" ? "a" : "s";
-        var label = "#" + st.stepIndex + " " + st.role + (st.toolName ? " · " + st.toolName.split(/\s+/)[0] : "");
-        return '<a class="mm-tick ' + cls + '" href="#" data-step="' + st.stepIndex + '" title="' + esc(label) + '"></a>';
-      }).join("") + "</nav>";
-  }
-
-  function card(k, v, alert) {
-    return '<div class="card' + (alert ? " alert" : "") + '"><div class="k">' + k + '</div><div class="v">' + v + "</div></div>";
-  }
-
-  function laneSection(reqs, compactSeqs) {
-    if (!reqs.length) return "";
-    var ctxItems = reqs.map(function (r) {
-      var c = compactSeqs[r.seq];
-      return {
-        label: String(r.seq),
-        value: r.transcriptItems,
-        warn: !!c,
-        title: "call " + r.seq + ": " + r.transcriptItems + " transcript items" + (c ? " — COMPACTION (was " + c.from + ")" : "")
-      };
+  function activatePane(name) {
+    document
+      .querySelectorAll("#session-subnav [data-pane]")
+      .forEach(function (a) {
+        a.classList.toggle("active", a.getAttribute("data-pane") === name);
+      });
+    document.querySelectorAll(".session-pane").forEach(function (p) {
+      p.classList.toggle("active", p.id === "pane-" + name);
     });
-    var tokItems = reqs.map(function (r) {
-      return {
-        label: String(r.seq),
-        title: "call " + r.seq + ": fresh in " + fmtTok(r.promptTokens) + " · cache read " + fmtTok(r.cacheRead) +
-          " · cache write " + fmtTok(r.cacheCreation) + " · out " + fmtTok(r.completionTokens),
-        parts: [
-          { value: r.cacheRead, color: "var(--cache)" },
-          { value: r.cacheCreation, color: "var(--purple)" },
-          { value: r.promptTokens, color: "var(--accent)" },
-          { value: r.completionTokens, color: "var(--ok)" }
-        ]
-      };
-    });
-    return '<div class="split">' +
-      '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Context growth — transcript items per call · amber = mid-task compaction</div>' +
-      columnChart(ctxItems, { height: 110, labels: false }) + "</div>" +
-      '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.2</span>Token flow per call</div>' +
-      stackedChart(tokItems, { height: 110 }) +
-      '<div class="legend">' +
-      '<span><span class="sw" style="background:var(--cache)"></span>cache read</span>' +
-      '<span><span class="sw" style="background:var(--purple)"></span>cache write</span>' +
-      '<span><span class="sw" style="background:var(--accent)"></span>fresh input</span>' +
-      '<span><span class="sw" style="background:var(--ok)"></span>output</span>' +
-      "</div></div></div>";
-  }
-
-  function waterfall(reqs, compactSeqs) {
-    if (!reqs.length) return '<div class="dim">No wire data (re-index with tracetap ≥ 0.3).</div>';
-    var t0 = Infinity, t1 = -Infinity;
-    reqs.forEach(function (r) {
-      if (r.ts > 0) t0 = Math.min(t0, r.ts);
-      var end = r.ts + (r.durationMs || 0) / 1000;
-      t1 = Math.max(t1, end);
-    });
-    if (!isFinite(t0) || t1 <= t0) { t0 = 0; t1 = 1; }
-    var span = t1 - t0;
-    return reqs.map(function (r) {
-      var left = r.ts > 0 ? ((r.ts - t0) / span) * 100 : 0;
-      var durW = r.durationMs != null ? Math.max(0.4, (r.durationMs / 1000 / span) * 100) : 0.6;
-      var ttftW = r.ttftMs != null ? (r.ttftMs / 1000 / span) * 100 : 0;
-      var bars = "";
-      if (ttftW > 0) {
-        bars += '<div class="wf-bar wait" style="left:' + left.toFixed(2) + "%;width:" + ttftW.toFixed(2) + '%"></div>';
-        bars += '<div class="wf-bar' + (r.errored ? " errored" : "") + '" style="left:' + (left + ttftW).toFixed(2) + "%;width:" + Math.max(0.3, durW - ttftW).toFixed(2) + '%"></div>';
-      } else {
-        bars += '<div class="wf-bar' + (r.errored ? " errored" : "") + '" style="left:' + left.toFixed(2) + "%;width:" + durW.toFixed(2) + '%"></div>';
+    if (current.name === "session" && current.arg) {
+      current.pane = name;
+      var next = "#session/" + encodeURIComponent(current.arg) + "/" + name;
+      if (location.hash !== next) {
+        // Update hash without re-routing away from the session.
+        history.replaceState(null, "", next);
       }
-      var c = compactSeqs[r.seq];
-      var meta = (r.status == null ? "no response" : r.status) +
-        " · " + fmtDur(r.durationMs) +
-        (r.ttftMs != null ? " · ttft " + fmtDur(r.ttftMs) : "") +
-        " · " + fmtTok(r.completionTokens) + " out" +
-        (r.stopReason ? " · " + esc(r.stopReason) : "");
-      var linked = r.agentStepIndex != null;
-      return '<div class="wf-row' + (linked ? " click" : "") + '" data-seq="' + r.seq + '"' +
-        (linked ? ' data-step="' + r.agentStepIndex + '"' : "") + ">" +
-        '<div class="wf-label">' + r.seq + (c ? ' <span class="wf-compact">⇣</span>' : "") + "</div>" +
-        '<div class="wf-track">' + bars + "</div>" +
-        '<div class="wf-meta">' + meta + "</div>" +
+    }
+  }
+
+  function bindSessionPanes(sessionId, reqs, contextTimeline) {
+    var nav = document.getElementById("session-subnav");
+    if (nav) {
+      nav.addEventListener("click", function (e) {
+        var a = e.target.closest("[data-pane]");
+        if (!a) return;
+        e.preventDefault();
+        activatePane(a.getAttribute("data-pane"));
+      });
+    }
+    var flowEl = document.getElementById("flow-graph");
+    if (flowEl) {
+      flowEl.addEventListener("click", function (e) {
+        var node = e.target.closest(".flow-node");
+        if (!node) return;
+        var detail = document.getElementById("flow-detail");
+        if (!detail) return;
+        var raw = node.getAttribute("data-detail");
+        var kind = node.getAttribute("data-kind");
+        var label = node.getAttribute("data-label");
+        var html =
+          '<div class="flow-detail-head"><span class="pill">' +
+          esc(kind) +
+          "</span> " +
+          esc(label) +
+          "</div>";
+        if (raw) {
+          try {
+            html +=
+              '<pre class="payload">' +
+              esc(JSON.stringify(JSON.parse(raw), null, 2)) +
+              "</pre>";
+          } catch (err) {
+            html += '<pre class="payload">' + esc(raw) + "</pre>";
+          }
+        }
+        var seq = node.getAttribute("data-seq");
+        if (seq != null && seq !== "") {
+          html +=
+            '<button type="button" class="btn-xray" data-seq="' +
+            esc(seq) +
+            '">Open Context X-Ray for API #' +
+            esc(seq) +
+            "</button>";
+        }
+        if (kind === "hook") {
+          html +=
+            '<button type="button" class="btn-xray" data-goto-hooks="1">Open Hooks pane</button>';
+        }
+        detail.innerHTML = html;
+        var btn = detail.querySelector(".btn-xray[data-seq]");
+        if (btn) {
+          btn.addEventListener("click", function () {
+            activatePane("xray");
+            loadXray(sessionId, Number(btn.getAttribute("data-seq")));
+          });
+        }
+        var hb = detail.querySelector("[data-goto-hooks]");
+        if (hb) {
+          hb.addEventListener("click", function () {
+            activatePane("hooks");
+          });
+        }
+      });
+    }
+    var xraySel = document.getElementById("xray-seq");
+    if (xraySel) {
+      xraySel.addEventListener("change", function () {
+        loadXray(sessionId, Number(xraySel.value));
+      });
+      if (reqs && reqs.length) loadXray(sessionId, reqs[reqs.length - 1].seq);
+    }
+    var tl = document.getElementById("context-timeline");
+    document
+      .querySelectorAll(".compaction-card .btn-xray[data-seq]")
+      .forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          activatePane("xray");
+          loadXray(sessionId, Number(btn.getAttribute("data-seq")));
+        });
+      });
+
+    if (tl && contextTimeline) {
+      tl.addEventListener("click", function (e) {
+        var bar = e.target.closest("[data-seq]");
+        if (!bar) return;
+        var seq = Number(bar.getAttribute("data-seq"));
+        activatePane("xray");
+        loadXray(sessionId, seq);
+      });
+    }
+  }
+
+  function bindPayloadPopovers() {
+    var pop = document.getElementById("payload-pop");
+    if (!pop) return;
+    var hideTimer = null;
+    function hide() {
+      pop.hidden = true;
+      pop.innerHTML = "";
+    }
+    function show(el, html) {
+      clearTimeout(hideTimer);
+      pop.innerHTML = html;
+      pop.hidden = false;
+      var r = el.getBoundingClientRect();
+      var top = r.bottom + 8 + window.scrollY;
+      var left = Math.min(
+        r.left + window.scrollX,
+        window.scrollX + window.innerWidth - 360,
+      );
+      pop.style.top = top + "px";
+      pop.style.left = Math.max(8, left) + "px";
+    }
+    document.querySelectorAll("[data-full-payload]").forEach(function (el) {
+      el.addEventListener("mouseenter", function () {
+        var raw = el.getAttribute("data-full-payload");
+        if (!raw) return;
+        show(
+          el,
+          '<div class="payload-pop-head">full payload</div><pre class="payload">' +
+            esc(raw) +
+            "</pre>",
+        );
+      });
+      el.addEventListener("mouseleave", function () {
+        hideTimer = setTimeout(hide, 180);
+      });
+      el.addEventListener("click", function (e) {
+        e.preventDefault();
+        var raw = el.getAttribute("data-full-payload");
+        if (!raw) return;
+        el.classList.toggle("expanded");
+        var panel = el.nextElementSibling;
+        if (panel && panel.classList.contains("payload-expand")) {
+          panel.hidden = !panel.hidden;
+        }
+      });
+    });
+    pop.addEventListener("mouseenter", function () {
+      clearTimeout(hideTimer);
+    });
+    pop.addEventListener("mouseleave", function () {
+      hideTimer = setTimeout(hide, 120);
+    });
+  }
+
+  function hookReturnBlock(h) {
+    var sp = h.stdoutPreview || {};
+    var returned =
+      sp.additional_context ||
+      sp.reason ||
+      sp.text ||
+      (sp.returned ? JSON.stringify(sp.returned, null, 2) : "");
+    if (sp.empty || (!returned && !sp.chars)) {
+      // Three distinct reasons stdout is empty, and conflating them is the
+      // difference between "your setup can't capture this" and "your hook had
+      // nothing to say". Events captured before the flag existed report neither.
+      var why;
+      if (sp.observeOnly === true) {
+        why =
+          "Observe-only tap — it wraps <code>true</code>, so there is no command whose output could be captured.<br/>" +
+          "To see real payloads, wrap the actual hook: <code>tracetap hooks track --mode inject</code>, then re-index.";
+      } else if (sp.observeOnly === undefined) {
+        why =
+          "No stdout recorded. This event predates payload classification, so it may be an observe-only tap.<br/>" +
+          "Re-capture with <code>tracetap hooks track --mode inject</code> to tell the two apart.";
+      } else {
+        why = "The hook ran and returned nothing — an empty allow.";
+      }
+      return (
+        '<div class="hook-return empty">' +
+        "<h3>returned payload</h3>" +
+        '<div class="dim">' +
+        why +
+        "</div></div>"
+      );
+    }
+    var preview =
+      sp.additional_context_preview ||
+      sp.reason_preview ||
+      sp.preview ||
+      String(returned).slice(0, 200) +
+        (String(returned).length > 200 ? "…" : "");
+    var full = String(returned);
+    return (
+      '<div class="hook-return">' +
+      "<h3>returned payload" +
+      (sp.additional_context_chars
+        ? " · additionalContext " +
+          fmtTok(sp.additional_context_chars) +
+          " chars"
+        : sp.chars
+          ? " · " + fmtTok(sp.chars) + " chars"
+          : "") +
+      "</h3>" +
+      '<button type="button" class="payload-hotspot" data-full-payload="' +
+      esc(full) +
+      '">' +
+      esc(preview) +
+      ' <span class="dim">hover / click to expand</span></button>' +
+      '<pre class="payload payload-expand" hidden>' +
+      esc(full) +
+      "</pre></div>"
+    );
+  }
+
+  function renderHooksPane(hooks) {
+    if (!hooks.length) {
+      return (
+        '<div class="empty-pane">No hook events for this session.<br/>' +
+        '<span class="dim">Run <code>tracetap hooks install</code> then re-index (<code>tracetap index</code>).<br/>' +
+        "If Flow shows hooks but this pane was blank before, it was a hash-route bug — use the buttons above.</span></div>"
+      );
+    }
+    return (
+      '<div class="hooks-timeline">' +
+      '<div class="dim hooks-hint">' +
+      hooks.length +
+      " hook event(s) · expand a card for stdin + returned stdout payload</div>" +
+      hooks
+        .map(function (h) {
+          var badge =
+            h.decision === "block"
+              ? "block"
+              : h.outcome === "error"
+                ? "error"
+                : "ok";
+          var sp = h.stdoutPreview || {};
+          var hasReturn = !sp.empty && (sp.chars > 0 || sp.additional_context);
+          return (
+            '<details class="hook-card"' +
+            (hasReturn ? " open" : "") +
+            ">" +
+            "<summary>" +
+            '<span class="hook-time">' +
+            fmtTime(h.ts) +
+            "</span>" +
+            '<span class="pill hook-' +
+            badge +
+            '">' +
+            esc(h.event) +
+            "</span>" +
+            (h.hookName
+              ? '<span class="dim">' + esc(h.hookName) + "</span>"
+              : "") +
+            (h.durationMs != null
+              ? '<span class="dim">' + fmtDur(h.durationMs) + "</span>"
+              : "") +
+            (h.decision
+              ? '<span class="pill">' + esc(h.decision) + "</span>"
+              : "") +
+            (hasReturn
+              ? '<span class="pill hook-return-pill">returned</span>'
+              : "") +
+            "</summary>" +
+            '<div class="hook-body">' +
+            hookReturnBlock(h) +
+            '<div class="hook-grid">' +
+            "<div><h3>stdin preview</h3>" +
+            '<button type="button" class="payload-hotspot" data-full-payload="' +
+            esc(JSON.stringify(h.stdinPreview || {}, null, 2)) +
+            '"><pre class="payload compact">' +
+            esc(JSON.stringify(h.stdinPreview || {}, null, 2)) +
+            "</pre></button></div>" +
+            "<div><h3>stdout preview</h3>" +
+            '<button type="button" class="payload-hotspot" data-full-payload="' +
+            esc(JSON.stringify(h.stdoutPreview || {}, null, 2)) +
+            '"><pre class="payload compact">' +
+            esc(JSON.stringify(h.stdoutPreview || {}, null, 2)) +
+            "</pre></button></div>" +
+            "</div>" +
+            (h.payload
+              ? "<h3>full stdin payload</h3>" +
+                '<button type="button" class="payload-hotspot" data-full-payload="' +
+                esc(JSON.stringify(h.payload, null, 2)) +
+                '"><pre class="payload compact">' +
+                esc(JSON.stringify(h.payload, null, 2)) +
+                "</pre></button>"
+              : '<div class="dim">Full stdin not stored — set <code>TRACETAP_HOOK_FULL=1</code> on capture.</div>') +
+            '<div class="dim">digest ' +
+            esc((h.stdinDigest || "").slice(0, 12)) +
+            " · outcome " +
+            esc(h.outcome || "—") +
+            " · exit " +
+            esc(h.exitCode == null ? "—" : h.exitCode) +
+            "</div>" +
+            "</div></details>"
+          );
+        })
+        .join("") +
+      "</div>"
+    );
+  }
+
+  function renderContextTimeline(tl) {
+    if (!tl || !tl.points || !tl.points.length) {
+      return '<div class="dim">No context timeline points.</div>';
+    }
+    var peak = Math.max(1, tl.peakPromptTokens || tl.peakApproxTokens || 1);
+    var html =
+      '<h2 class="sec">Context size timeline <small>' +
+      tl.points.length +
+      " calls · " +
+      tl.compactionCount +
+      " compaction(s) · peak " +
+      fmtTok(peak) +
+      " prompt tokens</small></h2>" +
+      '<div class="context-timeline" id="context-timeline">';
+    tl.points.forEach(function (p) {
+      var h = Math.max(4, Math.round((p.promptTokens / peak) * 100));
+      var cls =
+        "ct-bar" +
+        (p.compaction ? " compact" : "") +
+        (p.errored ? " errored" : "");
+      var title =
+        "#" +
+        p.seq +
+        " · " +
+        fmtTok(p.promptTokens) +
+        " prompt · " +
+        p.transcriptItems +
+        " items" +
+        (p.compaction
+          ? " · COMPACTION " +
+            p.compaction.fromItems +
+            "→" +
+            p.compaction.toItems +
+            " items · tokens " +
+            fmtTok(p.compaction.prePromptTokens) +
+            "→" +
+            fmtTok(p.compaction.postPromptTokens)
+          : "");
+      html +=
+        '<button type="button" class="' +
+        cls +
+        '" data-seq="' +
+        p.seq +
+        '" title="' +
+        esc(title) +
+        '" style="height:' +
+        h +
+        '%">' +
+        '<span class="ct-seq">' +
+        p.seq +
+        "</span>" +
+        (p.compaction ? '<span class="ct-compact">⇣</span>' : "") +
+        "</button>";
+    });
+    html += "</div>";
+    var comps = tl.points.filter(function (p) {
+      return p.compaction;
+    });
+    if (comps.length) {
+      html += '<div class="compaction-list">';
+      comps.forEach(function (p) {
+        var c = p.compaction;
+        html +=
+          '<div class="compaction-card">' +
+          '<span class="pill">compaction</span> API #' +
+          p.seq +
+          " · items <b>" +
+          c.fromItems +
+          " → " +
+          c.toItems +
+          "</b> (dropped " +
+          c.droppedItems +
+          ")" +
+          " · tokens <b>" +
+          fmtTok(c.prePromptTokens) +
+          " → " +
+          fmtTok(c.postPromptTokens) +
+          "</b>" +
+          " · approx <b>" +
+          fmtTok(c.preApproxTokens) +
+          " → " +
+          fmtTok(c.postApproxTokens) +
+          "</b>" +
+          ' <button type="button" class="btn-xray" data-seq="' +
+          p.seq +
+          '">inspect</button></div>';
+      });
+      html += "</div>";
+    }
+    return html;
+  }
+
+  function renderXrayPane(sessionId, reqs, contextTimeline) {
+    if (!reqs.length) {
+      return '<div class="empty-pane">No API calls to x-ray.</div>';
+    }
+    var opts = reqs
+      .map(function (r) {
+        return (
+          '<option value="' +
+          r.seq +
+          '">#' +
+          r.seq +
+          " · " +
+          esc(r.model || "model") +
+          " · " +
+          fmtTok(r.promptTokens) +
+          " in</option>"
+        );
+      })
+      .join("");
+    return (
+      renderContextTimeline(contextTimeline) +
+      '<div class="xray-controls">' +
+      '<label class="chrome">API call <select id="xray-seq">' +
+      opts +
+      "</select></label>" +
+      '<span class="dim" id="xray-status">loading…</span></div>' +
+      '<div id="xray-view"></div>'
+    );
+  }
+  function renderFlowPane(flow) {
+    var nodes = (flow && flow.nodes) || [];
+    if (!nodes.length) {
+      return '<div class="empty-pane">No flow nodes yet — index a session with transcript steps.</div>';
+    }
+    var html =
+      '<div class="flow-layout"><div class="flow-graph" id="flow-graph">';
+    nodes.forEach(function (n, i) {
+      var lane = n.lane ? " lane-" + Math.min(n.lane, 3) : "";
+      var err = n.errored ? " errored" : "";
+      html +=
+        '<div class="flow-node kind-' +
+        esc(n.kind) +
+        lane +
+        err +
+        '" data-kind="' +
+        esc(n.kind) +
+        '" data-label="' +
+        esc(n.label) +
+        '"' +
+        (n.requestSeq != null ? ' data-seq="' + n.requestSeq + '"' : "") +
+        (n.detail
+          ? ' data-detail="' + esc(JSON.stringify(n.detail)) + '"'
+          : "") +
+        ' style="--i:' +
+        i +
+        '">' +
+        '<span class="flow-kind">' +
+        esc(n.kind.replace("_", " ")) +
+        "</span>" +
+        '<span class="flow-label">' +
+        esc(n.label) +
+        "</span>" +
         "</div>";
-    }).join("");
+      if (i < nodes.length - 1)
+        html += '<div class="flow-edge" aria-hidden="true"></div>';
+    });
+    html +=
+      '</div><aside class="flow-detail" id="flow-detail"><div class="dim">Click a node to inspect payload</div></aside></div>';
+    return html;
+  }
+
+  function loadXray(sessionId, seq) {
+    var status = document.getElementById("xray-status");
+    var viewEl = document.getElementById("xray-view");
+    var sel = document.getElementById("xray-seq");
+    if (sel && String(sel.value) !== String(seq)) sel.value = String(seq);
+    if (status) status.textContent = "loading…";
+    if (viewEl) viewEl.innerHTML = skeleton({ rows: 4 });
+    fetchJSON(
+      "/api/session/" + encodeURIComponent(sessionId) + "/context/" + seq,
+    )
+      .then(function (x) {
+        if (status) {
+          status.textContent =
+            fmtTok(x.totalApproxTokens) +
+            " ≈tokens · " +
+            fmtTok(x.totalChars) +
+            " chars" +
+            (x.wirePromptTokens != null
+              ? " · wire " + fmtTok(x.wirePromptTokens) + " prompt"
+              : "");
+        }
+        if (viewEl) {
+          viewEl.innerHTML = drawXray(x);
+          bindPayloadPopovers();
+          viewEl
+            .querySelectorAll(".btn-xray[data-seq]")
+            .forEach(function (btn) {
+              btn.addEventListener("click", function () {
+                loadXray(sessionId, Number(btn.getAttribute("data-seq")));
+              });
+            });
+        }
+      })
+      .catch(function (err) {
+        if (status) status.textContent = "error";
+        if (viewEl)
+          viewEl.innerHTML =
+            '<div class="empty-pane">' +
+            esc(String(err.message || err)) +
+            "</div>";
+      });
+  }
+
+  function drawXray(x) {
+    var maxTok = 1;
+    x.buckets.forEach(function (b) {
+      if (b.approxTokens > maxTok) maxTok = b.approxTokens;
+    });
+    var stack =
+      '<div class="xray-stack">' +
+      x.buckets
+        .map(function (b) {
+          var pct = Math.max(2, Math.round((b.approxTokens / maxTok) * 100));
+          return (
+            '<div class="xray-bar bucket-' +
+            esc(b.bucket) +
+            '" style="width:' +
+            pct +
+            '%" title="' +
+            esc(b.label) +
+            '">' +
+            '<span class="xray-bar-label">' +
+            esc(b.label) +
+            "</span>" +
+            '<span class="xray-bar-n">' +
+            fmtTok(b.approxTokens) +
+            "</span></div>"
+          );
+        })
+        .join("") +
+      "</div>";
+
+    var delta = "";
+    if (x.delta) {
+      delta =
+        '<div class="xray-delta">' +
+        '<h2 class="sec">vs API #' +
+        x.delta.prevSeq +
+        " <small>new " +
+        x.delta.newCount +
+        " · carried " +
+        x.delta.carriedCount +
+        " · dropped " +
+        x.delta.droppedCount +
+        "</small></h2>" +
+        '<div class="xray-delta-list">' +
+        x.delta.items
+          .filter(function (i) {
+            return i.kind !== "carried";
+          })
+          .slice(0, 40)
+          .map(function (i) {
+            return (
+              '<div class="xray-delta-item kind-' +
+              esc(i.kind) +
+              '">' +
+              '<span class="pill">' +
+              esc(i.kind) +
+              "</span>" +
+              '<span class="pill">' +
+              esc(i.bucket) +
+              "</span>" +
+              "<span>" +
+              esc(i.preview) +
+              "</span>" +
+              '<span class="dim">' +
+              fmtTok(i.approxTokens) +
+              "</span></div>"
+            );
+          })
+          .join("") +
+        "</div></div>";
+    }
+
+    var segs =
+      '<h2 class="sec">Segments <small>(' +
+      x.segments.length +
+      ")</small></h2>" +
+      '<div class="xray-segs">' +
+      x.segments
+        .slice(0, 80)
+        .map(function (s) {
+          var full = s.preview; // preview already truncated; prefer longer if present
+          if (s.full) full = s.full;
+          return (
+            '<button type="button" class="xray-seg bucket-' +
+            esc(s.bucket) +
+            ' payload-hotspot" data-full-payload="' +
+            esc(full) +
+            '" title="Hover for full text">' +
+            '<span class="pill">' +
+            esc(s.bucket) +
+            "</span>" +
+            '<span class="dim">' +
+            fmtTok(s.approxTokens) +
+            "</span>" +
+            "<span>" +
+            esc(s.preview) +
+            "</span></button>"
+          );
+        })
+        .join("") +
+      "</div>";
+
+    return stack + delta + segs;
   }
 
   function stepCard(st) {
-    var roleClass = st.role === "user" ? "user" : st.role === "agent" ? "agent" : "system";
-    var head = '<div class="step-head"><span class="pill">#' + st.stepIndex + '</span><span class="role">' + esc(st.role) + "</span>" +
+    var roleClass =
+      st.role === "user" ? "user" : st.role === "agent" ? "agent" : "system";
+    var head =
+      '<div class="step-head"><span class="pill">#' +
+      st.stepIndex +
+      '</span><span class="role">' +
+      esc(st.role) +
+      "</span>" +
       (st.errored ? '<span class="pill err">errored</span>' : "") +
       "</div>";
     var body = "";
     if (st.reasoning) {
-      body += '<details><summary>reasoning (' + fmtTok(st.reasoning.length) + " chars)</summary><pre>" + esc(clip(st.reasoning, 20000)) + "</pre></details>";
+      body +=
+        "<details><summary>reasoning (" +
+        fmtTok(st.reasoning.length) +
+        " chars)</summary><pre>" +
+        esc(clip(st.reasoning, 20000)) +
+        "</pre></details>";
     }
-    if (st.message) body += '<div class="step-body">' + renderMarkdown(st.message) + "</div>";
+    if (st.message)
+      body += '<div class="step-body">' + renderMarkdown(st.message) + "</div>";
     body += toolCallsHtml(st);
     if (st.observation) {
-      var obs = clip(st.observation, 20000), obsInner;
-      try { JSON.parse(obs); obsInner = hlJSON(obs); } catch (e) { obsInner = esc(obs); }
-      body += '<details><summary>observation (' + fmtTok(st.observation.length) + " chars)</summary><pre>" + obsInner + "</pre></details>";
+      var obs = clip(st.observation, 20000),
+        obsInner;
+      try {
+        JSON.parse(obs);
+        obsInner = hlJSON(obs);
+      } catch (e) {
+        obsInner = esc(obs);
+      }
+      body +=
+        "<details><summary>observation (" +
+        fmtTok(st.observation.length) +
+        " chars)</summary><pre>" +
+        obsInner +
+        "</pre></details>";
     }
     if (!body) body = '<div class="step-body dim">(empty step)</div>';
-    return '<div class="step ' + roleClass + (st.errored ? " errored" : "") + '" id="step-' + st.stepIndex + '">' + head + body + "</div>";
+    return (
+      '<div class="step ' +
+      roleClass +
+      (st.errored ? " errored" : "") +
+      '" id="step-' +
+      st.stepIndex +
+      '">' +
+      head +
+      body +
+      "</div>"
+    );
   }
 
   // -- transcript renderers --------------------------------------------------
@@ -590,7 +1735,10 @@
     var out = "";
     for (var i = 0; i < parts.length; i++) {
       if (i % 2 === 1) {
-        out += '<pre class="md-code">' + parts[i].replace(/^[\w+-]*\n/, "") + "</pre>";
+        out +=
+          '<pre class="md-code">' +
+          parts[i].replace(/^[\w+-]*\n/, "") +
+          "</pre>";
       } else {
         out += mdInline(parts[i]);
       }
@@ -603,23 +1751,40 @@
       .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
       .replace(/(^|\n)#{1,4}\s+([^\n]+)/g, '$1<span class="md-h">$2</span>')
       .replace(/(^|\n)\s*[-*]\s+/g, "$1• ")
-      .replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+      .replace(
+        /\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener">$1</a>',
+      );
   }
 
   /** Pretty-print + token-color JSON. Falls back to escaped text on parse failure. */
   function hlJSON(val) {
     var s;
     try {
-      s = typeof val === "string" ? JSON.stringify(JSON.parse(val), null, 2) : JSON.stringify(val, null, 2);
-    } catch (e) { return esc(String(val)); }
+      s =
+        typeof val === "string"
+          ? JSON.stringify(JSON.parse(val), null, 2)
+          : JSON.stringify(val, null, 2);
+    } catch (e) {
+      return esc(String(val));
+    }
     if (s == null) return "";
     if (s.length > 24000) return esc(clip(s, 24000));
-    var re = /("(?:[^"\\]|\\.)*")(\s*:)?|\btrue\b|\bfalse\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
-    var out = "", last = 0, m;
+    var re =
+      /("(?:[^"\\]|\\.)*")(\s*:)?|\btrue\b|\bfalse\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
+    var out = "",
+      last = 0,
+      m;
     while ((m = re.exec(s))) {
       out += esc(s.slice(last, m.index));
       if (m[1] !== undefined) {
-        out += '<span class="' + (m[2] ? "j-key" : "j-str") + '">' + esc(m[1]) + "</span>" + (m[2] || "");
+        out +=
+          '<span class="' +
+          (m[2] ? "j-key" : "j-str") +
+          '">' +
+          esc(m[1]) +
+          "</span>" +
+          (m[2] || "");
       } else if (m[0] === "true" || m[0] === "false" || m[0] === "null") {
         out += '<span class="j-lit">' + m[0] + "</span>";
       } else {
@@ -635,25 +1800,47 @@
   function toolCallsHtml(st) {
     if (!st.toolInput) return "";
     var names = st.toolName ? st.toolName.split(/\s+/) : [];
-    var lines = st.toolInput.split("\n").filter(function (l) { return l.trim(); });
+    var lines = st.toolInput.split("\n").filter(function (l) {
+      return l.trim();
+    });
     if (!lines.length) return "";
-    return lines.map(function (line, i) {
-      var name = names[i] || names[names.length - 1] || "tool";
-      var args = null;
-      try { args = JSON.parse(line); } catch (e) {}
-      var sum = tcSummary(args);
-      var isDiff = args && typeof args.old_string === "string" && typeof args.new_string === "string";
-      var isCmd = args && typeof args.command === "string";
-      var open = isDiff || isCmd || line.length < 400;
-      return '<details class="tool-call"' + (open ? " open" : "") + '><summary class="tc-head">' +
-        '<span class="pill">' + esc(name) + "</span>" +
-        (sum ? '<span class="tc-sum">' + sum + "</span>" : "") +
-        "</summary>" + tcBody(args, line, isDiff, isCmd) + "</details>";
-    }).join("");
+    return lines
+      .map(function (line, i) {
+        var name = names[i] || names[names.length - 1] || "tool";
+        var args = null;
+        try {
+          args = JSON.parse(line);
+        } catch (e) {}
+        var sum = tcSummary(args);
+        var isDiff =
+          args &&
+          typeof args.old_string === "string" &&
+          typeof args.new_string === "string";
+        var isCmd = args && typeof args.command === "string";
+        var open = isDiff || isCmd || line.length < 400;
+        return (
+          '<details class="tool-call"' +
+          (open ? " open" : "") +
+          '><summary class="tc-head">' +
+          '<span class="pill">' +
+          esc(name) +
+          "</span>" +
+          (sum ? '<span class="tc-sum">' + sum + "</span>" : "") +
+          "</summary>" +
+          tcBody(args, line, isDiff, isCmd) +
+          "</details>"
+        );
+      })
+      .join("");
   }
   function tcSummary(args) {
     if (!args || typeof args !== "object") return "";
-    var v = args.file_path || args.path || args.notebook_path || args.pattern || args.url ||
+    var v =
+      args.file_path ||
+      args.path ||
+      args.notebook_path ||
+      args.pattern ||
+      args.url ||
       (typeof args.command === "string" ? args.command : "") ||
       (typeof args.description === "string" ? args.description : "");
     return v ? esc(clip(String(v), 96)) : "";
@@ -664,47 +1851,105 @@
       Object.keys(args).forEach(function (k) {
         if (k !== "old_string" && k !== "new_string") extra[k] = args[k];
       });
-      var head = Object.keys(extra).length ? '<pre class="md-code">' + hlJSON(extra) + "</pre>" : "";
-      return head + '<div class="tc-diff diff">' + diffHtml(args.old_string, args.new_string) + "</div>";
+      var head = Object.keys(extra).length
+        ? '<pre class="md-code">' + hlJSON(extra) + "</pre>"
+        : "";
+      return (
+        head +
+        '<div class="tc-diff diff">' +
+        diffHtml(args.old_string, args.new_string) +
+        "</div>"
+      );
     }
     if (isCmd) {
       var rest = {};
-      Object.keys(args).forEach(function (k) { if (k !== "command") rest[k] = args[k]; });
-      return '<pre class="md-code tc-cmd">$ ' + esc(clip(args.command, 4000)) + "</pre>" +
-        (Object.keys(rest).length ? '<pre class="md-code">' + hlJSON(rest) + "</pre>" : "");
+      Object.keys(args).forEach(function (k) {
+        if (k !== "command") rest[k] = args[k];
+      });
+      return (
+        '<pre class="md-code tc-cmd">$ ' +
+        esc(clip(args.command, 4000)) +
+        "</pre>" +
+        (Object.keys(rest).length
+          ? '<pre class="md-code">' + hlJSON(rest) + "</pre>"
+          : "")
+      );
     }
-    return '<pre class="md-code">' + (args != null ? hlJSON(args) : esc(clip(rawLine, 20000))) + "</pre>";
+    return (
+      '<pre class="md-code">' +
+      (args != null ? hlJSON(args) : esc(clip(rawLine, 20000))) +
+      "</pre>"
+    );
   }
 
   function clip(s, n) {
     s = String(s);
-    return s.length > n ? s.slice(0, n) + "\n… (" + (s.length - n) + " more chars — see wire report)" : s;
+    return s.length > n
+      ? s.slice(0, n) +
+          "\n… (" +
+          (s.length - n) +
+          " more chars — see wire report)"
+      : s;
   }
 
   // ----------------------------------------------------------------- usage
-  var usage = { granularity: "daily", breakdown: false, since: "", until: "", agent: "" };
+  var usage = {
+    granularity: "daily",
+    breakdown: false,
+    since: "",
+    until: "",
+    agent: "",
+  };
 
   function renderUsage() {
     current = { name: "usage" };
     var html =
       '<div class="controls">' +
       '<select id="u-gran">' +
-      ["daily", "weekly", "monthly", "total"].map(function (g) {
-        return '<option value="' + g + '"' + (usage.granularity === g ? " selected" : "") + ">" + g + "</option>";
-      }).join("") +
+      ["daily", "weekly", "monthly", "total"]
+        .map(function (g) {
+          return (
+            '<option value="' +
+            g +
+            '"' +
+            (usage.granularity === g ? " selected" : "") +
+            ">" +
+            g +
+            "</option>"
+          );
+        })
+        .join("") +
       "</select>" +
-      '<label class="check"><input id="u-breakdown" type="checkbox"' + (usage.breakdown ? " checked" : "") + "/> per-model breakdown</label>" +
-      '<input id="u-since" type="date" value="' + esc(usage.since) + '" title="since"/>' +
-      '<input id="u-until" type="date" value="' + esc(usage.until) + '" title="until"/>' +
-      '<input id="u-agent" class="filter" type="text" placeholder="agent" value="' + esc(usage.agent) + '"/>' +
+      '<label class="check"><input id="u-breakdown" type="checkbox"' +
+      (usage.breakdown ? " checked" : "") +
+      "/> per-model breakdown</label>" +
+      '<input id="u-since" type="date" value="' +
+      esc(usage.since) +
+      '" title="since"/>' +
+      '<input id="u-until" type="date" value="' +
+      esc(usage.until) +
+      '" title="until"/>' +
+      '<input id="u-agent" class="filter" type="text" placeholder="agent" value="' +
+      esc(usage.agent) +
+      '"/>' +
       "</div>" +
       '<div id="u-chart"></div>' +
-      '<div class="tbl-wrap"><table><thead><tr id="u-head"></tr></thead><tbody id="u-rows">' + skelRows(6, 8) + '</tbody></table></div>' +
+      '<div class="tbl-wrap"><table><thead><tr id="u-head"></tr></thead><tbody id="u-rows">' +
+      skelRows(6, 8) +
+      "</tbody></table></div>" +
       '<div class="note" id="u-note"></div>' +
       '<div class="empty" id="u-empty" style="display:none"></div>';
     setView(html);
-    [["u-gran", "change"], ["u-breakdown", "change"], ["u-since", "change"], ["u-until", "change"], ["u-agent", "input"]].forEach(function (pair) {
-      document.getElementById(pair[0]).addEventListener(pair[1], debounce(onUsageControls, 150));
+    [
+      ["u-gran", "change"],
+      ["u-breakdown", "change"],
+      ["u-since", "change"],
+      ["u-until", "change"],
+      ["u-agent", "input"],
+    ].forEach(function (pair) {
+      document
+        .getElementById(pair[0])
+        .addEventListener(pair[1], debounce(onUsageControls, 150));
     });
     loadUsage();
   }
@@ -726,8 +1971,12 @@
     if (usage.since) p.set("since", usage.since);
     if (usage.until) p.set("until", usage.until);
     if (usage.agent) p.set("agent", usage.agent);
-    try { p.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone); } catch (e) {}
-    fetchJSON("/api/usage?" + p).then(drawUsage).catch(fail);
+    try {
+      p.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone);
+    } catch (e) {}
+    fetchJSON("/api/usage?" + p)
+      .then(drawUsage)
+      .catch(fail);
   }
 
   function drawUsage(report) {
@@ -741,7 +1990,8 @@
       headEl.innerHTML = "";
       rowsEl.innerHTML = "";
       empty.style.display = "block";
-      empty.innerHTML = "No usage in range. Capture sessions, then run <code>tracetap index</code>.";
+      empty.innerHTML =
+        "No usage in range. Capture sessions, then run <code>tracetap index</code>.";
       return;
     }
     empty.style.display = "none";
@@ -751,41 +2001,90 @@
     report.rows.forEach(function (r) {
       byBucket[r.bucket] = (byBucket[r.bucket] || 0) + r.costUsd;
     });
-    var items = Object.keys(byBucket).sort().map(function (b) {
-      return { label: b.slice(5) || b, value: byBucket[b], title: b + ": " + fmtCost(byBucket[b]) };
-    });
+    var items = Object.keys(byBucket)
+      .sort()
+      .map(function (b) {
+        return {
+          label: b.slice(5) || b,
+          value: byBucket[b],
+          title: b + ": " + fmtCost(byBucket[b]),
+        };
+      });
     if (report.granularity !== "total" && items.length > 1) {
-      chart.innerHTML = '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost per ' +
-        ({ daily: "day", weekly: "week", monthly: "month" }[report.granularity] || report.granularity) + "</div>" +
-        columnChart(items, { height: 130, labels: true, colWidth: 34 }) + "</div>";
+      chart.innerHTML =
+        '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost per ' +
+        ({ daily: "day", weekly: "week", monthly: "month" }[
+          report.granularity
+        ] || report.granularity) +
+        "</div>" +
+        columnChart(items, { height: 130, labels: true, colWidth: 34 }) +
+        "</div>";
     } else chart.innerHTML = "";
 
-    var showGroup = report.rows.some(function (r) { return r.group; });
-    headEl.innerHTML = "<th>Bucket</th>" + (showGroup ? "<th>Group</th>" : "") +
+    var showGroup = report.rows.some(function (r) {
+      return r.group;
+    });
+    headEl.innerHTML =
+      "<th>Bucket</th>" +
+      (showGroup ? "<th>Group</th>" : "") +
       '<th class="num">In</th><th class="num">Out</th><th class="num">Cache R</th><th class="num">Cache W</th><th class="num">Sessions</th><th class="num">Cost</th>';
     var rowsHtml = report.rows.map(function (r) {
-      return "<tr><td>" + esc(r.bucket) + "</td>" +
+      return (
+        "<tr><td>" +
+        esc(r.bucket) +
+        "</td>" +
         (showGroup ? "<td>" + esc(r.group) + "</td>" : "") +
-        '<td class="num">' + fmtTok(r.promptTokens) + "</td>" +
-        '<td class="num">' + fmtTok(r.completionTokens) + "</td>" +
-        '<td class="num">' + fmtTok(r.cacheRead) + "</td>" +
-        '<td class="num">' + fmtTok(r.cacheCreation) + "</td>" +
-        '<td class="num">' + r.sessions + "</td>" +
-        '<td class="num">' + fmtCost(r.costUsd, r.hasUnpriced) + "</td></tr>";
+        '<td class="num">' +
+        fmtTok(r.promptTokens) +
+        "</td>" +
+        '<td class="num">' +
+        fmtTok(r.completionTokens) +
+        "</td>" +
+        '<td class="num">' +
+        fmtTok(r.cacheRead) +
+        "</td>" +
+        '<td class="num">' +
+        fmtTok(r.cacheCreation) +
+        "</td>" +
+        '<td class="num">' +
+        r.sessions +
+        "</td>" +
+        '<td class="num">' +
+        fmtCost(r.costUsd, r.hasUnpriced) +
+        "</td></tr>"
+      );
     });
     var t = report.totals;
-    rowsHtml.push('<tr class="total"><td>total</td>' + (showGroup ? "<td></td>" : "") +
-      '<td class="num">' + fmtTok(t.promptTokens) + "</td>" +
-      '<td class="num">' + fmtTok(t.completionTokens) + "</td>" +
-      '<td class="num">' + fmtTok(t.cacheRead) + "</td>" +
-      '<td class="num">' + fmtTok(t.cacheCreation) + "</td>" +
-      '<td class="num">' + t.sessions + "</td>" +
-      '<td class="num">' + fmtCost(t.costUsd, t.hasUnpriced) + "</td></tr>");
+    rowsHtml.push(
+      '<tr class="total"><td>total</td>' +
+        (showGroup ? "<td></td>" : "") +
+        '<td class="num">' +
+        fmtTok(t.promptTokens) +
+        "</td>" +
+        '<td class="num">' +
+        fmtTok(t.completionTokens) +
+        "</td>" +
+        '<td class="num">' +
+        fmtTok(t.cacheRead) +
+        "</td>" +
+        '<td class="num">' +
+        fmtTok(t.cacheCreation) +
+        "</td>" +
+        '<td class="num">' +
+        t.sessions +
+        "</td>" +
+        '<td class="num">' +
+        fmtCost(t.costUsd, t.hasUnpriced) +
+        "</td></tr>",
+    );
     rowsEl.innerHTML = rowsHtml.join("");
 
     var note = "prices: " + esc(report.priceSource);
     if (report.unpricedModels.length) {
-      note += ' · <span class="warn-text">unpriced models excluded from $: ' + esc(report.unpricedModels.join(", ")) + "</span>";
+      note +=
+        ' · <span class="warn-text">unpriced models excluded from $: ' +
+        esc(report.unpricedModels.join(", ")) +
+        "</span>";
     }
     document.getElementById("u-note").innerHTML = note;
   }
@@ -794,10 +2093,12 @@
   function renderAnalytics() {
     current = { name: "analytics" };
     setView(skeleton({ cards: 7, rows: 8 }));
-    fetchJSON("/api/analytics").then(function (a) {
-      if (current.name !== "analytics") return;
-      drawAnalytics(a);
-    }).catch(fail);
+    fetchJSON("/api/analytics")
+      .then(function (a) {
+        if (current.name !== "analytics") return;
+        drawAnalytics(a);
+      })
+      .catch(fail);
   }
 
   function drawAnalytics(a) {
@@ -805,94 +2106,197 @@
     var cards =
       card("Sessions", t.sessions) +
       card("API calls", t.requests) +
-      card("Call error rate", t.requests ? fmtPct(t.erroredRequests / t.requests) : "—", t.requests && t.erroredRequests / t.requests > 0.05) +
+      card(
+        "Call error rate",
+        t.requests ? fmtPct(t.erroredRequests / t.requests) : "—",
+        t.requests && t.erroredRequests / t.requests > 0.05,
+      ) +
       card("Total cost", fmtCost(t.costUsd, t.hasUnpriced)) +
       card("Cache hit rate", fmtPct(t.cacheHitRate)) +
       card("Output tokens", fmtTok(t.completionTokens)) +
-      card("Compactions", a.compactions.totalCompactions + ' <small>in ' + a.compactions.sessionsWithCompaction + " sessions</small>", a.compactions.totalCompactions > 0);
+      card(
+        "Compactions",
+        a.compactions.totalCompactions +
+          " <small>in " +
+          a.compactions.sessionsWithCompaction +
+          " sessions</small>",
+        a.compactions.totalCompactions > 0,
+      );
 
     var trendHtml = "";
     if (a.trend.length) {
-      trendHtml = '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost calendar — last 26 weeks · ' +
-        a.trend.length + " active days</div>" +
-        '<div id="hm">' + TracetapCharts.calendarHeatmap(a.trend) + "</div></div>";
+      trendHtml =
+        '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost calendar — last 26 weeks · ' +
+        a.trend.length +
+        " active days</div>" +
+        '<div id="hm">' +
+        TracetapCharts.calendarHeatmap(a.trend) +
+        "</div></div>";
     }
 
     var tmItems = a.perProject
-      .filter(function (p) { return p.costUsd > 0; })
+      .filter(function (p) {
+        return p.costUsd > 0;
+      })
       .map(function (p, i) {
-        return { label: basename(p.project) || p.project, sub: fmtCost(p.costUsd) + " · " + p.sessions + " sessions", value: p.costUsd, idx: i };
+        return {
+          label: basename(p.project) || p.project,
+          sub: fmtCost(p.costUsd) + " · " + p.sessions + " sessions",
+          value: p.costUsd,
+          idx: i,
+        };
       });
     var vizSplit = "";
     var strips = TracetapCharts.ttftStrips(a.perModel);
     if (tmItems.length || strips) {
-      vizSplit = '<div class="split">' +
+      vizSplit =
+        '<div class="split">' +
         (tmItems.length
           ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.2</span>Spend by project</div><div id="tm">' +
-            TracetapCharts.treemap(tmItems, { width: 620, height: 200 }) + "</div></div>"
+            TracetapCharts.treemap(tmItems, { width: 620, height: 200 }) +
+            "</div></div>"
           : "") +
         (strips
           ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.3</span>TTFT distribution by model · box p25–p75 · tick p50 · amber p95</div><div id="ts">' +
-            strips + "</div></div>"
+            strips +
+            "</div></div>"
           : "") +
         "</div>";
     }
 
-    var modelRows = a.perModel.map(function (m) {
-      return "<tr><td>" + esc(m.model) + "</td>" +
-        '<td class="num">' + m.requests + "</td>" +
-        '<td class="num">' + (m.errorRate > 0 ? '<span class="warn-text">' + fmtPct(m.errorRate) + "</span>" : "0%") + "</td>" +
-        '<td class="num">' + (m.ttftP50 != null ? fmtDur(m.ttftP50) : "—") + "</td>" +
-        '<td class="num">' + (m.ttftP95 != null ? fmtDur(m.ttftP95) : "—") + "</td>" +
-        '<td class="num">' + (m.durP50 != null ? fmtDur(m.durP50) : "—") + "</td>" +
-        '<td class="num">' + fmtTok(m.completionTokens) + "</td></tr>";
-    }).join("");
+    var modelRows = a.perModel
+      .map(function (m) {
+        return (
+          "<tr><td>" +
+          esc(m.model) +
+          "</td>" +
+          '<td class="num">' +
+          m.requests +
+          "</td>" +
+          '<td class="num">' +
+          (m.errorRate > 0
+            ? '<span class="warn-text">' + fmtPct(m.errorRate) + "</span>"
+            : "0%") +
+          "</td>" +
+          '<td class="num">' +
+          (m.ttftP50 != null ? fmtDur(m.ttftP50) : "—") +
+          "</td>" +
+          '<td class="num">' +
+          (m.ttftP95 != null ? fmtDur(m.ttftP95) : "—") +
+          "</td>" +
+          '<td class="num">' +
+          (m.durP50 != null ? fmtDur(m.durP50) : "—") +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(m.completionTokens) +
+          "</td></tr>"
+        );
+      })
+      .join("");
 
-    var agentRows = a.perAgent.map(function (p) {
-      return "<tr><td>" + agentPill(p.agent) + "</td>" +
-        '<td class="num">' + p.sessions + "</td>" +
-        '<td class="num">' + fmtTok(p.promptTokens) + "</td>" +
-        '<td class="num">' + fmtTok(p.completionTokens) + "</td>" +
-        '<td class="num">' + fmtCost(p.costUsd) + "</td></tr>";
-    }).join("");
+    var agentRows = a.perAgent
+      .map(function (p) {
+        return (
+          "<tr><td>" +
+          agentPill(p.agent) +
+          "</td>" +
+          '<td class="num">' +
+          p.sessions +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(p.promptTokens) +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(p.completionTokens) +
+          "</td>" +
+          '<td class="num">' +
+          fmtCost(p.costUsd) +
+          "</td></tr>"
+        );
+      })
+      .join("");
 
     var maxTool = a.topTools.length ? a.topTools[0].count : 1;
-    var toolRows = a.topTools.map(function (tl) {
-      return '<tr><td class="bar-cell"><div class="bar" style="width:' + ((tl.count / maxTool) * 100).toFixed(1) + '%"></div><span>' + esc(tl.name) + "</span></td>" +
-        '<td class="num">' + tl.count + "</td></tr>";
-    }).join("");
+    var toolRows = a.topTools
+      .map(function (tl) {
+        return (
+          '<tr><td class="bar-cell"><div class="bar" style="width:' +
+          ((tl.count / maxTool) * 100).toFixed(1) +
+          '%"></div><span>' +
+          esc(tl.name) +
+          "</span></td>" +
+          '<td class="num">' +
+          tl.count +
+          "</td></tr>"
+        );
+      })
+      .join("");
 
-    var topSessionRows = a.topSessions.map(function (s) {
-      return '<tr class="click" data-id="' + esc(s.sessionId) + '"><td>' + agentPill(s.agent) + " " + esc(s.model) + "</td>" +
-        '<td class="dim" title="' + esc(s.projectCwd) + '">' + esc(basename(s.projectCwd)) + "</td>" +
-        "<td>" + fmtTime(s.startedAt) + "</td>" +
-        '<td class="num">' + fmtDur(s.durationMs) + "</td>" +
-        '<td class="num">' + (s.turns || 0) + "</td>" +
-        '<td class="num">' + fmtCost(s.costUsd) + "</td></tr>";
-    }).join("");
+    var topSessionRows = a.topSessions
+      .map(function (s) {
+        return (
+          '<tr class="click" data-id="' +
+          esc(s.sessionId) +
+          '"><td>' +
+          agentPill(s.agent) +
+          " " +
+          esc(s.model) +
+          "</td>" +
+          '<td class="dim" title="' +
+          esc(s.projectCwd) +
+          '">' +
+          esc(basename(s.projectCwd)) +
+          "</td>" +
+          "<td>" +
+          fmtTime(s.startedAt) +
+          "</td>" +
+          '<td class="num">' +
+          fmtDur(s.durationMs) +
+          "</td>" +
+          '<td class="num">' +
+          (s.turns || 0) +
+          "</td>" +
+          '<td class="num">' +
+          fmtCost(s.costUsd) +
+          "</td></tr>"
+        );
+      })
+      .join("");
 
     setView(
-      '<div class="cards">' + cards + "</div>" +
-      trendHtml +
-      vizSplit +
-      '<div class="split">' +
-      '<div><h2 class="sec">Per model <small>(wire latency &amp; reliability)</small></h2>' +
-      '<div class="tbl-wrap"><table><thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Err</th><th class="num">TTFT p50</th><th class="num">TTFT p95</th><th class="num">Dur p50</th><th class="num">Out</th></tr></thead><tbody>' +
-      (modelRows || '<tr><td colspan="7" class="dim">no wire data</td></tr>') + "</tbody></table></div>" +
-      '<h2 class="sec">Per agent</h2>' +
-      '<div class="tbl-wrap"><table><thead><tr><th>Agent</th><th class="num">Sessions</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th></tr></thead><tbody>' +
-      (agentRows || '<tr><td colspan="5" class="dim">no data</td></tr>') + "</tbody></table></div></div>" +
-      '<div><h2 class="sec">Top tools</h2>' +
-      '<div class="tbl-wrap"><table><tbody>' + (toolRows || '<tr><td class="dim">no tool calls</td></tr>') + "</tbody></table></div>" +
-      '<h2 class="sec">Top sessions by cost</h2>' +
-      '<div class="tbl-wrap"><table><thead><tr><th>Session</th><th>Project</th><th>Started</th><th class="num">Dur</th><th class="num">Turns</th><th class="num">Cost</th></tr></thead><tbody>' +
-      (topSessionRows || '<tr><td colspan="6" class="dim">no sessions</td></tr>') + "</tbody></table></div></div>" +
-      "</div>" +
-      '<div class="note">prices: ' + esc(a.priceSource) + "</div>"
+      '<div class="cards">' +
+        cards +
+        "</div>" +
+        trendHtml +
+        vizSplit +
+        '<div class="split">' +
+        '<div><h2 class="sec">Per model <small>(wire latency &amp; reliability)</small></h2>' +
+        '<div class="tbl-wrap"><table><thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Err</th><th class="num">TTFT p50</th><th class="num">TTFT p95</th><th class="num">Dur p50</th><th class="num">Out</th></tr></thead><tbody>' +
+        (modelRows ||
+          '<tr><td colspan="7" class="dim">no wire data</td></tr>') +
+        "</tbody></table></div>" +
+        '<h2 class="sec">Per agent</h2>' +
+        '<div class="tbl-wrap"><table><thead><tr><th>Agent</th><th class="num">Sessions</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th></tr></thead><tbody>' +
+        (agentRows || '<tr><td colspan="5" class="dim">no data</td></tr>') +
+        "</tbody></table></div></div>" +
+        '<div><h2 class="sec">Top tools</h2>' +
+        '<div class="tbl-wrap"><table><tbody>' +
+        (toolRows || '<tr><td class="dim">no tool calls</td></tr>') +
+        "</tbody></table></div>" +
+        '<h2 class="sec">Top sessions by cost</h2>' +
+        '<div class="tbl-wrap"><table><thead><tr><th>Session</th><th>Project</th><th>Started</th><th class="num">Dur</th><th class="num">Turns</th><th class="num">Cost</th></tr></thead><tbody>' +
+        (topSessionRows ||
+          '<tr><td colspan="6" class="dim">no sessions</td></tr>') +
+        "</tbody></table></div></div>" +
+        "</div>" +
+        '<div class="note">prices: ' +
+        esc(a.priceSource) +
+        "</div>",
     );
     view.querySelectorAll("tr[data-id]").forEach(function (tr) {
       tr.addEventListener("click", function () {
-        location.hash = "#session/" + encodeURIComponent(tr.getAttribute("data-id"));
+        location.hash =
+          "#session/" + encodeURIComponent(tr.getAttribute("data-id"));
       });
     });
 
@@ -900,9 +2304,11 @@
     if (hm) {
       TT.bind(hm, ".hm-cell", function (cell) {
         var c = Number(cell.getAttribute("data-c"));
-        return TT.title(cell.getAttribute("data-d")) +
+        return (
+          TT.title(cell.getAttribute("data-d")) +
           TT.row("cost", fmtCost(c)) +
-          TT.row("agent turns", cell.getAttribute("data-e"));
+          TT.row("agent turns", cell.getAttribute("data-e"))
+        );
       });
     }
     var tm = document.getElementById("tm");
@@ -910,11 +2316,13 @@
       TT.bind(tm, ".tm-cell", function (cell) {
         var p = a.perProject[Number(cell.getAttribute("data-i"))];
         if (!p) return null;
-        return TT.title(p.project) +
+        return (
+          TT.title(p.project) +
           TT.row("cost", fmtCost(p.costUsd)) +
           TT.row("sessions", p.sessions) +
           TT.row("agent turns", p.events) +
-          TT.row("output", fmtTok(p.completionTokens));
+          TT.row("output", fmtTok(p.completionTokens))
+        );
       });
     }
     var ts = document.getElementById("ts");
@@ -924,7 +2332,9 @@
         if (!m || !m.ttftPcts) return null;
         var names = ["p10", "p25", "p50", "p75", "p90", "p95"];
         var h = TT.title(m.model + " · ttft, n=" + m.ttftN);
-        m.ttftPcts.forEach(function (v, i) { h += TT.row(names[i], fmtDur(v)); });
+        m.ttftPcts.forEach(function (v, i) {
+          h += TT.row(names[i], fmtDur(v));
+        });
         return h;
       });
     }
@@ -934,34 +2344,61 @@
   function renderPrompts() {
     current = { name: "prompts" };
     setView(skeleton({ rows: 8 }));
-    fetchJSON("/api/prompts").then(function (data) {
-      if (current.name !== "prompts") return;
-      if (!data.prompts.length) {
-        setView('<div class="empty">No system prompts on record yet. Index some traced sessions first.</div>');
-        return;
-      }
-      var rows = data.prompts.map(function (p) {
-        return '<tr class="click" data-hash="' + esc(p.promptHash) + '">' +
-          '<td class="hash">' + esc(p.promptHash.slice(0, 12)) + "</td>" +
-          "<td>" + agentPill(p.agent) + "</td>" +
-          '<td class="num">' + fmtTok(p.approxTokens) + "</td>" +
-          '<td class="num">' + p.requestCount + "</td>" +
-          '<td class="num">' + p.sessionCount + "</td>" +
-          "<td>" + fmtTime(p.firstSeen) + "</td>" +
-          "<td>" + fmtTime(p.lastSeen) + "</td></tr>";
-      }).join("");
-      setView(
-        '<div class="meta-line">' + data.count + " distinct system-prompt versions seen on the wire. " +
-        "Every harness update that touches the prompt shows up here as a new version.</div>" +
-        '<div class="tbl-wrap"><table><thead><tr><th>Hash</th><th>Agent</th><th class="num">~Tokens</th><th class="num">Requests</th><th class="num">Sessions</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>' +
-        rows + "</tbody></table></div>"
-      );
-      view.querySelectorAll("tr[data-hash]").forEach(function (tr) {
-        tr.addEventListener("click", function () {
-          location.hash = "#prompt/" + tr.getAttribute("data-hash");
+    fetchJSON("/api/prompts")
+      .then(function (data) {
+        if (current.name !== "prompts") return;
+        if (!data.prompts.length) {
+          setView(
+            '<div class="empty">No system prompts on record yet. Index some traced sessions first.</div>',
+          );
+          return;
+        }
+        var rows = data.prompts
+          .map(function (p) {
+            return (
+              '<tr class="click" data-hash="' +
+              esc(p.promptHash) +
+              '">' +
+              '<td class="hash">' +
+              esc(p.promptHash.slice(0, 12)) +
+              "</td>" +
+              "<td>" +
+              agentPill(p.agent) +
+              "</td>" +
+              '<td class="num">' +
+              fmtTok(p.approxTokens) +
+              "</td>" +
+              '<td class="num">' +
+              p.requestCount +
+              "</td>" +
+              '<td class="num">' +
+              p.sessionCount +
+              "</td>" +
+              "<td>" +
+              fmtTime(p.firstSeen) +
+              "</td>" +
+              "<td>" +
+              fmtTime(p.lastSeen) +
+              "</td></tr>"
+            );
+          })
+          .join("");
+        setView(
+          '<div class="meta-line">' +
+            data.count +
+            " distinct system-prompt versions seen on the wire. " +
+            "Every harness update that touches the prompt shows up here as a new version.</div>" +
+            '<div class="tbl-wrap"><table><thead><tr><th>Hash</th><th>Agent</th><th class="num">~Tokens</th><th class="num">Requests</th><th class="num">Sessions</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>' +
+            rows +
+            "</tbody></table></div>",
+        );
+        view.querySelectorAll("tr[data-hash]").forEach(function (tr) {
+          tr.addEventListener("click", function () {
+            location.hash = "#prompt/" + tr.getAttribute("data-hash");
+          });
         });
-      });
-    }).catch(fail);
+      })
+      .catch(fail);
   }
 
   function renderPrompt(hash) {
@@ -969,35 +2406,79 @@
     setView('<div class="meta-line">Loading prompt…</div>');
     Promise.all([
       fetchJSON("/api/prompt/" + encodeURIComponent(hash)),
-      fetchJSON("/api/prompts")
-    ]).then(function (results) {
-      if (current.name !== "prompt" || current.arg !== hash) return;
-      drawPrompt(results[0], results[1].prompts);
-    }).catch(fail);
+      fetchJSON("/api/prompts"),
+    ])
+      .then(function (results) {
+        if (current.name !== "prompt" || current.arg !== hash) return;
+        drawPrompt(results[0], results[1].prompts);
+      })
+      .catch(fail);
   }
 
   function drawPrompt(p, all) {
-    var others = all.filter(function (o) { return o.agent === p.agent && o.promptHash !== p.promptHash; });
+    var others = all.filter(function (o) {
+      return o.agent === p.agent && o.promptHash !== p.promptHash;
+    });
     var diffSel = others.length
       ? '<select id="diff-against"><option value="">— diff against another version —</option>' +
-        others.map(function (o) {
-          return '<option value="' + esc(o.promptHash) + '">' + esc(o.promptHash.slice(0, 12)) + " · last seen " + fmtTime(o.lastSeen) + "</option>";
-        }).join("") + "</select>"
-      : '<span class="dim">no other ' + esc(p.agent) + " versions to diff against</span>";
+        others
+          .map(function (o) {
+            return (
+              '<option value="' +
+              esc(o.promptHash) +
+              '">' +
+              esc(o.promptHash.slice(0, 12)) +
+              " · last seen " +
+              fmtTime(o.lastSeen) +
+              "</option>"
+            );
+          })
+          .join("") +
+        "</select>"
+      : '<span class="dim">no other ' +
+        esc(p.agent) +
+        " versions to diff against</span>";
 
     setView(
       '<div class="crumb"><a href="#prompts">← prompts</a></div>' +
-      '<div class="detail-head"><h1>' + agentPill(p.agent) + ' <span class="hash">' + esc(p.promptHash.slice(0, 16)) + "…</span></h1>" +
-      '<span class="dim">' + fmtTok(p.approxTokens) + " tokens · " + p.requestCount + " requests · " + p.sessionCount + " sessions · " +
-      fmtTime(p.firstSeen) + " → " + fmtTime(p.lastSeen) + "</span></div>" +
-      '<div class="controls">' + diffSel + "</div>" +
-      '<div id="prompt-body"><div class="prompt-content">' + esc(p.content) + "</div></div>" +
-      (p.sessionIds.length
-        ? '<h2 class="sec">Sessions using this prompt</h2><div class="meta-line">' +
-          p.sessionIds.slice(0, 20).map(function (id) {
-            return '<a href="#session/' + encodeURIComponent(id) + '">' + esc(id) + "</a>";
-          }).join(" · ") + "</div>"
-        : "")
+        '<div class="detail-head"><h1>' +
+        agentPill(p.agent) +
+        ' <span class="hash">' +
+        esc(p.promptHash.slice(0, 16)) +
+        "…</span></h1>" +
+        '<span class="dim">' +
+        fmtTok(p.approxTokens) +
+        " tokens · " +
+        p.requestCount +
+        " requests · " +
+        p.sessionCount +
+        " sessions · " +
+        fmtTime(p.firstSeen) +
+        " → " +
+        fmtTime(p.lastSeen) +
+        "</span></div>" +
+        '<div class="controls">' +
+        diffSel +
+        "</div>" +
+        '<div id="prompt-body"><div class="prompt-content">' +
+        esc(p.content) +
+        "</div></div>" +
+        (p.sessionIds.length
+          ? '<h2 class="sec">Sessions using this prompt</h2><div class="meta-line">' +
+            p.sessionIds
+              .slice(0, 20)
+              .map(function (id) {
+                return (
+                  '<a href="#session/' +
+                  encodeURIComponent(id) +
+                  '">' +
+                  esc(id) +
+                  "</a>"
+                );
+              })
+              .join(" · ") +
+            "</div>"
+          : ""),
     );
     var sel = document.getElementById("diff-against");
     if (sel) {
@@ -1005,61 +2486,114 @@
         var other = sel.value;
         var body = document.getElementById("prompt-body");
         if (!other) {
-          body.innerHTML = '<div class="prompt-content">' + esc(p.content) + "</div>";
+          body.innerHTML =
+            '<div class="prompt-content">' + esc(p.content) + "</div>";
           return;
         }
         body.innerHTML = '<div class="meta-line">computing diff…</div>';
-        fetchJSON("/api/prompt/" + encodeURIComponent(other)).then(function (o) {
-          body.innerHTML = '<div class="meta-line">diff: <span class="hash">' + esc(o.promptHash.slice(0, 12)) +
-            "</span> (old) → <span class=\"hash\">" + esc(p.promptHash.slice(0, 12)) + "</span> (this)</div>" +
-            '<div class="prompt-content diff">' + diffHtml(o.content, p.content) + "</div>";
-        }).catch(fail);
+        fetchJSON("/api/prompt/" + encodeURIComponent(other))
+          .then(function (o) {
+            body.innerHTML =
+              '<div class="meta-line">diff: <span class="hash">' +
+              esc(o.promptHash.slice(0, 12)) +
+              '</span> (old) → <span class="hash">' +
+              esc(p.promptHash.slice(0, 12)) +
+              "</span> (this)</div>" +
+              '<div class="prompt-content diff">' +
+              diffHtml(o.content, p.content) +
+              "</div>";
+          })
+          .catch(fail);
       });
     }
   }
 
   /** Line-level LCS diff, rendered with folded unchanged regions. */
   function diffHtml(oldText, newText) {
-    var a = String(oldText).split("\n"), b = String(newText).split("\n");
+    var a = String(oldText).split("\n"),
+      b = String(newText).split("\n");
     if (a.length * b.length > 4_000_000) {
-      return '<div class="ln ctx">(too large to diff: ' + a.length + " × " + b.length + " lines)</div>";
+      return (
+        '<div class="ln ctx">(too large to diff: ' +
+        a.length +
+        " × " +
+        b.length +
+        " lines)</div>"
+      );
     }
     // LCS table (uint32, flat).
-    var n = a.length, m = b.length;
+    var n = a.length,
+      m = b.length;
     var dp = new Uint32Array((n + 1) * (m + 1));
     for (var i = n - 1; i >= 0; i--) {
       for (var j = m - 1; j >= 0; j--) {
-        dp[i * (m + 1) + j] = a[i] === b[j]
-          ? dp[(i + 1) * (m + 1) + j + 1] + 1
-          : Math.max(dp[(i + 1) * (m + 1) + j], dp[i * (m + 1) + j + 1]);
+        dp[i * (m + 1) + j] =
+          a[i] === b[j]
+            ? dp[(i + 1) * (m + 1) + j + 1] + 1
+            : Math.max(dp[(i + 1) * (m + 1) + j], dp[i * (m + 1) + j + 1]);
       }
     }
     var ops = []; // {t: 'ctx'|'del'|'add', s}
-    var x = 0, y = 0;
+    var x = 0,
+      y = 0;
     while (x < n && y < m) {
-      if (a[x] === b[y]) { ops.push({ t: "ctx", s: a[x] }); x++; y++; }
-      else if (dp[(x + 1) * (m + 1) + y] >= dp[x * (m + 1) + y + 1]) { ops.push({ t: "del", s: a[x] }); x++; }
-      else { ops.push({ t: "add", s: b[y] }); y++; }
+      if (a[x] === b[y]) {
+        ops.push({ t: "ctx", s: a[x] });
+        x++;
+        y++;
+      } else if (dp[(x + 1) * (m + 1) + y] >= dp[x * (m + 1) + y + 1]) {
+        ops.push({ t: "del", s: a[x] });
+        x++;
+      } else {
+        ops.push({ t: "add", s: b[y] });
+        y++;
+      }
     }
-    while (x < n) { ops.push({ t: "del", s: a[x++] }); }
-    while (y < m) { ops.push({ t: "add", s: b[y++] }); }
+    while (x < n) {
+      ops.push({ t: "del", s: a[x++] });
+    }
+    while (y < m) {
+      ops.push({ t: "add", s: b[y++] });
+    }
 
     // Fold long unchanged runs.
-    var out = [], run = [];
+    var out = [],
+      run = [];
     function flushRun(isEnd) {
       if (run.length <= 7) {
-        run.forEach(function (l) { out.push('<div class="ln ctx">' + esc(l) + "</div>"); });
+        run.forEach(function (l) {
+          out.push('<div class="ln ctx">' + esc(l) + "</div>");
+        });
       } else {
-        run.slice(0, 2).forEach(function (l) { out.push('<div class="ln ctx">' + esc(l) + "</div>"); });
-        out.push('<div class="gap">··· ' + (run.length - 4) + " unchanged lines ···</div>");
-        if (!isEnd) run.slice(-2).forEach(function (l) { out.push('<div class="ln ctx">' + esc(l) + "</div>"); });
+        run.slice(0, 2).forEach(function (l) {
+          out.push('<div class="ln ctx">' + esc(l) + "</div>");
+        });
+        out.push(
+          '<div class="gap">··· ' +
+            (run.length - 4) +
+            " unchanged lines ···</div>",
+        );
+        if (!isEnd)
+          run.slice(-2).forEach(function (l) {
+            out.push('<div class="ln ctx">' + esc(l) + "</div>");
+          });
       }
       run = [];
     }
     ops.forEach(function (op) {
-      if (op.t === "ctx") { run.push(op.s); return; }
+      if (op.t === "ctx") {
+        run.push(op.s);
+        return;
+      }
       flushRun(false);
-      out.push('<div class="ln ' + op.t + '">' + (op.t === "add" ? "+ " : "− ") + esc(op.s) + "</div>");
+      out.push(
+        '<div class="ln ' +
+          op.t +
+          '">' +
+          (op.t === "add" ? "+ " : "− ") +
+          esc(op.s) +
+          "</div>",
+      );
     });
     flushRun(true);
     return out.join("");
@@ -1072,10 +2606,11 @@
     current = { name: "audit" };
     setView(
       '<div class="controls">' +
-      '<label class="check"><input id="a-strict" type="checkbox"' + (audit.mode === "strict" ? " checked" : "") +
-      "/> strict detectors (entropy-gated, may false-positive)</label>" +
-      '<span class="spacer"></span></div>' +
-      '<div id="a-body"><div class="meta-line">Scanning indexed logs…</div></div>'
+        '<label class="check"><input id="a-strict" type="checkbox"' +
+        (audit.mode === "strict" ? " checked" : "") +
+        "/> strict detectors (entropy-gated, may false-positive)</label>" +
+        '<span class="spacer"></span></div>' +
+        '<div id="a-body"><div class="meta-line">Scanning indexed logs…</div></div>',
     );
     document.getElementById("a-strict").addEventListener("change", function () {
       audit.mode = this.checked ? "strict" : "standard";
@@ -1088,10 +2623,12 @@
     var body = document.getElementById("a-body");
     if (!body) return;
     body.innerHTML = skeleton({ cards: 5, rows: 3 });
-    fetchJSON("/api/audit?mode=" + audit.mode).then(function (r) {
-      if (current.name !== "audit") return;
-      drawAudit(r);
-    }).catch(fail);
+    fetchJSON("/api/audit?mode=" + audit.mode)
+      .then(function (r) {
+        if (current.name !== "audit") return;
+        drawAudit(r);
+      })
+      .catch(fail);
   }
 
   function drawAudit(r) {
@@ -1107,29 +2644,67 @@
     var html = '<div class="cards">' + cards + "</div>";
 
     if (!r.groups.length) {
-      html += '<div class="empty">✓ No secrets detected on the wire (' + esc(r.mode) + " detectors).</div>";
+      html +=
+        '<div class="empty">✓ No secrets detected on the wire (' +
+        esc(r.mode) +
+        " detectors).</div>";
     } else {
-      html += '<div class="meta-line warn-text">Transcript resending means a secret egresses on EVERY later turn — rotate the credentials below.</div>' +
+      html +=
+        '<div class="meta-line warn-text">Transcript resending means a secret egresses on EVERY later turn — rotate the credentials below.</div>' +
         '<div class="tbl-wrap"><table><thead><tr>' +
         '<th>Type</th><th>Fingerprint</th><th class="num">Len</th><th class="num">Egressed</th><th class="num">In responses</th><th>Where</th><th>First → last</th><th>Files</th>' +
         "</tr></thead><tbody>" +
-        r.groups.map(function (g) {
-          return "<tr><td><span class=\"pill err\">" + esc(g.type) + "</span></td>" +
-            '<td class="hash">' + esc(g.fingerprint) + (g.last4 ? "…" + esc(g.last4) : "") + "</td>" +
-            '<td class="num">' + g.tokenLength + "</td>" +
-            '<td class="num">' + (g.egressCount ? '<b class="warn-text">' + g.egressCount + "×</b>" : "0") + "</td>" +
-            '<td class="num">' + (g.responseCount || 0) + "</td>" +
-            "<td>" + esc(g.locations.join(", ")) + "</td>" +
-            '<td class="dim">' + fmtTime(g.firstTs) + " → " + fmtTime(g.lastTs) + "</td>" +
-            '<td class="dim">' + g.files.map(function (f) { return esc(basename(f)); }).join("<br/>") + "</td></tr>";
-        }).join("") +
+        r.groups
+          .map(function (g) {
+            return (
+              '<tr><td><span class="pill err">' +
+              esc(g.type) +
+              "</span></td>" +
+              '<td class="hash">' +
+              esc(g.fingerprint) +
+              (g.last4 ? "…" + esc(g.last4) : "") +
+              "</td>" +
+              '<td class="num">' +
+              g.tokenLength +
+              "</td>" +
+              '<td class="num">' +
+              (g.egressCount
+                ? '<b class="warn-text">' + g.egressCount + "×</b>"
+                : "0") +
+              "</td>" +
+              '<td class="num">' +
+              (g.responseCount || 0) +
+              "</td>" +
+              "<td>" +
+              esc(g.locations.join(", ")) +
+              "</td>" +
+              '<td class="dim">' +
+              fmtTime(g.firstTs) +
+              " → " +
+              fmtTime(g.lastTs) +
+              "</td>" +
+              '<td class="dim">' +
+              g.files
+                .map(function (f) {
+                  return esc(basename(f));
+                })
+                .join("<br/>") +
+              "</td></tr>"
+            );
+          })
+          .join("") +
         "</tbody></table></div>";
     }
 
     if (r.redactCheck) {
-      html += '<div class="note">redact-check: capture-time <code>--redact-bodies</code> would mask ' +
-        r.redactCheck.standardMasked + ", <code>--redact-bodies=strict</code> " + r.redactCheck.strictMasked +
-        " of " + r.redactCheck.total + " detected occurrence(s). " +
+      html +=
+        '<div class="note">redact-check: capture-time <code>--redact-bodies</code> would mask ' +
+        r.redactCheck.standardMasked +
+        ", <code>--redact-bodies=strict</code> " +
+        r.redactCheck.strictMasked +
+        " of " +
+        r.redactCheck.total +
+        " detected occurrence(s). " +
         "Capture with <code>tracetap claude --redact-bodies</code> to mask at write time.</div>";
     }
     body.innerHTML = html;
@@ -1140,13 +2715,23 @@
 
   function isTyping(e) {
     var t = e.target;
-    return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
+    return (
+      t &&
+      (t.tagName === "INPUT" ||
+        t.tagName === "TEXTAREA" ||
+        t.tagName === "SELECT" ||
+        t.isContentEditable)
+    );
   }
 
-  function focusedRow() { return view.querySelector(".kb-focus"); }
+  function focusedRow() {
+    return view.querySelector(".kb-focus");
+  }
 
   function moveCursor(dir) {
-    var rows = Array.prototype.slice.call(view.querySelectorAll("tr.click, .wf-row.click"));
+    var rows = Array.prototype.slice.call(
+      view.querySelectorAll("tr.click, .wf-row.click"),
+    );
     if (!rows.length) return;
     var cur = focusedRow();
     var idx = cur ? rows.indexOf(cur) : -1;
@@ -1162,8 +2747,14 @@
   }
 
   function focusSearch() {
-    var inp = view.querySelector('input[type="search"]') || view.querySelector('input[type="text"]');
-    if (inp) { inp.focus(); inp.select(); return true; }
+    var inp =
+      view.querySelector('input[type="search"]') ||
+      view.querySelector('input[type="text"]');
+    if (inp) {
+      inp.focus();
+      inp.select();
+      return true;
+    }
     return false;
   }
 
@@ -1179,11 +2770,16 @@
       if (e.key === "Escape") e.target.blur();
       return;
     }
-    if (e.key === "/") { e.preventDefault(); focusSearch(); }
-    else if (e.key === "j") moveCursor(1);
+    if (e.key === "/") {
+      e.preventDefault();
+      focusSearch();
+    } else if (e.key === "j") moveCursor(1);
     else if (e.key === "k") moveCursor(-1);
-    else if (e.key === "Enter" && focusedRow()) { e.preventDefault(); activateCursor(); }
-    else if (e.key >= "1" && e.key <= "5") location.hash = "#" + TABS[Number(e.key) - 1];
+    else if (e.key === "Enter" && focusedRow()) {
+      e.preventDefault();
+      activateCursor();
+    } else if (e.key >= "1" && e.key <= "5")
+      location.hash = "#" + TABS[Number(e.key) - 1];
     else if (e.key === "?") toggleHelp();
     else if (e.key === "Escape") {
       if (current.name === "session") location.hash = "#sessions";
@@ -1192,12 +2788,18 @@
   });
 
   // -- command palette ---------------------------------------------------
-  var palItems = [], palSel = 0;
+  var palItems = [],
+    palSel = 0;
 
-  function paletteOpen() { return !!document.getElementById("pal"); }
+  function paletteOpen() {
+    return !!document.getElementById("pal");
+  }
 
   function togglePalette() {
-    if (paletteOpen()) { closeOverlays(); return; }
+    if (paletteOpen()) {
+      closeOverlays();
+      return;
+    }
     closeOverlays();
     var ov = document.createElement("div");
     ov.className = "pal-overlay";
@@ -1209,16 +2811,26 @@
       '<div class="pal-foot">↑↓ navigate · ↵ open · esc close</div>' +
       "</div>";
     document.body.appendChild(ov);
-    ov.addEventListener("mousedown", function (e) { if (e.target === ov) closeOverlays(); });
+    ov.addEventListener("mousedown", function (e) {
+      if (e.target === ov) closeOverlays();
+    });
 
     var q = document.getElementById("pal-q");
     q.focus();
-    q.addEventListener("input", function () { palRender(q.value); });
+    q.addEventListener("input", function () {
+      palRender(q.value);
+    });
     q.addEventListener("keydown", function (e) {
-      if (e.key === "Escape") { e.preventDefault(); closeOverlays(); }
-      else if (e.key === "ArrowDown") { e.preventDefault(); palMove(1); }
-      else if (e.key === "ArrowUp") { e.preventDefault(); palMove(-1); }
-      else if (e.key === "Enter") {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeOverlays();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        palMove(1);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        palMove(-1);
+      } else if (e.key === "Enter") {
         e.preventDefault();
         var sel = document.querySelector(".pal-item.sel");
         if (sel) palGo(sel.getAttribute("data-go"));
@@ -1227,28 +2839,49 @@
     });
 
     palItems = TABS.map(function (t, i) {
-      return { kind: "view", label: t, sub: "switch view · " + (i + 1), go: "#" + t, text: t };
+      return {
+        kind: "view",
+        label: t,
+        sub: "switch view · " + (i + 1),
+        go: "#" + t,
+        text: t,
+      };
     });
     Promise.all([
-      fetchJSON("/api/sessions?limit=200").catch(function () { return { sessions: [] }; }),
-      fetchJSON("/api/prompts").catch(function () { return { prompts: [] }; })
+      fetchJSON("/api/sessions?limit=200").catch(function () {
+        return { sessions: [] };
+      }),
+      fetchJSON("/api/prompts").catch(function () {
+        return { prompts: [] };
+      }),
     ]).then(function (res) {
       res[0].sessions.forEach(function (s) {
         palItems.push({
           kind: "session",
-          label: s.agent + " · " + (s.model || "?") + " · " + basename(s.projectCwd),
-          sub: fmtTime(s.startedAt) + " · " + (s.turns || 0) + " turns · " + fmtCost(s.costUsd),
+          label:
+            s.agent + " · " + (s.model || "?") + " · " + basename(s.projectCwd),
+          sub:
+            fmtTime(s.startedAt) +
+            " · " +
+            (s.turns || 0) +
+            " turns · " +
+            fmtCost(s.costUsd),
           go: "#session/" + encodeURIComponent(s.sessionId),
-          text: s.sessionId + " " + s.agent + " " + s.model + " " + s.projectCwd
+          text:
+            s.sessionId + " " + s.agent + " " + s.model + " " + s.projectCwd,
         });
       });
       res[1].prompts.forEach(function (p) {
         palItems.push({
           kind: "prompt",
           label: p.promptHash.slice(0, 12) + " · " + p.agent,
-          sub: "~" + fmtTok(p.approxTokens) + " tokens · last seen " + fmtTime(p.lastSeen),
+          sub:
+            "~" +
+            fmtTok(p.approxTokens) +
+            " tokens · last seen " +
+            fmtTime(p.lastSeen),
           go: "#prompt/" + p.promptHash,
-          text: p.promptHash + " " + p.agent + " prompt"
+          text: p.promptHash + " " + p.agent + " prompt",
         });
       });
       if (paletteOpen()) palRender(q.value);
@@ -1261,14 +2894,23 @@
     if (!needle) return 0;
     needle = needle.toLowerCase();
     hay = hay.toLowerCase();
-    var score = 0, hi = 0, streak = 0;
+    var score = 0,
+      hi = 0,
+      streak = 0;
     for (var ni = 0; ni < needle.length; ni++) {
       var c = needle[ni];
-      if (c === " ") { streak = 0; continue; }
+      if (c === " ") {
+        streak = 0;
+        continue;
+      }
       var found = hay.indexOf(c, hi);
       if (found === -1) return -1;
       streak = found === hi ? streak + 1 : 1;
-      score += streak * 2 + (found === 0 || hay[found - 1] === " " || hay[found - 1] === "/" ? 4 : 0);
+      score +=
+        streak * 2 +
+        (found === 0 || hay[found - 1] === " " || hay[found - 1] === "/"
+          ? 4
+          : 0);
       hi = found + 1;
     }
     return score;
@@ -1278,24 +2920,48 @@
     var list = document.getElementById("pal-list");
     if (!list) return;
     var ranked = palItems
-      .map(function (it) { return { it: it, s: fuzzyScore(qv, it.text) }; })
-      .filter(function (r) { return r.s >= 0; })
-      .sort(function (a, b) { return b.s - a.s; })
+      .map(function (it) {
+        return { it: it, s: fuzzyScore(qv, it.text) };
+      })
+      .filter(function (r) {
+        return r.s >= 0;
+      })
+      .sort(function (a, b) {
+        return b.s - a.s;
+      })
       .slice(0, 12);
     palSel = 0;
     if (!ranked.length) {
       list.innerHTML = '<div class="pal-empty">no matches</div>';
       return;
     }
-    list.innerHTML = ranked.map(function (r, i) {
-      return '<div class="pal-item' + (i === 0 ? " sel" : "") + '" data-go="' + esc(r.it.go) + '">' +
-        '<span class="pal-kind ' + r.it.kind + '">' + r.it.kind + "</span>" +
-        '<span class="pal-label">' + esc(r.it.label) + "</span>" +
-        '<span class="pal-sub">' + esc(r.it.sub) + "</span>" +
-        "</div>";
-    }).join("");
+    list.innerHTML = ranked
+      .map(function (r, i) {
+        return (
+          '<div class="pal-item' +
+          (i === 0 ? " sel" : "") +
+          '" data-go="' +
+          esc(r.it.go) +
+          '">' +
+          '<span class="pal-kind ' +
+          r.it.kind +
+          '">' +
+          r.it.kind +
+          "</span>" +
+          '<span class="pal-label">' +
+          esc(r.it.label) +
+          "</span>" +
+          '<span class="pal-sub">' +
+          esc(r.it.sub) +
+          "</span>" +
+          "</div>"
+        );
+      })
+      .join("");
     list.querySelectorAll(".pal-item").forEach(function (el) {
-      el.addEventListener("click", function () { palGo(el.getAttribute("data-go")); });
+      el.addEventListener("click", function () {
+        palGo(el.getAttribute("data-go"));
+      });
     });
   }
 
@@ -1303,7 +2969,9 @@
     var items = document.querySelectorAll(".pal-item");
     if (!items.length) return;
     palSel = Math.min(items.length - 1, Math.max(0, palSel + dir));
-    items.forEach(function (el, i) { el.classList.toggle("sel", i === palSel); });
+    items.forEach(function (el, i) {
+      el.classList.toggle("sel", i === palSel);
+    });
     items[palSel].scrollIntoView({ block: "nearest" });
   }
 
@@ -1314,10 +2982,15 @@
   }
 
   // -- shortcuts overlay ---------------------------------------------------
-  function helpOpen() { return !!document.getElementById("help"); }
+  function helpOpen() {
+    return !!document.getElementById("help");
+  }
 
   function toggleHelp() {
-    if (helpOpen()) { closeOverlays(); return; }
+    if (helpOpen()) {
+      closeOverlays();
+      return;
+    }
     closeOverlays();
     var rows = [
       ["⌘K", "command palette"],
@@ -1326,17 +2999,29 @@
       ["↵", "open focused row"],
       ["1–5", "switch view"],
       ["esc", "back / close"],
-      ["?", "this overlay"]
+      ["?", "this overlay"],
     ];
     var ov = document.createElement("div");
     ov.className = "pal-overlay";
     ov.id = "help";
-    ov.innerHTML = '<div class="pal help"><div class="tt-title">keyboard</div>' +
-      rows.map(function (r) {
-        return '<div class="help-row"><kbd>' + r[0] + "</kbd><span>" + r[1] + "</span></div>";
-      }).join("") + "</div>";
+    ov.innerHTML =
+      '<div class="pal help"><div class="tt-title">keyboard</div>' +
+      rows
+        .map(function (r) {
+          return (
+            '<div class="help-row"><kbd>' +
+            r[0] +
+            "</kbd><span>" +
+            r[1] +
+            "</span></div>"
+          );
+        })
+        .join("") +
+      "</div>";
     document.body.appendChild(ov);
-    ov.addEventListener("mousedown", function (e) { if (e.target === ov) closeOverlays(); });
+    ov.addEventListener("mousedown", function (e) {
+      if (e.target === ov) closeOverlays();
+    });
     document.addEventListener("keydown", function onEsc(e) {
       if (e.key === "Escape" || e.key === "?") {
         closeOverlays();

@@ -9,6 +9,15 @@ import { buildTrajectory, groupPairs } from "../trajectory";
 import type { PairGroup, Trajectory, Step } from "../trajectory";
 import { analyze, costForMetrics, priceFor } from "../analytics";
 import type { PriceTable } from "../analytics";
+import type { HookEvent, HookRow } from "../hooks/types";
+import { HOOK_EVENT_VERSION } from "../hooks/types";
+import { defaultHooksDir } from "../hooks/paths";
+import { deriveFlow } from "../flow/derive";
+import type { FlowGraph } from "../flow/derive";
+import { buildContextXray } from "../context/xray";
+import type { ContextXray } from "../context/xray";
+import { buildContextTimeline } from "../context/timeline";
+import type { ContextTimeline } from "../context/timeline";
 
 /**
  * Local cross-session trace store + search.
@@ -272,7 +281,7 @@ const SORTABLE_COLUMNS = new Set([
   "cost_usd",
 ]);
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 // ---------------------------------------------------------------------------
 // Paths / discovery
@@ -468,6 +477,8 @@ export class Store {
         DROP TABLE IF EXISTS requests;
         DROP TABLE IF EXISTS usage_events;
         DROP TABLE IF EXISTS prompts;
+        DROP TABLE IF EXISTS hooks;
+        DROP TABLE IF EXISTS hook_files;
       `);
     }
 
@@ -560,6 +571,32 @@ export class Store {
         first_seen  REAL,
         last_seen   REAL
       );
+      CREATE TABLE IF NOT EXISTS hook_files (
+        source_path  TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        mtime_ms     INTEGER NOT NULL,
+        size         INTEGER NOT NULL,
+        indexed_at   TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS hooks (
+        id              INTEGER PRIMARY KEY,
+        session_id      TEXT NOT NULL,
+        ts              REAL NOT NULL,
+        event           TEXT NOT NULL,
+        hook_name       TEXT NOT NULL DEFAULT '',
+        duration_ms     INTEGER,
+        decision        TEXT,
+        stdin_digest    TEXT NOT NULL DEFAULT '',
+        stdin_preview   TEXT NOT NULL DEFAULT '{}',
+        stdout_preview  TEXT,
+        outcome         TEXT,
+        exit_code       INTEGER,
+        payload_json    TEXT,
+        source_path     TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_hooks_session ON hooks(session_id, ts);
+      CREATE INDEX IF NOT EXISTS idx_hooks_ts ON hooks(ts);
+      CREATE INDEX IF NOT EXISTS idx_hooks_source ON hooks(source_path);
     `);
     this.db
       .prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
@@ -852,6 +889,12 @@ export class Store {
       else filesIndexed += 1;
       sessions += res.sessions;
       steps += res.steps;
+    }
+    // Also fold in the hook sidecar (idempotent).
+    try {
+      this.indexHooks();
+    } catch {
+      /* hooks dir may be absent */
     }
     return { files: results, filesIndexed, filesSkipped, sessions, steps };
   }
@@ -1295,6 +1338,269 @@ export class Store {
       sessionIds: sessionRows.map((s) => String(s.session_id)),
     };
   }
+
+  // -- hooks sidecar ---------------------------------------------------------
+
+  /**
+   * Index hook JSONL files under a directory (default: `~/.tracetap/hooks`).
+   * Watermarked like wire logs — unchanged files are skipped.
+   */
+  indexHooks(hooksDir?: string): { filesIndexed: number; filesSkipped: number; events: number } {
+    const dir = hooksDir && hooksDir.trim() ? hooksDir : defaultHooksDir();
+    let filesIndexed = 0;
+    let filesSkipped = 0;
+    let events = 0;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return { filesIndexed, filesSkipped, events };
+    }
+    for (const e of entries) {
+      if (!e.isFile() || !e.name.endsWith(".jsonl")) continue;
+      const sourcePath = path.resolve(dir, e.name);
+      try {
+        const res = this.indexHookFile(sourcePath);
+        if (res.skipped) filesSkipped += 1;
+        else {
+          filesIndexed += 1;
+          events += res.events;
+        }
+      } catch {
+        continue;
+      }
+    }
+    return { filesIndexed, filesSkipped, events };
+  }
+
+  indexHookFile(jsonlPath: string): { sourcePath: string; skipped: boolean; events: number } {
+    const sourcePath = path.resolve(jsonlPath);
+    const st = fs.statSync(sourcePath);
+    const content = fs.readFileSync(sourcePath, "utf-8");
+    const contentHash = crypto.createHash("sha256").update(content).digest("hex");
+    const prior = this.db
+      .prepare("SELECT content_hash FROM hook_files WHERE source_path = ?")
+      .get(sourcePath) as { content_hash: string } | undefined;
+    if (prior && prior.content_hash === contentHash) {
+      return { sourcePath, skipped: true, events: 0 };
+    }
+
+    const events: HookEvent[] = [];
+    for (const raw of content.split("\n")) {
+      const line = raw.trim();
+      if (!line) continue;
+      try {
+        const ev = JSON.parse(line) as HookEvent;
+        if (ev && (ev.v === HOOK_EVENT_VERSION || ev.v === 1) && ev.session_id && ev.event) {
+          events.push(ev);
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    const run = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM hooks WHERE source_path = ?").run(sourcePath);
+      const ins = this.db.prepare(
+        `INSERT INTO hooks(
+           session_id, ts, event, hook_name, duration_ms, decision,
+           stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
+           payload_json, source_path
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const ev of events) {
+        const ts = Date.parse(ev.ts) / 1000;
+        ins.run(
+          ev.session_id,
+          Number.isFinite(ts) ? ts : 0,
+          ev.event,
+          ev.hook_name ?? "",
+          ev.duration_ms ?? null,
+          ev.decision ?? null,
+          ev.stdin_digest ?? "",
+          JSON.stringify(ev.stdin_preview ?? {}),
+          ev.stdout_preview != null ? JSON.stringify(ev.stdout_preview) : null,
+          ev.outcome ?? null,
+          ev.exit_code ?? null,
+          ev.payload !== undefined ? JSON.stringify(ev.payload) : null,
+          sourcePath,
+        );
+      }
+      this.db
+        .prepare(
+          `INSERT OR REPLACE INTO hook_files(source_path, content_hash, mtime_ms, size, indexed_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(sourcePath, contentHash, Math.round(st.mtimeMs), st.size, new Date().toISOString());
+    });
+    run();
+    return { sourcePath, skipped: false, events: events.length };
+  }
+
+  /**
+   * Hooks for a wire session: exact `session_id` match OR time-overlap with the
+   * session window (±10 min slack). Wire conversation keys rarely equal Claude's
+   * hook session_id, so time correlation is the practical bridge.
+   */
+  listHooksForSession(sessionId: string): HookRow[] {
+    const session = this.getSession(sessionId);
+    const byId = this.db
+      .prepare(
+        `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
+                stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
+                payload_json, source_path
+         FROM hooks WHERE session_id = ? ORDER BY ts, id`,
+      )
+      .all(sessionId) as any[];
+
+    let byTime: any[] = [];
+    if (session) {
+      const slack = 600; // 10 minutes — long tool calls can lag the wire window
+      const start = session.startedAt > 0 ? session.startedAt - slack : 0;
+      const end = session.endedAt > 0 ? session.endedAt + slack : Number.MAX_SAFE_INTEGER;
+      byTime = this.db
+        .prepare(
+          `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
+                  stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
+                  payload_json, source_path
+           FROM hooks
+           WHERE ts >= ? AND ts <= ?
+           ORDER BY ts, id`,
+        )
+        .all(start, end) as any[];
+    }
+
+    const seen = new Set<number>();
+    const rows: HookRow[] = [];
+    for (const r of [...byId, ...byTime]) {
+      const id = Number(r.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      rows.push(hookRowFromDb(r));
+    }
+    rows.sort((a, b) => a.ts - b.ts || a.id - b.id);
+    return rows;
+  }
+
+  /** Build the Flow graph for one session (steps + hooks + requests). */
+  sessionFlow(sessionId: string): FlowGraph {
+    return deriveFlow({
+      steps: this.listSteps(sessionId),
+      hooks: this.listHooksForSession(sessionId),
+      requests: this.listRequests(sessionId),
+    });
+  }
+
+  /**
+   * Load the RawPair at `seq` for a session from its source JSONL (on disk).
+   * Returns null when the source file is missing or seq is out of range.
+   */
+  getRawPair(sessionId: string, seq: number): RawPair | null {
+    const session = this.getSession(sessionId);
+    if (!session?.sourcePath) return null;
+    let content: string;
+    try {
+      content = fs.readFileSync(session.sourcePath, "utf-8");
+    } catch {
+      return null;
+    }
+    const pairs = parsePairs(content);
+    // Pairs in the file may span multiple conversation groups; filter to this session.
+    const groups = groupPairs(pairs);
+    const group = groups.find((g) => g.sessionId === sessionId) ?? groups[0];
+    if (!group) return null;
+    return group.pairs[seq] ?? null;
+  }
+
+  /** Context X-Ray for one API call, with delta vs the previous call when present. */
+  sessionContextXray(sessionId: string, seq: number): ContextXray | null {
+    const requests = this.listRequests(sessionId);
+    const pair = this.getRawPair(sessionId, seq);
+    if (!pair) return null;
+    const req = requests.find((r) => r.seq === seq);
+    const prevReq = requests.filter((r) => r.seq < seq).sort((a, b) => b.seq - a.seq)[0];
+    const prevPair = prevReq ? this.getRawPair(sessionId, prevReq.seq) : null;
+    return buildContextXray({
+      seq,
+      pair,
+      promptHash: req?.promptHash ?? "",
+      prev:
+        prevReq && prevPair
+          ? { seq: prevReq.seq, pair: prevPair }
+          : undefined,
+    });
+  }
+
+  /**
+   * Context-size timeline across API calls, with compaction pre/post markers.
+   * Reads source JSONL when present so approx tokens / buckets are real.
+   */
+  sessionContextTimeline(sessionId: string): ContextTimeline {
+    const requests = this.listRequests(sessionId);
+    const pairsBySeq = new Map<number, RawPair>();
+    for (const r of requests) {
+      const pair = this.getRawPair(sessionId, r.seq);
+      if (pair) pairsBySeq.set(r.seq, pair);
+    }
+    return buildContextTimeline({
+      requests,
+      pairsBySeq,
+      xrayFor: (seq, pair, promptHash) => {
+        const x = buildContextXray({
+          seq,
+          pair: pair as RawPair,
+          promptHash,
+        });
+        return {
+          totalChars: x.totalChars,
+          totalApproxTokens: x.totalApproxTokens,
+          buckets: x.buckets.map((b) => ({ bucket: b.bucket, approxTokens: b.approxTokens })),
+        };
+      },
+    });
+  }
+}
+
+function hookRowFromDb(r: any): HookRow {
+  let stdinPreview: Record<string, unknown> = {};
+  let stdoutPreview: Record<string, unknown> | null = null;
+  let payload: unknown | null = null;
+  try {
+    stdinPreview = JSON.parse(String(r.stdin_preview || "{}"));
+  } catch {
+    stdinPreview = {};
+  }
+  if (r.stdout_preview) {
+    try {
+      stdoutPreview = JSON.parse(String(r.stdout_preview));
+    } catch {
+      stdoutPreview = { raw: String(r.stdout_preview) };
+    }
+  }
+  if (r.payload_json) {
+    try {
+      payload = JSON.parse(String(r.payload_json));
+    } catch {
+      payload = null;
+    }
+  }
+  const decision = r.decision === "block" || r.decision === "allow" ? r.decision : null;
+  return {
+    id: Number(r.id),
+    sessionId: String(r.session_id),
+    ts: Number(r.ts ?? 0),
+    event: String(r.event ?? ""),
+    hookName: String(r.hook_name ?? ""),
+    durationMs: r.duration_ms == null ? null : Number(r.duration_ms),
+    decision,
+    stdinDigest: String(r.stdin_digest ?? ""),
+    stdinPreview,
+    stdoutPreview,
+    outcome: r.outcome ?? null,
+    exitCode: r.exit_code == null ? null : Number(r.exit_code),
+    payload,
+    sourcePath: String(r.source_path ?? ""),
+  };
 }
 
 function sha256Hex(text: string): string {

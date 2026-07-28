@@ -378,6 +378,28 @@ async function auditIndexedFiles(
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
+/**
+ * Evaluate one pane's data source in isolation.
+ *
+ * The session endpoint feeds four independent panes. Without this, a throw in
+ * any single section (a malformed hook row, a flow graph cycle) returns a 500
+ * and every pane goes blank — including the ones that never needed that data.
+ * On failure the section is `null`, which the frontend already treats as its
+ * empty state, and the reason is reported under `sectionErrors`.
+ */
+function paneSection<T>(
+  errors: Record<string, string>,
+  label: string,
+  load: () => T,
+): T | null {
+  try {
+    return load();
+  } catch (err) {
+    errors[label] = err instanceof Error ? err.message : String(err);
+    return null;
+  }
+}
+
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -542,7 +564,27 @@ export async function handleRequest(
     }
 
     if (pathname.startsWith("/api/session/")) {
-      const sessionId = decodeURIComponent(pathname.slice("/api/session/".length));
+      // /api/session/<id>/context/<seq>
+      const rest = decodeURIComponent(pathname.slice("/api/session/".length));
+      const contextMatch = rest.match(/^(.*)\/context\/(\d+)$/);
+      if (contextMatch) {
+        const sessionId = contextMatch[1];
+        const seq = Number(contextMatch[2]);
+        const session = store.getSession(sessionId);
+        if (!session) {
+          sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
+          return;
+        }
+        const xray = store.sessionContextXray(sessionId, seq);
+        if (!xray) {
+          sendJson(res, 404, { error: `No request body for session '${sessionId}' seq ${seq}.` });
+          return;
+        }
+        sendJson(res, 200, xray);
+        return;
+      }
+
+      const sessionId = rest;
       const session = store.getSession(sessionId);
       if (!session) {
         sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
@@ -550,12 +592,27 @@ export async function handleRequest(
       }
       const steps = store.listSteps(sessionId);
       const requests = store.listRequests(sessionId);
+      // Each of these backs exactly one pane. Isolate them: a throw in any one
+      // degrades its own pane instead of 500-ing the endpoint and darkening all
+      // four — Wire in particular needs none of them.
+      const sectionErrors: Record<string, string> = {};
+      const hooks = paneSection(sectionErrors, "hooks", () =>
+        store.listHooksForSession(sessionId),
+      );
+      const flow = paneSection(sectionErrors, "flow", () => store.sessionFlow(sessionId));
+      const contextTimeline = paneSection(sectionErrors, "contextTimeline", () =>
+        store.sessionContextTimeline(sessionId),
+      );
       sendJson(res, 200, {
         session,
         steps,
         requests,
+        hooks,
+        flow,
+        contextTimeline,
         compactions: findCompactions(requests),
         reportAvailable: fs.existsSync(reportPathFor(session.sourcePath)),
+        ...(Object.keys(sectionErrors).length ? { sectionErrors } : {}),
       });
       return;
     }

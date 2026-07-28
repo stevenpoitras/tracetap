@@ -10,11 +10,11 @@ tracetap <tool> [trace-options] [tool args…]
 
 Supported tools today:
 
-| Tool | Traces | How |
-| ---- | ------ | --- |
-| **`claude`** | Claude Code v2 (native binary) | proxies `ANTHROPIC_BASE_URL` |
+| Tool         | Traces                         | How                                       |
+| ------------ | ------------------------------ | ----------------------------------------- |
+| **`claude`** | Claude Code v2 (native binary) | proxies `ANTHROPIC_BASE_URL`              |
 | **`codex`**  | the Codex CLI (native binary)  | injects a temporary OpenAI model provider |
-| **`gemini`** | the Gemini CLI                 | proxies `GOOGLE_GEMINI_BASE_URL` |
+| **`gemini`** | the Gemini CLI                 | proxies `GOOGLE_GEMINI_BASE_URL`          |
 
 These are agent harnesses you can't reliably loader-patch, so `tracetap` hooks them at the network layer instead. See [Tracing Claude](#tracing-claude), [Tracing Codex](#tracing-codex) and [Tracing Gemini](#tracing-gemini).
 
@@ -47,7 +47,7 @@ tracetap audit                               # what secrets crossed the wire?
 tracetap search "rate limit retry"           # full-text search across sessions
 ```
 
-Everything after the `<tool>` selector is handled by that tool's tracer: a small set of trace flags (below), and **any flag we don't recognize is forwarded verbatim to the underlying binary** — so most `claude`/`codex`/`gemini` invocations work just by prefixing them with `tracetap claude`/`tracetap codex`/`tracetap gemini`. Trace flags may also go *before* the tool (`tracetap --log demo codex exec …`). Use `--run-with` if an agent flag ever collides with one of ours.
+Everything after the `<tool>` selector is handled by that tool's tracer: a small set of trace flags (below), and **any flag we don't recognize is forwarded verbatim to the underlying binary** — so most `claude`/`codex`/`gemini` invocations work just by prefixing them with `tracetap claude`/`tracetap codex`/`tracetap gemini`. Trace flags may also go _before_ the tool (`tracetap --log demo codex exec …`). Use `--run-with` if an agent flag ever collides with one of ours.
 
 Output lands in `./.claude-trace/` (claude), `./.codex-trace/` (codex), or `./.gemini-trace/` (gemini), as `<basename>.{jsonl,html}`, next to wherever you ran the command. **Devin** is the exception: it can't be proxied, so `tracetap devin import` reconstructs sessions from Devin's local store into `./.devin-trace/` (see [Importing Devin sessions](#importing-devin-sessions)).
 
@@ -107,18 +107,19 @@ You can't loader-patch a binary you can't load. So this tool takes a different h
 
 1. The CLI spins up a tiny local HTTP server on `127.0.0.1:<random_port>`.
 2. It spawns `claude` as a child process with `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` in its env. The Anthropic SDK inside the binary respects that env var (verified by `strings(1)` against the v2 binary), so all `/v1/messages` traffic flows to us in plaintext.
-3. The proxy forwards each request to `https://api.anthropic.com`, streams the response chunks straight back to the client (no buffering — interactive output stays interactive), and *also* tees the bytes into an in-memory buffer for logging.
+3. The proxy forwards each request to `https://api.anthropic.com`, streams the response chunks straight back to the client (no buffering — interactive output stays interactive), and _also_ tees the bytes into an in-memory buffer for logging.
 4. When a response finishes, the proxy writes a single `{ request, response, logged_at }` JSON line to `.claude-trace/<basename>.jsonl` and re-renders the HTML viewer.
 
 ### Why this is simpler than HTTPS-mitm
 
 A proxy that intercepts HTTPS requires you to:
+
 - generate a self-signed CA,
 - install it into a system trust store (or Node's `NODE_EXTRA_CA_CERTS`),
 - man-in-the-middle every TLS handshake, and
 - still hope the client doesn't pin certs.
 
-We avoid all of that. The child process talks to us in plaintext over loopback because we *are* the API origin from its perspective. The hop from us to Anthropic uses the normal HTTPS client. No certificates touched.
+We avoid all of that. The child process talks to us in plaintext over loopback because we _are_ the API origin from its perspective. The hop from us to Anthropic uses the normal HTTPS client. No certificates touched.
 
 ### What's captured
 
@@ -152,7 +153,7 @@ Every request/response pair is one JSONL line:
 - JSON responses land in `response.body`.
 - SSE streaming responses land in `response.body_raw` (the raw `text/event-stream` text). The HTML viewer parses these into normal assistant turns.
 - Sensitive headers (`authorization`, `x-api-key`, `cookie`, `set-cookie`, `bearer`, `x-auth-token`, `x-session-token`, `x-access-token`, `proxy-authorization`) are partially redacted at write time — the full token is **not** in your logs.
-- Secrets in request/response **bodies** (keys pasted into prompts, an `.env` a tool read, …) are *not* masked by default, but `--redact-bodies` opts in to a high-precision masking pass, and export to ATIF redacts bodies by default. See [Privacy & security](#privacy--security).
+- Secrets in request/response **bodies** (keys pasted into prompts, an `.env` a tool read, …) are _not_ masked by default, but `--redact-bodies` opts in to a high-precision masking pass, and export to ATIF redacts bodies by default. See [Privacy & security](#privacy--security).
 
 ---
 
@@ -185,26 +186,26 @@ tracetap claude --claude /custom/path/to/claude
 
 Run as `tracetap claude [flag…] [claude args…]`.
 
-| Flag                       | Purpose                                                         |
-| -------------------------- | --------------------------------------------------------------- |
-| `--generate-html <jsonl>`  | Render a JSONL log to HTML and exit. Optional `[output.html]`.  |
-| `--stats <jsonl>`          | Print token/cost analytics for a log and write a `<basename>.stats.json` sidecar, then exit. See [Token & cost analytics](#token--cost-analytics). |
-| `--include-all-requests`   | Log every request, not just `/v1/messages`.                      |
+| Flag                                 | Purpose                                                                                                                                                                                                                                                                  |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--generate-html <jsonl>`            | Render a JSONL log to HTML and exit. Optional `[output.html]`.                                                                                                                                                                                                           |
+| `--stats <jsonl>`                    | Print token/cost analytics for a log and write a `<basename>.stats.json` sidecar, then exit. See [Token & cost analytics](#token--cost-analytics).                                                                                                                       |
+| `--include-all-requests`             | Log every request, not just `/v1/messages`.                                                                                                                                                                                                                              |
 | `--redact-bodies[=standard\|strict]` | Mask secrets (API keys, tokens, JWTs, `AKIA…`, `Bearer …`) in request/response **bodies** before they're written. Off by default on capture; `=standard` (bare) is high-precision, `=strict` adds entropy-based detectors. See [Privacy & security](#privacy--security). |
-| `--no-redact`              | Export verbatim. Body redaction is **on by default** for `--to-atif` / `--format atif`; this opts out. |
-| `--no-open`                | Don't open the HTML report in browser when the session ends.    |
-| `--summarize`              | On exit, shell out to `claude -p` for a one-paragraph session summary (added to the report header + a `.stats.json`). Off by default. Uses your existing plan — no extra API key — and the summary call is not itself traced. |
-| `--log <name>`             | Custom log basename (no extension).                             |
-| `--claude <path>`          | Override path to the `claude` binary (default: `which claude`). |
-| `--upstream <url>`         | Override the upstream API base.                                 |
-| `--run-with <args...>`     | Force everything after this through to `claude` (escape hatch for flag-name collisions; usually unnecessary since unknown flags auto-forward). |
-| `--help`, `-h`             | Show usage.                                                     |
+| `--no-redact`                        | Export verbatim. Body redaction is **on by default** for `--to-atif` / `--format atif`; this opts out.                                                                                                                                                                   |
+| `--no-open`                          | Don't open the HTML report in browser when the session ends.                                                                                                                                                                                                             |
+| `--summarize`                        | On exit, shell out to `claude -p` for a one-paragraph session summary (added to the report header + a `.stats.json`). Off by default. Uses your existing plan — no extra API key — and the summary call is not itself traced.                                            |
+| `--log <name>`                       | Custom log basename (no extension).                                                                                                                                                                                                                                      |
+| `--claude <path>`                    | Override path to the `claude` binary (default: `which claude`).                                                                                                                                                                                                          |
+| `--upstream <url>`                   | Override the upstream API base.                                                                                                                                                                                                                                          |
+| `--run-with <args...>`               | Force everything after this through to `claude` (escape hatch for flag-name collisions; usually unnecessary since unknown flags auto-forward).                                                                                                                           |
+| `--help`, `-h`                       | Show usage.                                                                                                                                                                                                                                                              |
 
 ---
 
 ## Tracing Codex
 
-`tracetap codex` records the **[Codex CLI](https://developers.openai.com/codex)**. Codex is also a native single binary, so the loader-patch problem is identical — but Codex doesn't honor an `OPENAI_BASE_URL` env var the way Claude Code honors `ANTHROPIC_BASE_URL`. Instead it routes model traffic through a configurable *model provider*. `tracetap codex` injects a throwaway provider that points Codex at the local proxy:
+`tracetap codex` records the **[Codex CLI](https://developers.openai.com/codex)**. Codex is also a native single binary, so the loader-patch problem is identical — but Codex doesn't honor an `OPENAI_BASE_URL` env var the way Claude Code honors `ANTHROPIC_BASE_URL`. Instead it routes model traffic through a configurable _model provider_. `tracetap codex` injects a throwaway provider that points Codex at the local proxy:
 
 ```bash
 tracetap codex "refactor this module"          # interactive Codex session, fully logged
@@ -248,21 +249,21 @@ The HTML report parses the OpenAI **Responses API** shape rather than Anthropic'
 
 Run as `tracetap codex [flag…] [codex args…]`.
 
-| Flag                       | Purpose                                                          |
-| -------------------------- | ---------------------------------------------------------------- |
-| `--generate-html <jsonl>`  | Render a JSONL log to HTML and exit. Optional `[output.html]`.   |
-| `--stats <jsonl>`          | Print token/cost analytics for a log and write a `<basename>.stats.json` sidecar, then exit. See [Token & cost analytics](#token--cost-analytics). |
-| `--include-all-requests`   | Log every request, not just `/responses`.                        |
+| Flag                                 | Purpose                                                                                                                                                                                                                                                                  |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--generate-html <jsonl>`            | Render a JSONL log to HTML and exit. Optional `[output.html]`.                                                                                                                                                                                                           |
+| `--stats <jsonl>`                    | Print token/cost analytics for a log and write a `<basename>.stats.json` sidecar, then exit. See [Token & cost analytics](#token--cost-analytics).                                                                                                                       |
+| `--include-all-requests`             | Log every request, not just `/responses`.                                                                                                                                                                                                                                |
 | `--redact-bodies[=standard\|strict]` | Mask secrets (API keys, tokens, JWTs, `AKIA…`, `Bearer …`) in request/response **bodies** before they're written. Off by default on capture; `=standard` (bare) is high-precision, `=strict` adds entropy-based detectors. See [Privacy & security](#privacy--security). |
-| `--no-redact`              | Export verbatim. Body redaction is **on by default** for `--to-atif` / `--format atif`; this opts out. |
-| `--no-open`                | Don't open the HTML report in browser when the session ends.     |
-| `--summarize`              | On exit, shell out to `codex exec` for a one-paragraph session summary (added to the report header + a `.stats.json`). Off by default. Uses your existing plan — no extra API key — and the summary call is not itself traced. |
-| `--log <name>`             | Custom log basename (no extension).                              |
-| `--codex <path>`           | Override path to the `codex` binary (default: `which codex`).    |
-| `--upstream <url>`         | Override the upstream API base (default: `https://api.openai.com`). |
-| `--env-key <NAME>`         | Env var Codex reads the API key from (default: `OPENAI_API_KEY`). |
-| `--run-with <args...>`     | Force everything after this through to `codex`.                  |
-| `--help`, `-h`             | Show usage.                                                      |
+| `--no-redact`                        | Export verbatim. Body redaction is **on by default** for `--to-atif` / `--format atif`; this opts out.                                                                                                                                                                   |
+| `--no-open`                          | Don't open the HTML report in browser when the session ends.                                                                                                                                                                                                             |
+| `--summarize`                        | On exit, shell out to `codex exec` for a one-paragraph session summary (added to the report header + a `.stats.json`). Off by default. Uses your existing plan — no extra API key — and the summary call is not itself traced.                                           |
+| `--log <name>`                       | Custom log basename (no extension).                                                                                                                                                                                                                                      |
+| `--codex <path>`                     | Override path to the `codex` binary (default: `which codex`).                                                                                                                                                                                                            |
+| `--upstream <url>`                   | Override the upstream API base (default: `https://api.openai.com`).                                                                                                                                                                                                      |
+| `--env-key <NAME>`                   | Env var Codex reads the API key from (default: `OPENAI_API_KEY`).                                                                                                                                                                                                        |
+| `--run-with <args...>`               | Force everything after this through to `codex`.                                                                                                                                                                                                                          |
+| `--help`, `-h`                       | Show usage.                                                                                                                                                                                                                                                              |
 
 ---
 
@@ -285,9 +286,9 @@ The SDK appends `/v1beta/models/<model>:streamGenerateContent` (or `:generateCon
 
 Inference is only interceptable on the **Gemini API-key** path. Set `GEMINI_API_KEY` before running.
 
-- Setting `GOOGLE_GEMINI_BASE_URL` alone makes the CLI default to its "gateway" auth mode, which the headless (`-p`) path rejects unless an auth type is already configured. So when `GEMINI_API_KEY` is set, `tracetap gemini` transparently writes a throwaway *system settings* file (via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`) selecting the `gemini-api-key` auth path for that run only — it never touches your real `~/.gemini` settings. If you've already set `GEMINI_CLI_SYSTEM_SETTINGS_PATH` yourself, we leave it alone.
+- Setting `GOOGLE_GEMINI_BASE_URL` alone makes the CLI default to its "gateway" auth mode, which the headless (`-p`) path rejects unless an auth type is already configured. So when `GEMINI_API_KEY` is set, `tracetap gemini` transparently writes a throwaway _system settings_ file (via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`) selecting the `gemini-api-key` auth path for that run only — it never touches your real `~/.gemini` settings. If you've already set `GEMINI_CLI_SYSTEM_SETTINGS_PATH` yourself, we leave it alone.
 - **Vertex AI** (`GOOGLE_GENAI_USE_VERTEXAI=true`) and **"Login with Google"** (OAuth, the Code Assist transport) route through different hosts/credentials that this proxy can't capture — analogous to Codex's ChatGPT-auth WebSocket. Export a `GEMINI_API_KEY` to trace via the Generative Language API instead.
-- First run in a new directory, the Gemini CLI may prompt to *trust* the folder; pass `--skip-trust` (forwarded to `gemini`) for unattended/headless captures.
+- First run in a new directory, the Gemini CLI may prompt to _trust_ the folder; pass `--skip-trust` (forwarded to `gemini`) for unattended/headless captures.
 
 ### The Gemini viewer
 
@@ -297,16 +298,16 @@ The HTML report parses the Generative Language API shape rather than Anthropic's
 
 Run as `tracetap gemini [flag…] [gemini args…]`.
 
-| Flag                       | Purpose                                                          |
-| -------------------------- | ---------------------------------------------------------------- |
-| `--generate-html <jsonl>`  | Render a JSONL log to HTML and exit. Optional `[output.html]`.   |
-| `--include-all-requests`   | Log every request (including `:countTokens` probes), not just `:generateContent`. |
-| `--no-open`                | Don't open the HTML report in browser when the session ends.     |
-| `--log <name>`             | Custom log basename (no extension).                              |
-| `--gemini <path>`          | Override path to the `gemini` binary (default: `which gemini`).  |
-| `--upstream <url>`         | Override the upstream API base (default: `https://generativelanguage.googleapis.com`). |
-| `--run-with <args...>`     | Force everything after this through to `gemini`.                 |
-| `--help`, `-h`             | Show usage.                                                      |
+| Flag                      | Purpose                                                                                |
+| ------------------------- | -------------------------------------------------------------------------------------- |
+| `--generate-html <jsonl>` | Render a JSONL log to HTML and exit. Optional `[output.html]`.                         |
+| `--include-all-requests`  | Log every request (including `:countTokens` probes), not just `:generateContent`.      |
+| `--no-open`               | Don't open the HTML report in browser when the session ends.                           |
+| `--log <name>`            | Custom log basename (no extension).                                                    |
+| `--gemini <path>`         | Override path to the `gemini` binary (default: `which gemini`).                        |
+| `--upstream <url>`        | Override the upstream API base (default: `https://generativelanguage.googleapis.com`). |
+| `--run-with <args...>`    | Force everything after this through to `gemini`.                                       |
+| `--help`, `-h`            | Show usage.                                                                            |
 
 By default only the model-inference calls (`:generateContent` / `:streamGenerateContent`) are logged. Pass `--include-all-requests` to also capture the Gemini CLI's `:countTokens` probes and any other endpoints it hits.
 
@@ -314,7 +315,7 @@ By default only the model-inference calls (`:generateContent` / `:streamGenerate
 
 ## Importing Devin sessions
 
-`tracetap devin` records the **[Devin CLI](https://cli.devin.ai)** (Cognition) — but *by import, not by proxy*. Devin's CLI is a native Rust binary that talks to a proprietary cloud backend (Cognition's Windsurf inference) over an in-house protocol behind pinned TLS, so the base-URL-override trick the other tracers use can't see its model traffic. Instead the CLI persists the **full structured trajectory locally** (`~/.local/share/devin/cli/sessions.db`), for every backend including the default hosted models — so `tracetap devin` reconstructs sessions from that store:
+`tracetap devin` records the **[Devin CLI](https://cli.devin.ai)** (Cognition) — but _by import, not by proxy_. Devin's CLI is a native Rust binary that talks to a proprietary cloud backend (Cognition's Windsurf inference) over an in-house protocol behind pinned TLS, so the base-URL-override trick the other tracers use can't see its model traffic. Instead the CLI persists the **full structured trajectory locally** (`~/.local/share/devin/cli/sessions.db`), for every backend including the default hosted models — so `tracetap devin` reconstructs sessions from that store:
 
 ```bash
 tracetap devin list                          # list sessions in the Devin store (no writes)
@@ -334,16 +335,16 @@ Output lands in each session's `<workdir>/.devin-trace/<session-id>.{jsonl,html}
 
 Run as `tracetap devin [import|list] [flag…]`.
 
-| Flag                       | Purpose                                                          |
-| -------------------------- | ---------------------------------------------------------------- |
-| `--session <id>`           | Import only this session (repeatable; ids may also be positional). Default: all. |
-| `--db <path>`              | Path to `sessions.db` (default: `$DEVIN_SESSIONS_DB` or the standard install location). |
-| `--out <dir>`              | Write all `.jsonl`/`.html` into `<dir>` instead of each session's working directory. |
-| `--here`                   | Write into `./.devin-trace` in the current directory.           |
-| `--no-index`               | Don't fold the imported sessions into `~/.tracetap/index.db`.    |
-| `--no-html`                | Skip the HTML viewer (JSONL only).                              |
-| `--no-open`                | Don't open the report on a single-session import.               |
-| `--generate-html <jsonl>`  | Render an existing devin JSONL to HTML and exit. Optional `[output.html]`. |
+| Flag                      | Purpose                                                                                 |
+| ------------------------- | --------------------------------------------------------------------------------------- |
+| `--session <id>`          | Import only this session (repeatable; ids may also be positional). Default: all.        |
+| `--db <path>`             | Path to `sessions.db` (default: `$DEVIN_SESSIONS_DB` or the standard install location). |
+| `--out <dir>`             | Write all `.jsonl`/`.html` into `<dir>` instead of each session's working directory.    |
+| `--here`                  | Write into `./.devin-trace` in the current directory.                                   |
+| `--no-index`              | Don't fold the imported sessions into `~/.tracetap/index.db`.                           |
+| `--no-html`               | Skip the HTML viewer (JSONL only).                                                      |
+| `--no-open`               | Don't open the report on a single-session import.                                       |
+| `--generate-html <jsonl>` | Render an existing devin JSONL to HTML and exit. Optional `[output.html]`.              |
 
 ## Token & cost analytics
 
@@ -418,18 +419,18 @@ total                           12.4K  3.4K     61.8M     1.6M    18  $5.45
 prices: litellm-cache
 ```
 
-| Option | Effect |
-| --- | --- |
+| Option                                      | Effect                                                   |
+| ------------------------------------------- | -------------------------------------------------------- |
 | `daily` \| `weekly` \| `monthly` \| `total` | Bucket granularity (default `daily`; weeks are ISO-8601) |
-| `--breakdown` | One row per model within each bucket |
-| `--since` / `--until <when>` | `YYYY-MM-DD`, `today`, `yesterday`, or `<N>d` |
-| `--agent` / `--model` / `--project` | Filter the events |
-| `--timezone <iana>` | Bucket-boundary timezone (default: system local) |
-| `--json` | Structured report for scripting |
-| `--statusline` | One-line today + month-to-date spend |
-| `--offline` | Never fetch prices (cache/builtin only) |
-| `--refresh-prices` | Re-fetch the price table even if the cache is fresh |
-| `--db <path>` | Use a different index database |
+| `--breakdown`                               | One row per model within each bucket                     |
+| `--since` / `--until <when>`                | `YYYY-MM-DD`, `today`, `yesterday`, or `<N>d`            |
+| `--agent` / `--model` / `--project`         | Filter the events                                        |
+| `--timezone <iana>`                         | Bucket-boundary timezone (default: system local)         |
+| `--json`                                    | Structured report for scripting                          |
+| `--statusline`                              | One-line today + month-to-date spend                     |
+| `--offline`                                 | Never fetch prices (cache/builtin only)                  |
+| `--refresh-prices`                          | Re-fetch the price table even if the cache is fresh      |
+| `--db <path>`                               | Use a different index database                           |
 
 **Live pricing.** Costs are priced from [LiteLLM's community price
 table](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json),
@@ -456,7 +457,7 @@ tracetap codex  --format atif
 
 A single captured conversation is emitted as one ATIF `Trajectory` object; a log that contains several independent trajectories (e.g. mixed agents, or `/clear`) is emitted as a JSON array of trajectories, each independently valid.
 
-**Higher fidelity than log converters.** Harbor's bundled Claude Code / Codex converters read the agent's own on-disk transcript; tracetap has the *wire*, so it emits things those converters can't:
+**Higher fidelity than log converters.** Harbor's bundled Claude Code / Codex converters read the agent's own on-disk transcript; tracetap has the _wire_, so it emits things those converters can't:
 
 - **`agent.tool_definitions`** — captured **verbatim** from the harness's request `tools[]` (the exact tool/function schemas the model was offered).
 - **`metrics.cached_tokens`** — billing-grade, populated from `cache_creation_input_tokens + cache_read_input_tokens`. The raw breakdown (and reasoning-token counts) is preserved losslessly under `metrics.extra` / `final_metrics.extra`.
@@ -502,19 +503,19 @@ of truth.
 `tracetap search` returns ranked hits (FTS5 BM25) showing the session id, step
 number, a highlighted snippet, and the stitched tool_call ↔ observation. Filters:
 
-| Flag | Effect |
-| --- | --- |
-| `--in message\|reasoning\|tool-input\|tool-output\|all` | Which text to match (default `all`) |
-| `--tool <name>` | Only steps that called this tool |
-| `--model <substr>` | Only sessions whose model id contains `<substr>` |
-| `--agent claude\|codex\|gemini` | Only sessions from this agent |
-| `--project <substr>` | Only sessions whose project path contains `<substr>` |
-| `--since <date>` / `--until <date>` | Bound the session start time (`YYYY-MM-DD` or ISO) |
-| `--errored` | Only steps whose tool output looks like an error |
-| `--min-cost <usd>` | Only sessions with estimated cost ≥ `<usd>` |
-| `--limit <n>` | Max hits (default 20) |
-| `--json` | Emit structured results for scripting |
-| `--db <path>` | Use a different index database |
+| Flag                                                    | Effect                                               |
+| ------------------------------------------------------- | ---------------------------------------------------- |
+| `--in message\|reasoning\|tool-input\|tool-output\|all` | Which text to match (default `all`)                  |
+| `--tool <name>`                                         | Only steps that called this tool                     |
+| `--model <substr>`                                      | Only sessions whose model id contains `<substr>`     |
+| `--agent claude\|codex\|gemini`                         | Only sessions from this agent                        |
+| `--project <substr>`                                    | Only sessions whose project path contains `<substr>` |
+| `--since <date>` / `--until <date>`                     | Bound the session start time (`YYYY-MM-DD` or ISO)   |
+| `--errored`                                             | Only steps whose tool output looks like an error     |
+| `--min-cost <usd>`                                      | Only sessions with estimated cost ≥ `<usd>`          |
+| `--limit <n>`                                           | Max hits (default 20)                                |
+| `--json`                                                | Emit structured results for scripting                |
+| `--db <path>`                                           | Use a different index database                       |
 
 **Degrade-to-lexical by design.** Ranking is pure BM25/FTS5 — it works fully
 offline with nothing else installed. Semantic (embedding) search is intentionally
@@ -544,29 +545,21 @@ tracetap serve
 tracetap serve --port 8080 --host 127.0.0.1 --db ~/.tracetap/index.db
 ```
 
-| Option | Effect |
-| --- | --- |
-| `--port <n>` | Port to listen on (default `4000`) |
-| `--host <addr>` | Address to bind (default `127.0.0.1`) |
-| `--db <path>` | Index database to read (default `~/.tracetap/index.db`) |
+| Option          | Effect                                                  |
+| --------------- | ------------------------------------------------------- |
+| `--port <n>`    | Port to listen on (default `4000`)                      |
+| `--host <addr>` | Address to bind (default `127.0.0.1`)                   |
+| `--db <path>`   | Index database to read (default `~/.tracetap/index.db`) |
 
 Five views:
 
 - **Sessions** — sortable wire-metric table (duration, in/out tokens, cache-hit
   rate, errors, cost) over every indexed session; the search box switches to
   ranked FTS5 hits (same engine as `tracetap search`). Click through to…
-- **Session detail** — the flight-recorder view of one session: stat cards
-  (cost, TTFT p50, cache hit, compactions), a **context-growth lane**
-  (transcript items per call, compactions flagged), a stacked **token-flow
-  lane** (cache read/write vs fresh input vs output per call), and a
-  **request waterfall** linked to the transcript — every bar knows which step
-  it produced: hover for the full wire breakdown (TTFT vs streaming time,
-  fresh/cached/output tokens, stop reason, prompt hash), click to jump to the
-  step. The transcript renders agent markdown, token-colored JSON tool args,
-  **Edit-tool calls as real line diffs**, shell calls as command lines, and a
-  minimap rail tracks scroll position. Search hits deep-link straight to the
-  matching step. Links to the session's original self-contained HTML wire
-  report when it exists on disk.
+- **Session detail** — flight-recorder for one session with four panes:
+  **Flow** (agent-loop graph), **Hooks** (Claude Code hook timeline + payloads),
+  **Context X-Ray** (window composition + new/carried/dropped vs prior call),
+  and **Wire** (context-growth / token-flow lanes, request waterfall, transcript).
 - **Usage** — the `tracetap usage` report in chart + table form (granularity,
   per-model breakdown, date range).
 - **Analytics** — fleet rollups: total cost / cache-hit rate / call error rate
@@ -580,21 +573,48 @@ Five views:
   changed when a harness update rewrites its prompt.
 - **Audit** — the `tracetap audit` report (next section) over all indexed logs.
 
+### Claude Code hooks (`tracetap hooks`)
+
+Hook fires never appear on the Anthropic wire. Capture them into
+`~/.tracetap/hooks/<session_id>.jsonl` so the observatory can show them next
+to turns:
+
+```bash
+tracetap hooks discover [path]   # list hooks.json / settings hooks in a repo
+tracetap hooks track [path]      # ask which to wrap (or --all / --ids)
+                                 # default --mode inject rewrites hooks.json
+tracetap hooks install           # baseline observe taps in ~/.claude/settings.json
+tracetap hooks status            # log files + install state
+tracetap hooks uninstall --restore [path]  # remove taps + restore *.tracetap.bak
+```
+
+**Stopping `tracetap serve` does not remove hooks.** They live in Claude Code
+config until `uninstall`. Prefer `track --mode inject` for plugin hooks (single
+fire + full returned payload); `settings` mode can double-fire alongside plugins.
+
+Agent workflow: invoke the project skill `.cursor/skills/track-hooks`.
+
+Then `tracetap index` folds hook events into the SQLite index. Correlation to
+wire sessions uses exact `session_id` when it matches, otherwise **time
+overlap** with the session window (wire conversation keys are hashes, not
+Claude's session UUID). Set `TRACETAP_HOOK_FULL=1` to store full stdin payloads.
+
 JSON API (everything the UI uses is scriptable):
 
-| Route | Returns |
-| --- | --- |
-| `GET /` | The self-contained dashboard page (inline CSS/JS) |
-| `GET /api/meta` | DB path, row counts, price source |
-| `GET /api/sessions` | Session list (`agent`/`model`/`project`/`tool`/`errored` filters, `sort`/`order`) |
-| `GET /api/search?q=…` | FTS5 search hits (`tool`/`agent`/`model`/`project`/`errored` filters) |
-| `GET /api/session/<id>` | One session: summary + transcript steps + per-request wire rows + compactions |
-| `GET /api/usage` | Bucketed usage report (`granularity`/`breakdown`/`since`/`until`/`timezone`…) |
-| `GET /api/analytics` | Fleet rollups (per-model TTFT percentiles, error rates, tools, trend…) |
-| `GET /api/prompts` / `GET /api/prompt/<hash>` | Prompt registry list / full content + sessions (prefix hash ok) |
-| `GET /api/audit?mode=standard\|strict` | Egress secret findings over all indexed source logs |
-| `GET /api/events` | SSE stream; `change` events fire when the index db changes |
-| `GET /report?session=<id>` | The session's HTML wire report, or `404` if it isn't on disk |
+| Route                                         | Returns                                                                           |
+| --------------------------------------------- | --------------------------------------------------------------------------------- |
+| `GET /`                                       | The self-contained dashboard page (inline CSS/JS)                                 |
+| `GET /api/meta`                               | DB path, row counts, price source                                                 |
+| `GET /api/sessions`                           | Session list (`agent`/`model`/`project`/`tool`/`errored` filters, `sort`/`order`) |
+| `GET /api/search?q=…`                         | FTS5 search hits (`tool`/`agent`/`model`/`project`/`errored` filters)             |
+| `GET /api/session/<id>`                       | One session: summary + steps + requests + hooks + flow + compactions              |
+| `GET /api/session/<id>/context/<seq>`         | Context X-Ray for one API call (buckets, segments, delta)                         |
+| `GET /api/usage`                              | Bucketed usage report (`granularity`/`breakdown`/`since`/`until`/`timezone`…)     |
+| `GET /api/analytics`                          | Fleet rollups (per-model TTFT percentiles, error rates, tools, trend…)            |
+| `GET /api/prompts` / `GET /api/prompt/<hash>` | Prompt registry list / full content + sessions (prefix hash ok)                   |
+| `GET /api/audit?mode=standard\|strict`        | Egress secret findings over all indexed source logs                               |
+| `GET /api/events`                             | SSE stream; `change` events fire when the index db changes                        |
+| `GET /report?session=<id>`                    | The session's HTML wire report, or `404` if it isn't on disk                      |
 
 ## Egress secret audit (`tracetap audit`)
 
@@ -626,15 +646,15 @@ conversation — rotate any credential listed above.
   (provider-prefixed keys, JWTs, `AKIA…`, `Bearer …`); `--strict` adds the
   entropy-gated detectors. Auditing an already-redacted log reports clean.
 - `--redact-check` simulates capture-time masking and reports coverage:
-  *"`--redact-bodies` would mask 2 of 2 detected occurrence(s)"*.
+  _"`--redact-bodies` would mask 2 of 2 detected occurrence(s)"_.
 - Exits `1` when any egress finding exists — drop it in CI or a pre-share hook.
 
-| Option | Effect |
-| --- | --- |
-| `[paths…]` | `.jsonl` files or directories to walk (default: cwd's trace dirs) |
-| `--strict` | Add entropy-gated detectors (higher recall, some FP risk) |
-| `--redact-check` | Report what capture-time redaction would have masked |
-| `--json` | Full structured report |
+| Option           | Effect                                                            |
+| ---------------- | ----------------------------------------------------------------- |
+| `[paths…]`       | `.jsonl` files or directories to walk (default: cwd's trace dirs) |
+| `--strict`       | Add entropy-gated detectors (higher recall, some FP risk)         |
+| `--redact-check` | Report what capture-time redaction would have masked              |
+| `--json`         | Full structured report                                            |
 
 ### Interactive command center (`tracetap explore`)
 
@@ -654,13 +674,13 @@ tracetap explore --follow      # jump straight into live-tail of the newest sess
 tracetap explore --follow .claude-trace/log-….jsonl   # live-tail a specific capture
 ```
 
-| Option | Effect |
-| --- | --- |
-| `--db <path>` | Index database to read (default `~/.tracetap/index.db`) |
-| `--follow [path]` | Start in live-tail; with a `.jsonl` path tails that file, else the newest session |
-| `--agent` / `--model` / `--tool` | Pre-apply a structured filter |
-| `--errored` | Pre-filter to sessions with errored steps |
-| `--select <id>` | Preselect a session id |
+| Option                           | Effect                                                                            |
+| -------------------------------- | --------------------------------------------------------------------------------- |
+| `--db <path>`                    | Index database to read (default `~/.tracetap/index.db`)                           |
+| `--follow [path]`                | Start in live-tail; with a `.jsonl` path tails that file, else the newest session |
+| `--agent` / `--model` / `--tool` | Pre-apply a structured filter                                                     |
+| `--errored`                      | Pre-filter to sessions with errored steps                                         |
+| `--select <id>`                  | Preselect a session id                                                            |
 
 **Layout:** a header token strip (in / out / cache / cost / cache-hit % /
 duration, from the analytics rollup); a LEFT session list (agent · model · turns
@@ -672,20 +692,20 @@ restores the terminal cleanly on quit.
 
 **Keymap / manual walkthrough** (exact keys, for verification):
 
-| Key | Action |
-| --- | --- |
-| `↑`/`↓` or `k`/`j` | Move selection (session list, or step when drilled in) |
-| `g` / `G` | Jump to first / last |
-| `⏎` (or `l`/`→`) | Drill into the selected session (rebuilds its trajectory); when drilled in, `⏎`/`space` collapses/expands the current turn |
-| `h` / `←` / `esc` | Back out to the session list |
-| `/` | Live incremental filter — type to narrow the list, `⏎`/`esc` to finish |
-| `f` | Structured filter form (agent / model / tool / errored); `↑`/`↓` pick a field, type to edit, `space` toggles `errored`, `⏎` applies, `esc` cancels |
-| `t` | Live-tail the selected session's capture (the timeline grows as new pairs are appended); `t`/`esc` stops |
-| `d` | Diff — press once to mark session A, move, press again on B to render the structural diff (system prompt / tools / model / shape); `j`/`k` scroll, `esc` closes |
-| `e` | Export the selected session to ATIF on the spot (writes the `.atif.json` sidecar and reports the path) |
-| `o` | Open the selected session's HTML report in the browser (errors gracefully if absent) |
-| `y` | Yank the session's source path to the clipboard |
-| `q` (or `Ctrl-C`) | Quit, restoring terminal state |
+| Key                | Action                                                                                                                                                          |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `↑`/`↓` or `k`/`j` | Move selection (session list, or step when drilled in)                                                                                                          |
+| `g` / `G`          | Jump to first / last                                                                                                                                            |
+| `⏎` (or `l`/`→`)   | Drill into the selected session (rebuilds its trajectory); when drilled in, `⏎`/`space` collapses/expands the current turn                                      |
+| `h` / `←` / `esc`  | Back out to the session list                                                                                                                                    |
+| `/`                | Live incremental filter — type to narrow the list, `⏎`/`esc` to finish                                                                                          |
+| `f`                | Structured filter form (agent / model / tool / errored); `↑`/`↓` pick a field, type to edit, `space` toggles `errored`, `⏎` applies, `esc` cancels              |
+| `t`                | Live-tail the selected session's capture (the timeline grows as new pairs are appended); `t`/`esc` stops                                                        |
+| `d`                | Diff — press once to mark session A, move, press again on B to render the structural diff (system prompt / tools / model / shape); `j`/`k` scroll, `esc` closes |
+| `e`                | Export the selected session to ATIF on the spot (writes the `.atif.json` sidecar and reports the path)                                                          |
+| `o`                | Open the selected session's HTML report in the browser (errors gracefully if absent)                                                                            |
+| `y`                | Yank the session's source path to the clipboard                                                                                                                 |
+| `q` (or `Ctrl-C`)  | Quit, restoring terminal state                                                                                                                                  |
 
 A suggested smoke run: `tracetap explore` → `j j` to move → `⏎` to drill in →
 `j`/`k` through steps → `e` to export ATIF → `o` to open the browser report →
@@ -696,9 +716,10 @@ The non-interactive seams (store reads, trajectory rebuild from `source_path`,
 HTML-path derivation, ATIF export, diff invocation, and the live-tail
 `JsonlTailer`) live in `src/explore/data.ts` and are covered headlessly by
 `test/explore.test.mjs`.
+
 ## Conversation grouping
 
-*(Claude viewer.)* The codex viewer groups by Codex's per-session `prompt_cache_key` and reconstructs each transcript from the request `input[]`; the rest of this section is Claude-specific.
+_(Claude viewer.)_ The codex viewer groups by Codex's per-session `prompt_cache_key` and reconstructs each transcript from the request `input[]`; the rest of this section is Claude-specific.
 
 The Claude viewer groups raw request/response pairs into "conversations" by hashing each request's `system` and `model`, then merging by first user message. Claude Code v2 stamps two volatile fields into the system field that change on every call:
 
@@ -706,16 +727,16 @@ The Claude viewer groups raw request/response pairs into "conversations" by hash
    `x-anthropic-billing-header: cc_version=…; cc_entrypoint=cli; cch=7f0d1;` → `cch=34c8e;` next call.
 2. `cache_control` toggles between `{"type":"ephemeral"}` and `{"type":"ephemeral","ttl":"1h"}` between calls.
 
-Without normalization, the same conversation hashes to a different group every turn → no merging → every call appears as its own collapsed "Compacted" row in the viewer. Our viewer normalizes `cch=<hex>;` to `cch=[HASH];` and ignores `cache_control` for *grouping purposes only* — the rendered content is unchanged. The textual diff lives at `frontend/patches/v2-grouping-normalization.patch` for reference.
+Without normalization, the same conversation hashes to a different group every turn → no merging → every call appears as its own collapsed "Compacted" row in the viewer. Our viewer normalizes `cch=<hex>;` to `cch=[HASH];` and ignores `cache_control` for _grouping purposes only_ — the rendered content is unchanged. The textual diff lives at `frontend/patches/v2-grouping-normalization.patch` for reference.
 
 ---
 
 ## Privacy & security
 
-- **What's stored:** the JSONL log contains the *full* request and response bodies for every API call your session made. That includes your prompts, the system prompts, every tool result your session produced (including file contents your agent read), and the assistant's full output. Treat `.claude-trace/` and `.codex-trace/` like you'd treat a shell-history file from a sensitive session — don't paste them into a public bug report without redacting.
+- **What's stored:** the JSONL log contains the _full_ request and response bodies for every API call your session made. That includes your prompts, the system prompts, every tool result your session produced (including file contents your agent read), and the assistant's full output. Treat `.claude-trace/` and `.codex-trace/` like you'd treat a shell-history file from a sensitive session — don't paste them into a public bug report without redacting.
 - **Header redaction (always on):** authorization headers (`x-api-key`, `authorization`, `bearer`, `cookie`, `proxy-authorization`, `x-session-token`, `x-auth-token`, `x-access-token`, `set-cookie`) are partially redacted at write time. Only the first ~10 and last 4 characters of the value remain; the middle is replaced with `...`. The token is **not** recoverable from the log.
-- **Body redaction (opt-in, complements header redaction):** headers are not the only place secrets live — anything you (or a tool result) put in a *prompt*, a *system message*, or an `.env` file the agent read lands in the request/response **body**. `--redact-bodies[=standard|strict]` runs a small, high-precision detector pass over body text and masks recognised secrets with a typed placeholder, e.g. `[REDACTED:github_token]`, while leaving the surrounding JSON structurally intact:
-  - **`standard`** (the default when the flag is bare) only fires on tokens with an unambiguous provider prefix — OpenAI/Anthropic `sk-…` keys, GitHub `ghp_`/`gho_`/`github_pat_…`, Slack `xox[baprs]-…`, AWS `AKIA…`/`ASIA…` access-key IDs, JWTs (`eyJ….….…`) and `Bearer <token>`. It is tuned to **favour precision over recall**: a false redaction silently corrupts the data you're trying to debug, so the standard detectors will rather miss an exotic secret than mangle a benign string. Code, prose, git SHAs and normal tool output redact to *nothing*.
+- **Body redaction (opt-in, complements header redaction):** headers are not the only place secrets live — anything you (or a tool result) put in a _prompt_, a _system message_, or an `.env` file the agent read lands in the request/response **body**. `--redact-bodies[=standard|strict]` runs a small, high-precision detector pass over body text and masks recognised secrets with a typed placeholder, e.g. `[REDACTED:github_token]`, while leaving the surrounding JSON structurally intact:
+  - **`standard`** (the default when the flag is bare) only fires on tokens with an unambiguous provider prefix — OpenAI/Anthropic `sk-…` keys, GitHub `ghp_`/`gho_`/`github_pat_…`, Slack `xox[baprs]-…`, AWS `AKIA…`/`ASIA…` access-key IDs, JWTs (`eyJ….….…`) and `Bearer <token>`. It is tuned to **favour precision over recall**: a false redaction silently corrupts the data you're trying to debug, so the standard detectors will rather miss an exotic secret than mangle a benign string. Code, prose, git SHAs and normal tool output redact to _nothing_.
   - **`strict`** adds two entropy-gated detectors — bare 40-char AWS-secret-shaped strings and `.env`-style `KEY=<high-entropy value>` assignments. Higher recall, slightly higher false-positive risk; opt in when you're about to share widely.
 - **Redaction on capture vs. export:** body redaction is **off by default on capture** (`tracetap claude` / `codex`) so your local debug log stays byte-faithful — pass `--redact-bodies` to mask at write time. It is **on by default on export** (`--to-atif` / `--format atif`): an exported ATIF trajectory is the thing you hand to a teammate or a training pipeline, so it ships redacted (`standard`) unless you pass `--no-redact` to export verbatim. Header redaction is independent of all of this and always applied.
 - **Network:** all traffic between `claude` and our proxy is plaintext on `127.0.0.1`. The hop from our proxy to Anthropic uses normal TLS through Node's `https` module. No certificates are generated, installed, or trusted.
@@ -779,10 +800,11 @@ A vanilla `http.createServer` on `127.0.0.1:0` (port 0 = OS-assigned). Per reque
 
 ### The CLI (`src/tracetap.ts` → `src/claude-cli.ts` / `src/codex-cli.ts`)
 
-`tracetap.ts` is a thin dispatcher: it finds the first `claude`/`codex` token, hands everything else to that tool's `run(argv)` (trace flags before *or* after the tool both work, since each runner extracts its own flags by name). Each runner is also directly executable for back-compat.
+`tracetap.ts` is a thin dispatcher: it finds the first `claude`/`codex` token, hands everything else to that tool's `run(argv)` (trace flags before _or_ after the tool both work, since each runner extracts its own flags by name). Each runner is also directly executable for back-compat.
 
 The **claude** runner:
-- Discovers `claude` via `which claude`, with fallbacks for the `~/.claude/local/claude` bash wrapper that some Anthropic install paths produce. Resolves through symlinks but does *not* try to find a JS file underneath — the binary is fine as-is.
+
+- Discovers `claude` via `which claude`, with fallbacks for the `~/.claude/local/claude` bash wrapper that some Anthropic install paths produce. Resolves through symlinks but does _not_ try to find a JS file underneath — the binary is fine as-is.
 - Spawns claude with `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` injected. Everything else in `process.env` is preserved (so your existing `ANTHROPIC_API_KEY` keeps working).
 - Forwards `SIGINT`/`SIGTERM` to the child.
 - On child exit, finalizes the proxy + log, optionally pops the HTML in `open(1)`.
@@ -805,17 +827,17 @@ The TypeScript build outputs to `dist/`. The frontend bundle is committed pre-bu
 
 ## Compatibility
 
-| Component                      | Tested with                 |
-| Codex CLI                      | `0.137.0` (OpenAI API-key auth) |
-| `@google/gemini-cli`           | `0.45.2` (Gemini API-key auth) |
-| Node (CLI host)                | `22.14`                     |
-| macOS                          | Darwin 25 (arm64)           |
-| Linux                          | not yet, but should work    |
-| AWS Bedrock / Vertex backends  | not supported (different env vars route around `ANTHROPIC_BASE_URL`) |
-| Codex "Sign in with ChatGPT"   | not supported (model inference runs over a WebSocket the proxy can't see) |
+| Component | Tested with |
+| Codex CLI | `0.137.0` (OpenAI API-key auth) |
+| `@google/gemini-cli` | `0.45.2` (Gemini API-key auth) |
+| Node (CLI host) | `22.14` |
+| macOS | Darwin 25 (arm64) |
+| Linux | not yet, but should work |
+| AWS Bedrock / Vertex backends | not supported (different env vars route around `ANTHROPIC_BASE_URL`) |
+| Codex "Sign in with ChatGPT" | not supported (model inference runs over a WebSocket the proxy can't see) |
 | Gemini Vertex AI / "Login with Google" | not supported (Vertex + OAuth Code Assist route through hosts/credentials the proxy can't see — use a `GEMINI_API_KEY`) |
-| AWS Bedrock / Vertex backends  | not supported (different env vars route around `ANTHROPIC_BASE_URL`) |
-| Codex "Sign in with ChatGPT"   | not supported (model inference runs over a WebSocket the proxy can't see) |
+| AWS Bedrock / Vertex backends | not supported (different env vars route around `ANTHROPIC_BASE_URL`) |
+| Codex "Sign in with ChatGPT" | not supported (model inference runs over a WebSocket the proxy can't see) |
 
 ---
 
@@ -831,7 +853,7 @@ The TypeScript build outputs to `dist/`. The frontend bundle is committed pre-bu
 
 **(Codex) every pair is a 401 / "Incorrect API key"** — `OPENAI_API_KEY` is unset or wrong. The proxied provider authenticates with that key against `api.openai.com`. The requests are still fully captured (that's the point), but no model output comes back until the key is valid.
 
-**(Codex) nothing logged at all** — you're probably on "Sign in with ChatGPT" auth, whose model traffic runs over a WebSocket to `chatgpt.com` that bypasses the provider `base_url`. Export an `OPENAI_API_KEY` to route inference through the captureable `/v1/responses` HTTP path. Use `--include-all-requests` to confirm the proxy is seeing *any* codex traffic.
+**(Codex) nothing logged at all** — you're probably on "Sign in with ChatGPT" auth, whose model traffic runs over a WebSocket to `chatgpt.com` that bypasses the provider `base_url`. Export an `OPENAI_API_KEY` to route inference through the captureable `/v1/responses` HTTP path. Use `--include-all-requests` to confirm the proxy is seeing _any_ codex traffic.
 
 ---
 
