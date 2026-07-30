@@ -13,6 +13,7 @@ import { auditOneFilePath, reportFromScans } from "../audit";
 import type { AuditFileScan, AuditReport } from "../audit";
 import type { FlowGraph } from "../flow/derive";
 import type { ContextTimeline } from "../context/timeline";
+import type { ContextXray } from "../context/xray";
 
 /**
  * `tracetap serve` — the local observatory over the cross-session store.
@@ -432,6 +433,83 @@ function timelineFor(store: Store, sessionId: string): ContextTimeline {
 }
 
 /**
+ * Calls either side of the requested one built from the same file parse. The
+ * X-Ray pane is stepped through call by call, so the neighbours are what gets
+ * asked for next; 12 covers a typical session (27 calls in the capture this was
+ * measured against) in two parses.
+ */
+const XRAY_WARM_RADIUS = 12;
+
+/**
+ * Retained segment text before the least-recently-used X-Ray is evicted. These
+ * payloads are big — ~330k chars (~140KB of JSON) for one call in a real
+ * session — so an unbounded map would grow without limit in a server that runs
+ * for days. 16M chars is ~32MB of UTF-16 text, roughly 48 typical entries:
+ * enough to hold a whole session's worth of stepping, and a bound that shrinks
+ * itself as contexts get bigger.
+ */
+const XRAY_MEMO_MAX_CHARS = 16_000_000;
+
+/** Insertion-ordered = LRU order; see contextXrayFor. */
+const xrayMemo = new Map<string, ContextXray>();
+let xrayMemoChars = 0;
+
+/** Drop every memoized X-Ray (tests, which reuse session ids across stores). */
+export function clearXrayMemo(): void {
+  xrayMemo.clear();
+  xrayMemoChars = 0;
+}
+
+function xrayMemoPut(key: string, xray: ContextXray): void {
+  const prev = xrayMemo.get(key);
+  if (prev) xrayMemoChars -= prev.totalChars;
+  xrayMemo.set(key, xray);
+  xrayMemoChars += xray.totalChars;
+  while (xrayMemoChars > XRAY_MEMO_MAX_CHARS && xrayMemo.size > 1) {
+    const oldest = xrayMemo.keys().next().value as string;
+    xrayMemoChars -= xrayMemo.get(oldest)!.totalChars;
+    xrayMemo.delete(oldest);
+  }
+}
+
+/**
+ * One call's Context X-Ray, memoized per session + seq.
+ *
+ * Uncached this route was seconds, and constant in the size of the *log file*
+ * rather than the answer: every call re-read and re-parsed the whole source
+ * JSONL — twice, once for the call and once for its predecessor — to reach two
+ * pairs out of hundreds. Building the view from parsed pairs is single-digit ms
+ * either side of that. So the fix is two-part: the store now parses once per
+ * request and returns a window of neighbouring calls from it, and this memo
+ * keeps the window until the underlying log changes.
+ *
+ * Keyed on {@link Store.sessionSourceSignature} rather than the db+WAL signal
+ * timelineFor uses: the X-Ray is a pure function of the source log, while the
+ * index is rewritten by the background re-index loop every ~30s, which would
+ * throw the cache away for nothing. A log that grows or is rotated changes its
+ * mtime+size and misses.
+ */
+function contextXrayFor(store: Store, sessionId: string, seq: number): ContextXray | null {
+  const sig = store.sessionSourceSignature(sessionId);
+  const key = `${sessionId} ${sig} ${seq}`;
+  const hit = xrayMemo.get(key);
+  if (hit) {
+    xrayMemo.delete(key); // re-insert to mark most-recently-used
+    xrayMemo.set(key, hit);
+    return hit;
+  }
+  const warmed = store.sessionContextXrayWindow(sessionId, seq, XRAY_WARM_RADIUS);
+  // Neighbours first, so the call actually asked for is the most-recently-used
+  // entry and survives eviction if one window alone exceeds the budget.
+  for (const xray of warmed) {
+    if (xray.seq !== seq) xrayMemoPut(`${sessionId} ${sig} ${xray.seq}`, xray);
+  }
+  const want = warmed.find((x) => x.seq === seq) ?? null;
+  if (want) xrayMemoPut(key, want);
+  return want;
+}
+
+/**
  * Node detail is the bulk of the flow payload — full message text on every one
  * of what can be hundreds of nodes, inlined into DOM attributes by the frontend.
  * Send a preview and let the detail pane fetch the rest for the one node the
@@ -658,7 +736,7 @@ export async function handleRequest(
           sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
           return;
         }
-        const xray = store.sessionContextXray(sessionId, seq);
+        const xray = contextXrayFor(store, sessionId, seq);
         if (!xray) {
           sendJson(res, 404, { error: `No request body for session '${sessionId}' seq ${seq}.` });
           return;

@@ -120,6 +120,8 @@ export interface IndexResult {
 }
 
 export interface SessionListFilters {
+  /** Exactly this session id — the single-row lookup {@link Store.getSession} uses. */
+  sessionId?: string;
   /** Substring (case-insensitive) the session agent name must contain. */
   agent?: string;
   /** Substring (case-insensitive) the session model id must contain. */
@@ -1057,6 +1059,10 @@ export class Store {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
 
+    if (filters.sessionId) {
+      where.push("s.session_id = @sessionId");
+      params.sessionId = filters.sessionId;
+    }
     if (filters.agent) {
       where.push("lower(s.agent) LIKE '%' || lower(@agent) || '%'");
       params.agent = filters.agent;
@@ -1167,10 +1173,15 @@ export class Store {
     });
   }
 
-  /** Look up a single indexed session by id, or null when absent. */
+  /**
+   * Look up a single indexed session by id, or null when absent.
+   *
+   * Filtered in SQL. Listing every session and picking one out in JS cost ~110ms
+   * on a real index — the per-row `turns`/`errorCount` subqueries are counts over
+   * the whole FTS table — and nearly every session route calls this at least once.
+   */
   getSession(sessionId: string): SessionSummary | null {
-    const rows = this.listSessions();
-    return rows.find((s) => s.sessionId === sessionId) ?? null;
+    return this.listSessions({ sessionId })[0] ?? null;
   }
 
   // -- transcript ------------------------------------------------------------
@@ -1524,10 +1535,16 @@ export class Store {
   }
 
   /**
-   * Load the RawPair at `seq` for a session from its source JSONL (on disk).
-   * Returns null when the source file is missing or seq is out of range.
+   * Every RawPair of one session, from ONE read+parse of its source JSONL.
+   *
+   * The source log is the expensive input on every body-reading path: capture
+   * files run to hundreds of MB, and reading + `JSON.parse`ing one is ~0.4s per
+   * 100MB. Callers that need more than a single pair must go through here so
+   * they pay that once, not once per pair.
+   *
+   * Returns null when the source file is missing or unreadable.
    */
-  getRawPair(sessionId: string, seq: number): RawPair | null {
+  private loadSessionPairs(sessionId: string): RawPair[] | null {
     const session = this.getSession(sessionId);
     if (!session?.sourcePath) return null;
     let content: string;
@@ -1540,27 +1557,76 @@ export class Store {
     // Pairs in the file may span multiple conversation groups; filter to this session.
     const groups = groupPairs(pairs);
     const group = groups.find((g) => g.sessionId === sessionId) ?? groups[0];
-    if (!group) return null;
-    return group.pairs[seq] ?? null;
+    return group ? group.pairs : null;
+  }
+
+  /**
+   * Load the RawPair at `seq` for a session from its source JSONL (on disk).
+   * Returns null when the source file is missing or seq is out of range.
+   */
+  getRawPair(sessionId: string, seq: number): RawPair | null {
+    return this.loadSessionPairs(sessionId)?.[seq] ?? null;
+  }
+
+  /**
+   * A cheap validity token for anything derived from a session's source JSONL:
+   * the resolved path plus the file's mtime and size. Memoizing callers key on
+   * it so an appended, rewritten or rotated log misses instead of serving a
+   * stale view. Empty string when the session or its file is gone.
+   *
+   * Deliberately NOT the db mtime signature the SSE poller uses: the index is
+   * rewritten every re-index pass (~30s) whether or not any log changed, and
+   * every X-Ray input — bodies, and the `promptHash` recorded from them — is a
+   * function of the source file alone.
+   */
+  sessionSourceSignature(sessionId: string): string {
+    const session = this.getSession(sessionId);
+    if (!session?.sourcePath) return "";
+    try {
+      const st = fs.statSync(session.sourcePath);
+      return `${session.sourcePath}:${st.mtimeMs}:${st.size}`;
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Context X-Rays for `seq` and up to `radius` calls either side of it, in
+   * ascending seq order. Empty when the source is unreadable or `seq` is out
+   * of range.
+   *
+   * The window exists because the cost here is the file, not the X-Ray: reading
+   * and parsing a 96MB capture log is ~0.5s while building one X-Ray from the
+   * parsed pairs is ~6ms. One parse therefore yields a whole neighbourhood of
+   * views almost for free, and stepping through a session pays the read once
+   * rather than once per call.
+   */
+  sessionContextXrayWindow(sessionId: string, seq: number, radius = 0): ContextXray[] {
+    const pairs = this.loadSessionPairs(sessionId);
+    if (!pairs?.[seq]) return [];
+    // One request row per pair, seq === pair index (see insertRequests), so the
+    // previous call is simply pairs[i - 1].
+    const promptHashes = new Map(this.listRequests(sessionId).map((r) => [r.seq, r.promptHash]));
+    const from = Math.max(0, seq - radius);
+    const to = Math.min(pairs.length - 1, seq + radius);
+    const out: ContextXray[] = [];
+    for (let i = from; i <= to; i++) {
+      if (!pairs[i]) continue;
+      out.push(
+        buildContextXray({
+          seq: i,
+          pair: pairs[i],
+          promptHash: promptHashes.get(i) ?? "",
+          prev: i > 0 && pairs[i - 1] ? { seq: i - 1, pair: pairs[i - 1] } : undefined,
+        }),
+      );
+    }
+    return out;
   }
 
   /** Context X-Ray for one API call, with delta vs the previous call when present. */
   sessionContextXray(sessionId: string, seq: number): ContextXray | null {
-    const requests = this.listRequests(sessionId);
-    const pair = this.getRawPair(sessionId, seq);
-    if (!pair) return null;
-    const req = requests.find((r) => r.seq === seq);
-    const prevReq = requests.filter((r) => r.seq < seq).sort((a, b) => b.seq - a.seq)[0];
-    const prevPair = prevReq ? this.getRawPair(sessionId, prevReq.seq) : null;
-    return buildContextXray({
-      seq,
-      pair,
-      promptHash: req?.promptHash ?? "",
-      prev:
-        prevReq && prevPair
-          ? { seq: prevReq.seq, pair: prevPair }
-          : undefined,
-    });
+    return this.sessionContextXrayWindow(sessionId, seq, 0)[0] ?? null;
   }
 
   /**
@@ -1667,12 +1733,16 @@ export class Store {
     const precomputedBySeq = this.contextMetricsFor(sessionId);
     // Only read bodies for calls the index run could not segment — normally
     // none. Before this, every call was read back and re-parsed on every load,
-    // which dominated the session endpoint's latency.
+    // which dominated the session endpoint's latency. When there IS a gap, the
+    // source is read once for all of them, not once per gap.
     const pairsBySeq = new Map<number, RawPair>();
-    for (const r of requests) {
-      if (precomputedBySeq.has(r.seq)) continue;
-      const pair = this.getRawPair(sessionId, r.seq);
-      if (pair) pairsBySeq.set(r.seq, pair);
+    const gaps = requests.filter((r) => !precomputedBySeq.has(r.seq));
+    if (gaps.length) {
+      const pairs = this.loadSessionPairs(sessionId);
+      for (const r of gaps) {
+        const pair = pairs?.[r.seq];
+        if (pair) pairsBySeq.set(r.seq, pair);
+      }
     }
     return buildContextTimeline({
       requests,

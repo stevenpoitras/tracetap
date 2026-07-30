@@ -10,6 +10,7 @@ import { Store } from "../dist/store/index.js";
 import {
     auditIndexedFiles,
     clearAuditMemo,
+    clearXrayMemo,
     handleRequest,
     parseServeArgs,
     reportPathFor,
@@ -360,6 +361,51 @@ test("GET /api/session/<id>/context/<seq> returns Context X-Ray with delta", asy
     "/api/session/" + encodeURIComponent(id) + "/context/99",
   );
   assert.equal(missing.status, 404);
+});
+
+test("GET /api/session/<id>/context/<seq> is memoized until the source log changes", async () => {
+  const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
+  const id = list.sessions[0].sessionId;
+  const url = (seq) => "/api/session/" + encodeURIComponent(id) + "/context/" + seq;
+
+  // Every X-Ray costs one read + parse of the whole source JSONL, so what has
+  // to be asserted is how often that happens — not that the route answers 200.
+  clearXrayMemo();
+  const build = Store.prototype.sessionContextXrayWindow;
+  let builds = 0;
+  store.sessionContextXrayWindow = function (...args) {
+    builds += 1;
+    return build.apply(this, args);
+  };
+  const before = fs.statSync(claudeSource);
+  try {
+    const first = await get(url(0));
+    assert.equal(first.status, 200);
+    assert.equal(builds, 1, "cold call reads the source log once");
+
+    const second = await get(url(0));
+    assert.equal(second.status, 200);
+    assert.equal(builds, 1, "identical repeat must not recompute");
+    assert.equal(second.text, first.text, "cached payload is byte-identical");
+
+    // Neighbouring calls come out of that same parse, so stepping through the
+    // X-Ray pane does not pay for the file again.
+    const next = await get(url(1));
+    assert.equal(next.status, 200);
+    assert.equal(JSON.parse(next.text).seq, 1);
+    assert.equal(builds, 1, "neighbouring seq is served from the warmed window");
+
+    // A log that grew or was rewritten must not be answered from the memo.
+    const later = new Date(before.mtimeMs + 60_000);
+    fs.utimesSync(claudeSource, later, later);
+    const afterTouch = await get(url(0));
+    assert.equal(afterTouch.status, 200);
+    assert.equal(builds, 2, "changed source log invalidates the memo");
+  } finally {
+    delete store.sessionContextXrayWindow;
+    fs.utimesSync(claudeSource, before.atime, before.mtime);
+    clearXrayMemo();
+  }
 });
 
 test("GET /api/usage aggregates priced buckets", async () => {
