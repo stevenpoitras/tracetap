@@ -21,6 +21,36 @@ test("wrapCommand prefixes tap once", () => {
   assert.equal(wrapCommand(once, { name: "done-gate", event: "Stop" }), once);
 });
 
+test("wrapCommand carries --full only on request", () => {
+  const opts = { name: "done-gate", event: "Stop" };
+  assert.ok(!wrapCommand("node x.mjs", opts).includes("--full"));
+  const full = wrapCommand("node x.mjs", { ...opts, full: true });
+  assert.match(full, /^tracetap hooks tap --name done-gate --event Stop --full -- node x\.mjs$/);
+});
+
+test("trackInject threads --full into the injected wrapper", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-track-full-"));
+  try {
+    const hooksFile = path.join(root, "hooks", "hooks.json");
+    fs.mkdirSync(path.dirname(hooksFile));
+    fs.writeFileSync(
+      hooksFile,
+      JSON.stringify({
+        hooks: {
+          Stop: [{ hooks: [{ type: "command", command: "node done-gate.mjs" }] }],
+        },
+      }),
+      "utf-8",
+    );
+    const res = trackInject(discoverHooks(root).hooks, "tracetap", { full: true });
+    assert.equal(res.tracked, 1);
+    const cmd = JSON.parse(fs.readFileSync(hooksFile, "utf-8")).hooks.Stop[0].hooks[0].command;
+    assert.match(cmd, /--full -- node done-gate\.mjs$/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("discoverHooks finds fixture plugin hooks.json", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-disc-"));
   try {

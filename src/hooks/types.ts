@@ -29,7 +29,7 @@ export interface HookEvent {
   stdin_preview: Record<string, unknown>;
   /** Summarized stdout (decision JSON, additionalContext length, …). */
   stdout_preview?: Record<string, unknown>;
-  /** Full stdin object when TRACETAP_HOOK_FULL=1. */
+  /** Full stdin object when the tap ran with --full (or TRACETAP_HOOK_FULL=1). */
   payload?: unknown;
   outcome?: HookOutcome;
   /** Process exit code of the wrapped command (0 when passthrough-only). */
@@ -50,7 +50,7 @@ export interface HookRow {
   stdoutPreview: Record<string, unknown> | null;
   outcome: HookOutcome | null;
   exitCode: number | null;
-  /** Present when the event was captured with TRACETAP_HOOK_FULL=1. */
+  /** Present when the event was captured with --full / TRACETAP_HOOK_FULL=1. */
   payload: unknown | null;
   sourcePath: string;
 }

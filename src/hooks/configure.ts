@@ -16,6 +16,12 @@ import { ensureDir } from "./paths";
 
 export type TrackMode = "inject" | "settings";
 
+/** Shared knobs for the track modes. `full` maps 1:1 to the tap's `--full`. */
+export interface TrackOptions {
+  /** Emit `--full` on the generated tap: store whole hook stdin on each event. */
+  full?: boolean;
+}
+
 export interface TrackResult {
   mode: TrackMode;
   tracked: number;
@@ -54,7 +60,11 @@ function backupOnce(file: string): string | null {
 /**
  * Inject tap wrappers into the source hooks.json files for the selected hooks.
  */
-export function trackInject(hooks: DiscoveredHook[], tracetapBin = "tracetap"): TrackResult {
+export function trackInject(
+  hooks: DiscoveredHook[],
+  tracetapBin = "tracetap",
+  opts: TrackOptions = {},
+): TrackResult {
   const byFile = new Map<string, DiscoveredHook[]>();
   for (const h of hooks) {
     if (h.type !== "command") continue;
@@ -111,6 +121,7 @@ export function trackInject(hooks: DiscoveredHook[], tracetapBin = "tracetap"): 
             name: hit.suggestedName,
             event: hit.event,
             tracetapBin,
+            full: opts.full,
           });
           tracked += 1;
         }
@@ -127,7 +138,11 @@ export function trackInject(hooks: DiscoveredHook[], tracetapBin = "tracetap"): 
  * Merge wrapped (or observe) hooks into ~/.claude/settings.json.
  * Warns that plugin hooks may still fire unwrapped alongside these.
  */
-export function trackSettings(hooks: DiscoveredHook[], tracetapBin = "tracetap"): TrackResult {
+export function trackSettings(
+  hooks: DiscoveredHook[],
+  tracetapBin = "tracetap",
+  opts: TrackOptions = {},
+): TrackResult {
   const sp = settingsPath();
   let existing: any = {};
   if (fs.existsSync(sp)) {
@@ -159,6 +174,7 @@ export function trackSettings(hooks: DiscoveredHook[], tracetapBin = "tracetap")
       name: h.suggestedName,
       event: h.event,
       tracetapBin,
+      full: opts.full,
     });
     if ((h.resolvedCommand || h.command).includes(MARKER)) {
       skipped += 1;

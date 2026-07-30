@@ -150,15 +150,23 @@ export function discoverHooks(root = process.cwd()): DiscoverResult {
   return { root: absRoot, sources, hooks };
 }
 
-/** Wrap a shell command so it is observed by tracetap hook-tap. */
+/**
+ * Wrap a shell command so it is observed by tracetap hook-tap.
+ *
+ * `full` adds `--full`, which stores the whole hook stdin object on each event.
+ * It is off by default: stdin carries prompt text and tool inputs, and the log
+ * is a shared local store. The wrapper always captures what the hook *returns*
+ * on stdout — `--full` is only about what it was *given*.
+ */
 export function wrapCommand(
   command: string,
-  opts: { name: string; event: string; tracetapBin?: string },
+  opts: { name: string; event: string; tracetapBin?: string; full?: boolean },
 ): string {
   if (command.includes(MARKER)) return command;
   const bin = opts.tracetapBin || "tracetap";
+  const full = opts.full ? " --full" : "";
   // Use -- so the original command (with quotes) is preserved as argv via shell.
-  return `${bin} hooks tap --name ${shellQuote(opts.name)} --event ${shellQuote(opts.event)} -- ${command}`;
+  return `${bin} hooks tap --name ${shellQuote(opts.name)} --event ${shellQuote(opts.event)}${full} -- ${command}`;
 }
 
 function shellQuote(s: string): string {

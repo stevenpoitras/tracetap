@@ -226,6 +226,80 @@ test("tap --full stores the payload without TRACETAP_HOOK_FULL", () => {
   }
 });
 
+test("installSnippet only emits --full when asked", () => {
+  const commands = (snippet) =>
+    Object.values(snippet.hooks).map((m) => m[0].hooks[0].command);
+
+  const plain = commands(installSnippet());
+  assert.equal(plain.length, 4);
+  for (const cmd of plain) {
+    assert.ok(!cmd.includes("--full"), `default install stayed metadata-only: ${cmd}`);
+  }
+
+  const full = commands(installSnippet("tracetap", { full: true }));
+  assert.equal(full.length, 4);
+  for (const cmd of full) {
+    assert.match(cmd, /hooks tap .*--full -- true$/);
+  }
+});
+
+test("hooks install --full writes taps that carry --full", () => {
+  // Drive the real CLI against a throwaway HOME: settingsPath() resolves via
+  // os.homedir(), so this proves argv → snippet → settings.json end to end
+  // without going anywhere near the user's live settings.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-install-"));
+  try {
+    const settings = path.join(home, ".claude", "settings.json");
+    const install = (args) =>
+      spawnSync(process.execPath, [CLI, "hooks", "install", ...args], {
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: home,
+          TRACETAP_HOOKS_DIR: path.join(home, "hooks"),
+          // The env var is a second spelling of --full; scrub it so the flag
+          // (and its absence) is the only thing under test.
+          TRACETAP_HOOK_FULL: "",
+        },
+      });
+    const taps = () =>
+      Object.values(JSON.parse(fs.readFileSync(settings, "utf-8")).hooks).flatMap((m) =>
+        m.flatMap((entry) => entry.hooks.map((h) => h.command)),
+      );
+
+    assert.equal(install([]).status, 0);
+    const plain = taps();
+    assert.equal(plain.length, 4);
+    for (const cmd of plain) assert.ok(!cmd.includes("--full"), cmd);
+
+    // Fresh HOME: install is a no-op once the marker is already present.
+    fs.rmSync(path.join(home, ".claude"), { recursive: true, force: true });
+
+    assert.equal(install(["--full"]).status, 0);
+    const full = taps();
+    assert.equal(full.length, 4);
+    for (const cmd of full) assert.match(cmd, /^tracetap hooks tap .*--full -- true$/);
+    assert.ok(full.some((c) => c.includes("--event PreToolUse")));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("hooks install rejects unknown options", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-install-bad-"));
+  try {
+    const res = spawnSync(process.execPath, [CLI, "hooks", "install", "--ful"], {
+      encoding: "utf-8",
+      env: { ...process.env, HOME: home },
+    });
+    assert.notEqual(res.status, 0);
+    assert.match(res.stderr + res.stdout, /--ful/);
+    assert.ok(!fs.existsSync(path.join(home, ".claude", "settings.json")));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("tap rejects unknown options instead of swallowing them as the command", () => {
   const res = spawnSync(process.execPath, [CLI, "hooks", "tap", "--ful", "--", "true"], {
     input: "{}",
