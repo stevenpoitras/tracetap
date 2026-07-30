@@ -17,8 +17,12 @@ import type { FlowGraph } from "../flow/derive";
 import { buildContextXray } from "../context/xray";
 import type { ContextXray } from "../context/xray";
 import type { AuditFileScan } from "../audit";
-import { buildContextTimeline } from "../context/timeline";
-import type { ContextMetrics, ContextTimeline } from "../context/timeline";
+import { buildContextTimeline, findCompactions } from "../context/timeline";
+import type {
+  CompactionTrigger,
+  ContextMetrics,
+  ContextTimeline,
+} from "../context/timeline";
 
 /**
  * Local cross-session trace store + search.
@@ -285,6 +289,15 @@ const SORTABLE_COLUMNS = new Set([
 ]);
 
 const SCHEMA_VERSION = 5;
+
+/**
+ * How long after a `PreCompact` hook its compacted call may arrive, and how far
+ * the wire timestamp may run ahead of the hook's. Compaction itself can take
+ * seconds on a large transcript; the slack absorbs clock skew between the hook
+ * process and the proxy.
+ */
+const COMPACT_HOOK_WINDOW_SEC = 120;
+const COMPACT_HOOK_SLACK_SEC = 5;
 
 // ---------------------------------------------------------------------------
 // Paths / discovery
@@ -1728,6 +1741,53 @@ export class Store {
     return out;
   }
 
+  /**
+   * seq → what triggered the compaction at that seq, from `PreCompact` hooks.
+   *
+   * `PreCompact` is the only source that can tell `manual` (the user typed
+   * /compact) from `auto` (the harness hit its limit) — the harness puts that
+   * word in the hook payload's `trigger`. Nothing on the wire carries it: a
+   * compaction looks identical either way from the request body, so a seq with
+   * no matching hook is left out entirely rather than guessed at, and the
+   * timeline reports it as `inferred` / `unknown`.
+   *
+   * Correlation is by time, since compaction happens immediately before the
+   * call that carries the shrunken transcript.
+   */
+  private compactionTriggers(
+    sessionId: string,
+    compactionTimes: { seq: number; ts: number }[],
+  ): Map<number, CompactionTrigger> {
+    const out = new Map<number, CompactionTrigger>();
+    if (!compactionTimes.length) return out;
+    const pre = this.listHooksForSession(sessionId)
+      .filter((h) => h.event === "PreCompact")
+      .sort((a, b) => a.ts - b.ts);
+    if (!pre.length) return out;
+
+    const claimed = new Set<number>();
+    for (const c of compactionTimes) {
+      let best: (typeof pre)[number] | null = null;
+      let bestGap = Infinity;
+      for (const h of pre) {
+        if (claimed.has(h.id)) continue;
+        // The hook fires before the compacted call, so only look backwards.
+        const gap = c.ts - h.ts;
+        if (gap < -COMPACT_HOOK_SLACK_SEC || gap > COMPACT_HOOK_WINDOW_SEC) continue;
+        if (Math.abs(gap) < bestGap) {
+          bestGap = Math.abs(gap);
+          best = h;
+        }
+      }
+      if (!best) continue;
+      claimed.add(best.id);
+      const raw = (best.payload as any)?.trigger ?? (best.stdinPreview as any)?.trigger;
+      const kind = raw === "manual" || raw === "auto" ? raw : "unknown";
+      out.set(c.seq, { kind, source: "hook", hookTs: best.ts });
+    }
+    return out;
+  }
+
   sessionContextTimeline(sessionId: string): ContextTimeline {
     const requests = this.listRequests(sessionId);
     const precomputedBySeq = this.contextMetricsFor(sessionId);
@@ -1744,10 +1804,19 @@ export class Store {
         if (pair) pairsBySeq.set(r.seq, pair);
       }
     }
+    const tsBySeq = new Map(requests.map((r) => [r.seq, r.ts] as const));
+    const triggersBySeq = this.compactionTriggers(
+      sessionId,
+      findCompactions([...requests].sort((a, b) => a.seq - b.seq)).map((c) => ({
+        seq: c.seq,
+        ts: tsBySeq.get(c.seq) ?? 0,
+      })),
+    );
     return buildContextTimeline({
       requests,
       precomputedBySeq,
       pairsBySeq,
+      triggersBySeq,
       xrayFor: (seq, pair, promptHash) => {
         const x = buildContextXray({
           seq,
