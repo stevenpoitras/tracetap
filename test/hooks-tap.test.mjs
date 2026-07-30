@@ -226,18 +226,33 @@ test("tap --full stores the payload without TRACETAP_HOOK_FULL", () => {
   }
 });
 
-test("installSnippet only emits --full when asked", () => {
+/**
+ * Events `hooks install` is expected to tap. Asserted as a set rather than a
+ * count so adding an event has to be a deliberate edit here, and so a wrong
+ * event name cannot pass by keeping the total right.
+ */
+const INSTALLED_EVENTS = [
+  "UserPromptSubmit",
+  "PreToolUse",
+  "PostToolUse",
+  "Stop",
+  "PreCompact",
+  "PostCompact",
+];
+
+test("installSnippet taps every expected event, and only emits --full when asked", () => {
   const commands = (snippet) =>
     Object.values(snippet.hooks).map((m) => m[0].hooks[0].command);
 
+  assert.deepEqual(Object.keys(installSnippet().hooks).sort(), [...INSTALLED_EVENTS].sort());
+
   const plain = commands(installSnippet());
-  assert.equal(plain.length, 4);
   for (const cmd of plain) {
     assert.ok(!cmd.includes("--full"), `default install stayed metadata-only: ${cmd}`);
   }
 
   const full = commands(installSnippet("tracetap", { full: true }));
-  assert.equal(full.length, 4);
+  assert.equal(full.length, INSTALLED_EVENTS.length);
   for (const cmd of full) {
     assert.match(cmd, /hooks tap .*--full -- true$/);
   }
@@ -269,7 +284,7 @@ test("hooks install --full writes taps that carry --full", () => {
 
     assert.equal(install([]).status, 0);
     const plain = taps();
-    assert.equal(plain.length, 4);
+    assert.equal(plain.length, INSTALLED_EVENTS.length);
     for (const cmd of plain) assert.ok(!cmd.includes("--full"), cmd);
 
     // Fresh HOME: install is a no-op once the marker is already present.
@@ -277,9 +292,14 @@ test("hooks install --full writes taps that carry --full", () => {
 
     assert.equal(install(["--full"]).status, 0);
     const full = taps();
-    assert.equal(full.length, 4);
+    assert.equal(full.length, INSTALLED_EVENTS.length);
     for (const cmd of full) assert.match(cmd, /^tracetap hooks tap .*--full -- true$/);
-    assert.ok(full.some((c) => c.includes("--event PreToolUse")));
+    for (const event of INSTALLED_EVENTS) {
+      assert.ok(
+        full.some((c) => c.includes("--event " + event)),
+        `install --full taps ${event}`,
+      );
+    }
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -96,6 +96,12 @@ const INSTALL_TAPS: ReadonlyArray<{ event: string; name: string }> = [
   { event: "PreToolUse", name: "pre-tool-observe" },
   { event: "PostToolUse", name: "post-tool-observe" },
   { event: "Stop", name: "stop-observe" },
+  // Compaction is the one context event the wire cannot explain on its own: the
+  // request bodies show that items vanished, never why. PreCompact carries the
+  // trigger (Claude Code matches it as `manual` vs `auto`), which is the
+  // difference between "the user typed /compact" and "the harness hit a limit".
+  { event: "PreCompact", name: "pre-compact-observe" },
+  { event: "PostCompact", name: "post-compact-observe" },
 ];
 
 export interface InstallOptions {
