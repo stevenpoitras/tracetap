@@ -58,6 +58,17 @@
     if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e5 ? 0 : 1) + "K";
     return String(n);
   }
+  /**
+   * Exact integer with thousands separators.
+   *
+   * `fmtTok` abbreviates (46698 → "46.7K"), which is right for dense tables and
+   * wrong for a figure the reader is asked to weigh against another figure —
+   * "46,698 rebuilt to reclaim 78" only lands when both are exact.
+   */
+  function fmtCount(n) {
+    if (n == null || isNaN(n)) return "—";
+    return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  }
   function fmtCost(c, plus) {
     if (c == null) return "—";
     var s =
@@ -1408,6 +1419,12 @@
     );
   }
 
+  /**
+   * Compaction stats keyed by request seq, captured when the timeline lands.
+   * Lets the x-ray detail head describe a compaction without a second fetch.
+   */
+  var xrayCompactions = {};
+
   function renderContextTimeline(tl) {
     if (!tl || !tl.points || !tl.points.length) {
       return '<div class="dim">No context timeline points.</div>';
@@ -1420,12 +1437,16 @@
       tl.compactionCount +
       " compaction(s) · peak " +
       fmtTok(peak) +
-      " prompt tokens</small></h2>" +
+      " prompt tokens · click any column to x-ray it · amber ⇣ = compaction</small></h2>" +
       '<div class="context-timeline" id="context-timeline">';
     tl.points.forEach(function (p) {
       var h = Math.max(4, Math.round((p.promptTokens / peak) * 100));
+      // The BUTTON is a full-height transparent column; the bar inside it is
+      // what encodes the value. Sizing the button itself meant a call with a
+      // small prompt got a ~3px-tall click target — visible, but in practice
+      // unclickable with a mouse. The visual encoding is unchanged.
       var cls =
-        "ct-bar" +
+        "ct-col" +
         (p.compaction ? " compact" : "") +
         (p.errored ? " errored" : "");
       var title =
@@ -1453,51 +1474,104 @@
         p.seq +
         '" title="' +
         esc(title) +
-        '" style="height:' +
+        '" aria-label="' +
+        esc(title) +
+        '">' +
+        '<span class="ct-bar" style="height:' +
         h +
-        '%">' +
+        '%"></span>' +
+        // The marker hangs off the COLUMN, not off the bar. Anchored to the bar
+        // it sat at whatever height that call happened to be, so the compactions
+        // were a scatter of glyphs you had to hunt for; anchored to the column
+        // they form one straight row of ticks you can scan in a glance. That
+        // matters more now that the compaction list beside the detail is gone.
+        (p.compaction ? '<span class="ct-compact">⇣</span>' : "") +
         '<span class="ct-seq">' +
         p.seq +
         "</span>" +
-        (p.compaction ? '<span class="ct-compact">⇣</span>' : "") +
         "</button>";
     });
     html += "</div>";
-    var comps = tl.points.filter(function (p) {
-      return p.compaction;
-    });
-    if (comps.length) {
-      html += '<div class="compaction-list">';
-      comps.forEach(function (p) {
-        var c = p.compaction;
-        html +=
-          '<div class="compaction-card">' +
-          '<span class="pill">compaction</span> API #' +
-          p.seq +
-          " · items <b>" +
-          c.fromItems +
-          " → " +
-          c.toItems +
-          "</b> (dropped " +
-          c.droppedItems +
-          ")" +
-          " · tokens <b>" +
-          fmtTok(c.prePromptTokens) +
-          " → " +
-          fmtTok(c.postPromptTokens) +
-          "</b>" +
-          " · approx <b>" +
-          fmtTok(c.preApproxTokens) +
-          " → " +
-          fmtTok(c.postApproxTokens) +
-          "</b>" +
-          ' <button type="button" class="btn-xray" data-seq="' +
-          p.seq +
-          '">inspect</button></div>';
-      });
-      html += "</div>";
-    }
     return html;
+  }
+
+  /** Compaction seqs in call order — the stepper walks this. */
+  var xrayCompactionSeqs = [];
+
+  /**
+   * The compaction stepper: a count plus prev/next, sitting in the controls row.
+   *
+   * It replaces the left-hand compaction list. The list was a whole column spent
+   * on 15 rows, and it was the only place compactions were easy to find — so
+   * deleting it outright would have made them strictly harder to reach. This
+   * keeps the two things the list actually provided (how many there are, and a
+   * way to walk them) in one line of chrome, and the timeline's amber ticks keep
+   * the "where are they" job the list never really did well anyway.
+   */
+  function renderCompactionNav(tl) {
+    xrayCompactions = {};
+    xrayCompactionSeqs = [];
+    ((tl && tl.points) || []).forEach(function (p) {
+      if (!p.compaction) return;
+      xrayCompactions[p.seq] = p.compaction;
+      xrayCompactionSeqs.push(p.seq);
+    });
+    var n = xrayCompactionSeqs.length;
+    if (!n) {
+      return '<span class="xray-comp-nav"><span class="xray-comp-label">compactions</span><span class="dim">none</span></span>';
+    }
+    return (
+      '<span class="xray-comp-nav">' +
+      '<span class="xray-comp-label">compactions</span>' +
+      '<button type="button" class="comp-step" data-comp-step="-1" title="Previous compaction" aria-label="Previous compaction">‹</button>' +
+      '<button type="button" class="comp-step comp-pos" data-comp-step="0" id="xray-comp-pos" title="Jump to a compaction">—/' +
+      n +
+      "</button>" +
+      '<button type="button" class="comp-step" data-comp-step="1" title="Next compaction" aria-label="Next compaction">›</button>' +
+      "</span>"
+    );
+  }
+
+  /** Repaint the stepper's position readout for whatever the detail is showing. */
+  function updateCompNav() {
+    var pos = document.getElementById("xray-comp-pos");
+    if (!pos) return;
+    var n = xrayCompactionSeqs.length;
+    var i = xrayCompactionSeqs.indexOf(currentXraySeq);
+    pos.textContent = (i < 0 ? "—" : i + 1) + "/" + n;
+    pos.classList.toggle("on", i >= 0);
+    pos.title =
+      i < 0
+        ? "Not on a compaction — click to jump to the next one"
+        : "Compaction " + (i + 1) + " of " + n + " · API #" + currentXraySeq;
+  }
+
+  /**
+   * Which compaction a step lands on. `dir` is -1 / +1 / 0 (nearest forward).
+   * Deliberately does NOT wrap: walking off the end silently teleporting to the
+   * other end of a 145-call session is disorienting, so the ends just hold.
+   */
+  function stepCompaction(dir) {
+    var seqs = xrayCompactionSeqs;
+    if (!seqs.length) return null;
+    var cur = currentXraySeq;
+    var i = seqs.indexOf(cur);
+    // Already on one: step off it, or — for the readout in the middle, which is
+    // a jump target and not a third arrow — stay put.
+    if (i >= 0) {
+      if (dir === 0) return seqs[i];
+      var next = i + dir;
+      return next < 0 || next >= seqs.length ? seqs[i] : seqs[next];
+    }
+    // Not sitting on a compaction: step to the nearest one in the direction of
+    // travel, so `next` from call #50 means "the next compaction after #50".
+    var k;
+    if (dir < 0) {
+      for (k = seqs.length - 1; k >= 0; k--) if (seqs[k] < cur) return seqs[k];
+      return seqs[0];
+    }
+    for (k = 0; k < seqs.length; k++) if (cur == null || seqs[k] > cur) return seqs[k];
+    return seqs[seqs.length - 1];
   }
 
   function renderXrayPane(sessionId, reqs) {
@@ -1527,8 +1601,18 @@
       '<label class="chrome">API call <select id="xray-seq">' +
       opts +
       "</select></label>" +
+      // Filled in by loadTimeline: the count + prev/next that replaced the
+      // left-hand compaction list.
+      '<span id="xray-comp-host"></span>' +
       '<span class="dim" id="xray-status">loading…</span></div>' +
-      '<div id="xray-view"></div>'
+      // One column, not two. The compaction list that used to sit on the left is
+      // gone — the timeline above reaches every compaction — and the detail
+      // carries four-column segment rows plus full payload text, which is what
+      // the reclaimed width is for.
+      '<div class="xray-layout">' +
+      '<aside class="flow-detail xray-detail-full" id="xray-view">' +
+      '<div class="dim">Click a column in the timeline above to inspect that call’s context</div>' +
+      "</aside></div>"
     );
   }
   function renderFlowPane(flow) {
@@ -1596,32 +1680,46 @@
   function loadTimeline(sessionId) {
     var host = document.getElementById("timeline-host");
     if (!host) return;
+    var compEl = document.getElementById("xray-comp-host");
+    // Delegated on the containers, which outlive their contents — binding each
+    // control would have to be redone every time they are re-rendered.
+    if (compEl && !compEl.getAttribute("data-bound")) {
+      compEl.setAttribute("data-bound", "1");
+      compEl.addEventListener("click", function (e) {
+        var b = e.target.closest(".comp-step[data-comp-step]");
+        if (!b) return;
+        var seq = stepCompaction(Number(b.getAttribute("data-comp-step")));
+        if (seq == null) return;
+        activatePane("xray");
+        loadXray(sessionId, seq);
+      });
+    }
+    if (!host.getAttribute("data-bound")) {
+      host.setAttribute("data-bound", "1");
+      host.addEventListener("click", function (e) {
+        var col = e.target.closest(".ct-col[data-seq]");
+        if (!col) return;
+        activatePane("xray");
+        loadXray(sessionId, Number(col.getAttribute("data-seq")));
+      });
+    }
     fetchJSON("/api/session/" + encodeURIComponent(sessionId) + "/timeline")
       .then(function (tl) {
         host.innerHTML = renderContextTimeline(tl);
-        host
-          .querySelectorAll(".compaction-card .btn-xray[data-seq]")
-          .forEach(function (btn) {
-            btn.addEventListener("click", function () {
-              activatePane("xray");
-              loadXray(sessionId, Number(btn.getAttribute("data-seq")));
-            });
-          });
-        var tlEl = host.querySelector("#context-timeline");
-        if (tlEl) {
-          tlEl.addEventListener("click", function (e) {
-            var bar = e.target.closest("[data-seq]");
-            if (!bar) return;
-            activatePane("xray");
-            loadXray(sessionId, Number(bar.getAttribute("data-seq")));
-          });
-        }
+        if (compEl) compEl.innerHTML = renderCompactionNav(tl);
+        // The auto-loaded x-ray resolved before this markup existed, so there
+        // was nothing to mark selected at the time. Re-apply it now.
+        markXraySelection(currentXraySeq);
+        // The head is already on screen by now and was drawn without the
+        // compaction facts (they only arrive here), so redraw it in place.
+        refreshXrayHead();
       })
       .catch(function (err) {
         host.innerHTML =
           '<div class="dim">context timeline unavailable — ' +
           esc(String(err.message || err)) +
           "</div>";
+        if (compEl) compEl.innerHTML = "";
       });
   }
 
@@ -1635,32 +1733,218 @@
    */
   var xrayToken = 0;
 
+  /**
+   * The seq the detail pane is showing. Kept outside `loadXray` because the
+   * timeline arrives later and has to re-apply the selection to markup that did
+   * not exist when the auto-load resolved.
+   */
+  var currentXraySeq = null;
+
+  /** The `note` the head last rendered, so the head can be redrawn in place. */
+  var currentXrayNote = "";
+
+  /** Paint the active timeline column, and clear the rest. */
+  function markXraySelection(seq) {
+    currentXraySeq = seq;
+    var hit = null;
+    document
+      .querySelectorAll("#pane-xray .ct-col")
+      .forEach(function (el) {
+        var on = seq != null && el.getAttribute("data-seq") === String(seq);
+        el.classList.toggle("selected", on);
+        if (on) {
+          el.setAttribute("aria-current", "true");
+          hit = el;
+        } else {
+          el.removeAttribute("aria-current");
+        }
+      });
+    // 145 columns overflow the chart, so the selected one is often scrolled out
+    // of sight. `nearest` on both axes means a visible column never moves.
+    if (hit && hit.offsetParent && hit.scrollIntoView) {
+      hit.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+    updateCompNav();
+  }
+
+  /**
+   * "Was this compaction worth it?" — rendered only when the timeline says so.
+   *
+   * `compaction.efficacy` is a NEW field. Sessions indexed before it existed
+   * carry no such key, and an empty bordered box on every one of them is worse
+   * than no box at all — so every read here is guarded and the whole block
+   * collapses to "" when the data is absent or malformed. Nothing else in the
+   * detail depends on it, so it lights up on its own the moment it appears.
+   */
+  function compactionEfficacy(seq, c) {
+    var e = c && c.efficacy;
+    if (!e || typeof e !== "object") return "";
+    var verdict = String(e.verdict || "").toLowerCase();
+    var label =
+      verdict === "negative"
+        ? "net negative"
+        : verdict === "positive"
+          ? "net positive"
+          : verdict === "marginal"
+            ? "marginal"
+            : verdict;
+    var rows = "";
+    function row(k, v, tip) {
+      rows +=
+        '<div class="ceff-row"' +
+        (tip ? ' title="' + esc(tip) + '"' : "") +
+        '><span class="ceff-k">' +
+        esc(k) +
+        '</span><span class="ceff-v">' +
+        v +
+        "</span></div>";
+    }
+    if (e.reclaimedTokens != null) {
+      row(
+        "reclaimed",
+        "<b>" +
+          fmtCount(e.reclaimedTokens) +
+          "</b> tokens" +
+          (typeof e.reclaimedPct === "number"
+            ? ' <span class="dim">(' + e.reclaimedPct.toFixed(1) + "%)</span>"
+            : ""),
+      );
+    }
+    if (e.cacheRebuildTokens != null) {
+      // The two cache-read figures are the evidence for the rebuild number, but
+      // they are one level of detail below the verdict — a tooltip, not a row.
+      row(
+        "cache rebuild",
+        "<b>" + fmtCount(e.cacheRebuildTokens) + "</b>",
+        e.cacheReadBefore != null || e.cacheReadAfter != null
+          ? "cache read " +
+              fmtCount(e.cacheReadBefore) +
+              " → " +
+              fmtCount(e.cacheReadAfter) +
+              " across the compaction"
+          : "",
+      );
+    }
+    if (typeof e.callsToRegrow !== "undefined") {
+      row(
+        "regrew in",
+        e.callsToRegrow == null
+          ? '<span class="dim">never regrew</span>'
+          : "<b>" +
+              fmtCount(e.callsToRegrow) +
+              "</b> call" +
+              (e.callsToRegrow === 1 ? "" : "s"),
+      );
+    }
+    // `trigger` is a separate, also-optional field on the compaction — a
+    // compaction can have efficacy and no known trigger, so guard it apart.
+    var t = c.trigger;
+    if (t && t.kind) {
+      row(
+        "trigger",
+        "<b>" +
+          esc(t.kind) +
+          "</b>" +
+          (t.source ? ' <span class="dim">(' + esc(t.source) + ")</span>" : ""),
+        t.hookTs ? "hook fired " + fmtTime(t.hookTs) : "",
+      );
+    }
+    if (!rows && !label) return "";
+    return (
+      '<div class="ceff' +
+      (verdict ? " ceff-" + esc(verdict) : "") +
+      '"><div class="ceff-head">' +
+      '<span class="ceff-title">compaction #' +
+      esc(seq) +
+      "</span>" +
+      (label ? '<span class="ceff-verdict">' + esc(label) + "</span>" : "") +
+      "</div>" +
+      '<div class="ceff-rows">' +
+      rows +
+      "</div>" +
+      (e.verdictReason
+        ? '<div class="ceff-why dim">' + esc(e.verdictReason) + "</div>"
+        : "") +
+      "</div>"
+    );
+  }
+
+  /** Flow-pane style detail header: what you are looking at, and how big it is. */
+  function xrayHead(seq, note) {
+    var c = xrayCompactions[seq];
+    return (
+      // Wrapped so the head can be redrawn on its own: the timeline (and with it
+      // the compaction facts) can land AFTER the context body, and re-rendering
+      // the whole detail to pick them up would throw away an open segment.
+      '<div id="xray-head-block">' +
+      '<div class="flow-detail-head">' +
+      '<span class="pill">context</span> API #' +
+      esc(seq) +
+      (c ? ' <span class="pill compaction-pill">compaction</span>' : "") +
+      '<span class="dim xray-head-note">' +
+      esc(note) +
+      "</span></div>" +
+      (c
+        ? '<div class="dim xray-head-sub">compacted at this call — items ' +
+          c.fromItems +
+          " → " +
+          c.toItems +
+          " (dropped " +
+          c.droppedItems +
+          ") · prompt tokens " +
+          fmtTok(c.prePromptTokens) +
+          " → " +
+          fmtTok(c.postPromptTokens) +
+          "</div>"
+        : "") +
+      compactionEfficacy(seq, c) +
+      "</div>"
+    );
+  }
+
+  /** Redraw just the head in place, leaving the body (and any open segment) alone. */
+  function refreshXrayHead() {
+    var el = document.getElementById("xray-head-block");
+    if (!el || currentXraySeq == null) return;
+    el.outerHTML = xrayHead(currentXraySeq, currentXrayNote);
+  }
+
   function loadXray(sessionId, seq) {
     var token = ++xrayToken;
     var status = document.getElementById("xray-status");
     var viewEl = document.getElementById("xray-view");
     var sel = document.getElementById("xray-seq");
     if (sel && String(sel.value) !== String(seq)) sel.value = String(seq);
+    markXraySelection(seq);
     if (status) status.textContent = "loading…";
-    if (viewEl) viewEl.innerHTML = skeleton({ rows: 4 });
+    if (viewEl) {
+      // Same guard as the flow detail: the pane records what it is showing, so
+      // the header is right even while the body is still a skeleton.
+      viewEl.setAttribute("data-showing", String(seq));
+      currentXrayNote = "loading…";
+      viewEl.innerHTML = xrayHead(seq, "loading…") + skeleton({ rows: 4 });
+    }
     fetchJSON(
       "/api/session/" + encodeURIComponent(sessionId) + "/context/" + seq,
     )
       .then(function (x) {
         if (token !== xrayToken) return; // a newer click already won
-        if (status) {
-          status.textContent =
-            fmtTok(x.totalApproxTokens) +
-            " ≈tokens · " +
-            fmtTok(x.totalChars) +
-            " chars" +
-            (x.wirePromptTokens != null
-              ? " · wire " + fmtTok(x.wirePromptTokens) + " prompt"
-              : "");
-        }
+        var summary =
+          fmtTok(x.totalApproxTokens) +
+          " ≈tokens · " +
+          fmtTok(x.totalChars) +
+          " chars" +
+          (x.wirePromptTokens != null
+            ? " · wire " + fmtTok(x.wirePromptTokens) + " prompt"
+            : "");
+        if (status) status.textContent = summary;
+        currentXrayNote = summary;
         if (viewEl) {
-          viewEl.innerHTML = drawXray(x);
-          bindPayloadPopovers();
+          viewEl.innerHTML = xrayHead(seq, summary) + drawXray(x);
+          // Segment rows open their payload INSIDE this pane (see
+          // `bindXraySegments`); they are deliberately not `.payload-hotspot`
+          // any more, so there is nothing here for the hover popover to bind.
+          bindXraySegments(viewEl);
           viewEl
             .querySelectorAll(".btn-xray[data-seq]")
             .forEach(function (btn) {
@@ -1676,9 +1960,11 @@
         // land on top of whatever the user had just clicked.
         if (token !== xrayToken) return;
         if (status) status.textContent = "error";
+        currentXrayNote = "unavailable";
         if (viewEl)
           viewEl.innerHTML =
-            '<div class="empty-pane">' +
+            xrayHead(seq, "unavailable") +
+            '<div class="section-errors"><b>context unavailable</b><br/>' +
             esc(String(err.message || err)) +
             "</div>";
       });
@@ -1796,14 +2082,34 @@
       '<div class="xray-segs">' +
       x.segments
         .slice(0, 80)
-        .map(function (s) {
+        .map(function (s, i) {
           var full = s.preview; // preview already truncated; prefer longer if present
           if (s.full) full = s.full;
           var pct = sharePct(s.approxTokens, total);
+          var meta =
+            fmtCount(s.approxTokens) +
+            " approx tokens · " +
+            fmtCount(s.chars) +
+            " chars · " +
+            fmtShare(pct) +
+            " of context";
           return (
+            // The payload used to live in a hover popover, which meant it
+            // vanished the moment you reached for it and could not be scrolled,
+            // selected or compared. It now opens in place, below its own row —
+            // see `bindXraySegments`. The row keeps every attribute that answer
+            // needs, so the handler never has to re-fetch anything.
             '<button type="button" class="xray-seg bucket-' +
             esc(s.bucket) +
-            ' payload-hotspot" data-full-payload="' +
+            '" aria-expanded="false" data-seg-i="' +
+            i +
+            '" data-seg-bucket="' +
+            esc(s.bucket) +
+            '" data-seg-kind="' +
+            esc(s.kind || "") +
+            '" data-seg-meta="' +
+            esc(meta) +
+            '" data-seg-payload="' +
             esc(full) +
             // The row is shaded to its own share of the context, so the segments
             // actually eating the window are visible without reading a number.
@@ -1812,10 +2118,8 @@
             '%" title="' +
             esc(s.bucket) +
             " · " +
-            fmtTok(s.approxTokens) +
-            " approx tokens · " +
-            fmtShare(pct) +
-            ' of context — hover for full text">' +
+            meta +
+            ' — click for the full payload">' +
             '<span class="xray-seg-bucket">' +
             esc(s.bucket) +
             "</span>" +
@@ -1834,6 +2138,78 @@
       "</div>";
 
     return stack + delta + segs;
+  }
+
+  /** Close whichever segment payload is open, if any. */
+  function closeXraySeg(list) {
+    var open = list.querySelector(".xray-seg-detail");
+    if (open && open.parentNode) open.parentNode.removeChild(open);
+    list.querySelectorAll(".xray-seg.open").forEach(function (b) {
+      b.classList.remove("open");
+      b.setAttribute("aria-expanded", "false");
+    });
+  }
+
+  /**
+   * Segment payloads, opened by click, in the detail pane.
+   *
+   * The payload is inserted directly BELOW the row it belongs to rather than in
+   * a shared panel elsewhere: "which segment is this?" then has no answer to get
+   * wrong — the row is highlighted and physically attached to its own text. One
+   * at a time, so the segment list never turns into a wall of payloads, and it
+   * closes on a second click, on ✕, or on Escape.
+   */
+  function bindXraySegments(root) {
+    var list = root.querySelector(".xray-segs");
+    if (!list) return;
+    list.addEventListener("click", function (e) {
+      if (e.target.closest(".xray-seg-close")) {
+        closeXraySeg(list);
+        return;
+      }
+      var btn = e.target.closest(".xray-seg[data-seg-payload]");
+      if (!btn) return;
+      var wasOpen = btn.classList.contains("open");
+      closeXraySeg(list);
+      if (wasOpen) return; // second click on the same row = collapse
+      btn.classList.add("open");
+      btn.setAttribute("aria-expanded", "true");
+      var d = document.createElement("div");
+      d.className =
+        "xray-seg-detail bucket-" + (btn.getAttribute("data-seg-bucket") || "");
+      var kind = btn.getAttribute("data-seg-kind") || "";
+      // Attributes come back decoded, so everything is re-escaped on the way in.
+      d.innerHTML =
+        '<div class="flow-detail-head">' +
+        '<span class="pill">' +
+        esc(btn.getAttribute("data-seg-bucket") || "segment") +
+        "</span>" +
+        '<span class="xray-seg-detail-title">segment #' +
+        esc(btn.getAttribute("data-seg-i")) +
+        (kind ? " · " + esc(kind) : "") +
+        "</span>" +
+        '<span class="dim xray-seg-detail-meta">' +
+        esc(btn.getAttribute("data-seg-meta") || "") +
+        "</span>" +
+        '<button type="button" class="xray-seg-close" title="Close (Esc)" aria-label="Close payload">✕</button>' +
+        "</div>" +
+        '<pre class="payload">' +
+        esc(btn.getAttribute("data-seg-payload") || "") +
+        "</pre>";
+      btn.parentNode.insertBefore(d, btn.nextSibling);
+      if (d.scrollIntoView) d.scrollIntoView({ block: "nearest" });
+    });
+    // Focus stays on the row that was clicked, so a keydown here reaches us.
+    list.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape") return;
+      if (!list.querySelector(".xray-seg-detail")) return;
+      // The document-level Escape leaves the session entirely. While a payload
+      // is open, Escape means "close this" — swallowed so one key never does
+      // both, and left alone when there is nothing open to close.
+      e.stopPropagation();
+      e.preventDefault();
+      closeXraySeg(list);
+    });
   }
 
   function stepCard(st) {
