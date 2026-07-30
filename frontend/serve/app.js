@@ -62,15 +62,17 @@
     };
   }
 
+  /** Skeleton shimmer placeholder: a grid of stat-card blanks. */
+  function skelCards(n) {
+    var h = '<div class="skel-cards">';
+    for (var c = 0; c < n; c++) h += '<div class="skel skel-card"></div>';
+    return h + "</div>";
+  }
+
   /** Skeleton shimmer placeholder: optional card grid + stacked rows. */
   function skeleton(opts) {
     opts = opts || {};
-    var h = "";
-    if (opts.cards) {
-      h += '<div class="skel-cards">';
-      for (var c = 0; c < opts.cards; c++) h += '<div class="skel skel-card"></div>';
-      h += "</div>";
-    }
+    var h = opts.cards ? skelCards(opts.cards) : "";
     for (var i = 0; i < (opts.rows || 6); i++) h += '<div class="skel skel-row"></div>';
     return h;
   }
@@ -159,7 +161,9 @@
     var m;
     if ((m = h.match(/^session\/([^/]+)(?:\/step-(\d+))?$/))) renderSession(decodeURIComponent(m[1]), m[2] ? Number(m[2]) : null);
     else if ((m = h.match(/^prompt\/(.+)$/))) renderPrompt(decodeURIComponent(m[1]));
-    else if (h === "usage") renderUsage();
+    // #usage was folded into #analytics; keep old bookmarks working (replace,
+    // so Back does not bounce straight into the redirect again).
+    else if (h === "usage") { location.replace("#analytics"); return; }
     else if (h === "analytics") renderAnalytics();
     else if (h === "prompts") renderPrompts();
     else if (h === "audit") renderAudit();
@@ -681,162 +685,206 @@
     return s.length > n ? s.slice(0, n) + "\n… (" + (s.length - n) + " more chars — see wire report)" : s;
   }
 
-  // ----------------------------------------------------------------- usage
-  var usage = { granularity: "daily", breakdown: false, since: "", until: "", agent: "" };
+  // ------------------------------------------------- analytics (merged pane)
+  /**
+   * ONE pane, ONE scope. `since` / `until` / `agent` are PANE-LEVEL filters:
+   * they go to /api/analytics and /api/usage alike, so every card, chart and
+   * table below answers for exactly the same slice -- there is no "this half
+   * is filtered, that half is all-time" ambiguity to explain away.
+   *
+   * `granularity` / `breakdown` are NOT filters -- they only reshape the
+   * time-series section, so they live next to it rather than in the scope bar,
+   * and changing them re-queries that section alone.
+   */
+  var an = { since: "", until: "", agent: "", granularity: "daily", breakdown: false };
+  var anAgents = [];
 
-  function renderUsage() {
-    current = { name: "usage" };
-    var html =
-      '<div class="controls">' +
-      '<select id="u-gran">' +
-      ["daily", "weekly", "monthly", "total"].map(function (g) {
-        return '<option value="' + g + '"' + (usage.granularity === g ? " selected" : "") + ">" + g + "</option>";
-      }).join("") +
-      "</select>" +
-      '<label class="check"><input id="u-breakdown" type="checkbox"' + (usage.breakdown ? " checked" : "") + "/> per-model breakdown</label>" +
-      '<input id="u-since" type="date" value="' + esc(usage.since) + '" title="since"/>' +
-      '<input id="u-until" type="date" value="' + esc(usage.until) + '" title="until"/>' +
-      '<input id="u-agent" class="filter" type="text" placeholder="agent" value="' + esc(usage.agent) + '"/>' +
-      "</div>" +
-      '<div id="u-chart"></div>' +
-      '<div class="tbl-wrap"><table><thead><tr id="u-head"></tr></thead><tbody id="u-rows">' + skelRows(6, 8) + '</tbody></table></div>' +
-      '<div class="note" id="u-note"></div>' +
-      '<div class="empty" id="u-empty" style="display:none"></div>';
-    setView(html);
-    [["u-gran", "change"], ["u-breakdown", "change"], ["u-since", "change"], ["u-until", "change"], ["u-agent", "input"]].forEach(function (pair) {
-      document.getElementById(pair[0]).addEventListener(pair[1], debounce(onUsageControls, 150));
-    });
-    loadUsage();
-  }
+  function anFiltered() { return !!(an.since || an.until || an.agent); }
 
-  function onUsageControls() {
-    usage.granularity = document.getElementById("u-gran").value;
-    usage.breakdown = document.getElementById("u-breakdown").checked;
-    usage.since = document.getElementById("u-since").value;
-    usage.until = document.getElementById("u-until").value;
-    usage.agent = document.getElementById("u-agent").value.trim();
-    loadUsage();
-  }
-
-  function loadUsage() {
-    if (!document.getElementById("u-rows")) return;
+  /** The scope every request from this pane carries. */
+  function anScopeParams() {
     var p = new URLSearchParams();
-    p.set("granularity", usage.granularity);
-    if (usage.breakdown) p.set("breakdown", "1");
-    if (usage.since) p.set("since", usage.since);
-    if (usage.until) p.set("until", usage.until);
-    if (usage.agent) p.set("agent", usage.agent);
-    try { p.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone); } catch (e) {}
-    fetchJSON("/api/usage?" + p).then(drawUsage).catch(fail);
+    if (an.since) p.set("since", an.since);
+    if (an.until) p.set("until", an.until);
+    if (an.agent) p.set("agent", an.agent);
+    return p;
   }
 
-  function drawUsage(report) {
-    var chart = document.getElementById("u-chart");
-    if (!chart) return;
-    var empty = document.getElementById("u-empty");
-    var rowsEl = document.getElementById("u-rows");
-    var headEl = document.getElementById("u-head");
-    if (!report.rows.length) {
-      chart.innerHTML = "";
-      headEl.innerHTML = "";
-      rowsEl.innerHTML = "";
-      empty.style.display = "block";
-      empty.innerHTML = "No usage in range. Capture sessions, then run <code>tracetap index</code>.";
-      return;
-    }
-    empty.style.display = "none";
-
-    // Chart: cost per bucket (collapse breakdown rows into buckets).
-    var byBucket = {};
-    report.rows.forEach(function (r) {
-      byBucket[r.bucket] = (byBucket[r.bucket] || 0) + r.costUsd;
-    });
-    var items = Object.keys(byBucket).sort().map(function (b) {
-      return { label: b.slice(5) || b, value: byBucket[b], title: b + ": " + fmtCost(byBucket[b]) };
-    });
-    if (report.granularity !== "total" && items.length > 1) {
-      chart.innerHTML = '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost per ' +
-        ({ daily: "day", weekly: "week", monthly: "month" }[report.granularity] || report.granularity) + "</div>" +
-        columnChart(items, { height: 130, labels: true, colWidth: 34 }) + "</div>";
-    } else chart.innerHTML = "";
-
-    var showGroup = report.rows.some(function (r) { return r.group; });
-    headEl.innerHTML = "<th>Bucket</th>" + (showGroup ? "<th>Group</th>" : "") +
-      '<th class="num">In</th><th class="num">Out</th><th class="num">Cache R</th><th class="num">Cache W</th><th class="num">Sessions</th><th class="num">Cost</th>';
-    var rowsHtml = report.rows.map(function (r) {
-      return "<tr><td>" + esc(r.bucket) + "</td>" +
-        (showGroup ? "<td>" + esc(r.group) + "</td>" : "") +
-        '<td class="num">' + fmtTok(r.promptTokens) + "</td>" +
-        '<td class="num">' + fmtTok(r.completionTokens) + "</td>" +
-        '<td class="num">' + fmtTok(r.cacheRead) + "</td>" +
-        '<td class="num">' + fmtTok(r.cacheCreation) + "</td>" +
-        '<td class="num">' + r.sessions + "</td>" +
-        '<td class="num">' + fmtCost(r.costUsd, r.hasUnpriced) + "</td></tr>";
-    });
-    var t = report.totals;
-    rowsHtml.push('<tr class="total"><td>total</td>' + (showGroup ? "<td></td>" : "") +
-      '<td class="num">' + fmtTok(t.promptTokens) + "</td>" +
-      '<td class="num">' + fmtTok(t.completionTokens) + "</td>" +
-      '<td class="num">' + fmtTok(t.cacheRead) + "</td>" +
-      '<td class="num">' + fmtTok(t.cacheCreation) + "</td>" +
-      '<td class="num">' + t.sessions + "</td>" +
-      '<td class="num">' + fmtCost(t.costUsd, t.hasUnpriced) + "</td></tr>");
-    rowsEl.innerHTML = rowsHtml.join("");
-
-    var note = "prices: " + esc(report.priceSource);
-    if (report.unpricedModels.length) {
-      note += ' · <span class="warn-text">unpriced models excluded from $: ' + esc(report.unpricedModels.join(", ")) + "</span>";
-    }
-    document.getElementById("u-note").innerHTML = note;
+  function anAgentOptions() {
+    return '<option value="">all agents</option>' +
+      anAgents.map(function (a) {
+        return '<option value="' + esc(a) + '"' + (an.agent === a ? " selected" : "") + ">" + esc(a) + "</option>";
+      }).join("");
   }
 
-  // ------------------------------------------------------------- analytics
   function renderAnalytics() {
     current = { name: "analytics" };
-    setView(skeleton({ cards: 7, rows: 8 }));
-    fetchJSON("/api/analytics").then(function (a) {
+    setView(
+      '<div class="controls scope' + (anFiltered() ? " on" : "") + '" id="an-scope">' +
+      '<span class="ctl-lbl">scope</span>' +
+      '<input id="an-since" type="date" value="' + esc(an.since) + '" title="since (inclusive)"/>' +
+      '<span class="ctl-sep">&rarr;</span>' +
+      '<input id="an-until" type="date" value="' + esc(an.until) + '" title="until (inclusive)"/>' +
+      '<select id="an-agent" title="agent">' + anAgentOptions() + "</select>" +
+      '<button type="button" class="btn" id="an-reset"' + (anFiltered() ? "" : " disabled") + ">reset</button>" +
+      '<span class="spacer"></span>' +
+      '<span class="ctl-hint">applies to every figure on this page</span>' +
+      "</div>" +
+      '<div class="scope-line" id="an-scope-line">Loading&hellip;</div>' +
+      '<div id="an-cards">' + skelCards(7) + "</div>" +
+      '<div id="an-calendar"></div>' +
+      '<h2 class="sec">Spend over time <small>(the same slice, bucketed &mdash; granularity and breakdown reshape this section only)</small></h2>' +
+      '<div class="controls sub">' +
+      '<select id="an-gran" title="bucket size">' +
+      ["daily", "weekly", "monthly", "total"].map(function (g) {
+        return '<option value="' + g + '"' + (an.granularity === g ? " selected" : "") + ">" + g + "</option>";
+      }).join("") +
+      "</select>" +
+      '<label class="check"><input id="an-breakdown" type="checkbox"' + (an.breakdown ? " checked" : "") + "/> per-model breakdown</label>" +
+      "</div>" +
+      '<div id="an-series"><div class="tbl-wrap"><table><tbody>' + skelRows(6, 8) + "</tbody></table></div></div>" +
+      '<div id="an-viz"></div>' +
+      '<div id="an-tables"></div>' +
+      '<div class="note" id="an-note"></div>'
+    );
+
+    ["an-since", "an-until", "an-agent"].forEach(function (id) {
+      document.getElementById(id).addEventListener("change", onScopeControls);
+    });
+    document.getElementById("an-reset").addEventListener("click", function () {
+      an.since = "";
+      an.until = "";
+      an.agent = "";
+      renderAnalytics();
+    });
+    ["an-gran", "an-breakdown"].forEach(function (id) {
+      document.getElementById(id).addEventListener("change", onSeriesControls);
+    });
+
+    loadAnalytics();
+  }
+
+  /** Scope changed - everything on the page has to be re-asked. */
+  function onScopeControls() {
+    an.since = document.getElementById("an-since").value;
+    an.until = document.getElementById("an-until").value;
+    an.agent = document.getElementById("an-agent").value;
+    var bar = document.getElementById("an-scope");
+    if (bar) bar.classList.toggle("on", anFiltered());
+    var reset = document.getElementById("an-reset");
+    if (reset) reset.disabled = !anFiltered();
+    loadAnalytics();
+  }
+
+  /** Series shape changed - only the time-series section is affected. */
+  function onSeriesControls() {
+    an.granularity = document.getElementById("an-gran").value;
+    an.breakdown = document.getElementById("an-breakdown").checked;
+    loadAnalyticsSeries();
+  }
+
+  function loadAnalytics() {
+    loadAnalyticsOverview();
+    loadAnalyticsSeries();
+  }
+
+  /**
+   * Number the figures by final DOM order. The pane's regions render
+   * independently and some charts drop out for a given slice (a single bucket,
+   * no wire data), so hard-coded FIG.n would leave holes; both draw passes call
+   * this and the last one to land settles the numbering.
+   */
+  function renumberFigs() {
+    view.querySelectorAll(".chart-title .fig").forEach(function (el, i) {
+      el.textContent = "FIG." + (i + 1);
+    });
+  }
+
+  /** Replace one pane region with an error instead of nuking the whole view. */
+  function regionFail(id, err) {
+    var el = document.getElementById(id);
+    if (el) el.innerHTML = '<div class="empty">Error: ' + esc(err.message || err) + "</div>";
+  }
+
+  function loadAnalyticsOverview() {
+    if (!document.getElementById("an-cards")) return;
+    fetchJSON("/api/analytics?" + anScopeParams()).then(function (a) {
       if (current.name !== "analytics") return;
       drawAnalytics(a);
-    }).catch(fail);
+    }).catch(function (err) { regionFail("an-cards", err); });
+  }
+
+  function loadAnalyticsSeries() {
+    if (!document.getElementById("an-series")) return;
+    var p = anScopeParams();
+    p.set("granularity", an.granularity);
+    if (an.breakdown) p.set("breakdown", "1");
+    try { p.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone); } catch (e) {}
+    fetchJSON("/api/usage?" + p).then(function (report) {
+      if (current.name !== "analytics") return;
+      drawSeries(report);
+    }).catch(function (err) { regionFail("an-series", err); });
+  }
+
+  /** Human-readable proof of what the numbers on this page actually cover. */
+  function scopeLine(a) {
+    var t = a.totals;
+    var range = an.since || an.until
+      ? esc(an.since || "the beginning") + " &rarr; " + esc(an.until || "now")
+      : "all time";
+    return "<b>" + range + "</b> &middot; <b>" + (an.agent ? esc(an.agent) : "all agents") + "</b> &mdash; " +
+      t.sessions + " session" + (t.sessions === 1 ? "" : "s") + " &middot; " +
+      t.requests + " API call" + (t.requests === 1 ? "" : "s") + " &middot; " +
+      t.events + " agent turn" + (t.events === 1 ? "" : "s");
   }
 
   function drawAnalytics(a) {
     var t = a.totals;
-    var cards =
+
+    // The agent picker offers every agent in the index, not just the ones that
+    // survived the current filter - otherwise picking one erases the others.
+    if (a.agentOptions && a.agentOptions.join(" ") !== anAgents.join(" ")) {
+      anAgents = a.agentOptions;
+      var sel = document.getElementById("an-agent");
+      if (sel) sel.innerHTML = anAgentOptions();
+    }
+    document.getElementById("an-scope-line").innerHTML = scopeLine(a);
+
+    document.getElementById("an-cards").innerHTML = '<div class="cards">' +
       card("Sessions", t.sessions) +
       card("API calls", t.requests) +
       card("Call error rate", t.requests ? fmtPct(t.erroredRequests / t.requests) : "—", t.requests && t.erroredRequests / t.requests > 0.05) +
       card("Total cost", fmtCost(t.costUsd, t.hasUnpriced)) +
       card("Cache hit rate", fmtPct(t.cacheHitRate)) +
       card("Output tokens", fmtTok(t.completionTokens)) +
-      card("Compactions", a.compactions.totalCompactions + ' <small>in ' + a.compactions.sessionsWithCompaction + " sessions</small>", a.compactions.totalCompactions > 0);
+      card("Compactions", a.compactions.totalCompactions + ' <small>in ' + a.compactions.sessionsWithCompaction + " sessions</small>", a.compactions.totalCompactions > 0) +
+      "</div>";
 
-    var trendHtml = "";
-    if (a.trend.length) {
-      trendHtml = '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost calendar — last 26 weeks · ' +
-        a.trend.length + " active days</div>" +
-        '<div id="hm">' + TracetapCharts.calendarHeatmap(a.trend) + "</div></div>";
-    }
+    document.getElementById("an-calendar").innerHTML = a.trend.length
+      ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost calendar &mdash; last 26 weeks &middot; ' +
+        a.trend.length + " active days in scope</div>" +
+        '<div id="hm">' + TracetapCharts.calendarHeatmap(a.trend) + "</div></div>"
+      : '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost calendar</div>' +
+        '<div class="dim">No priced activity in scope.</div></div>';
 
     var tmItems = a.perProject
       .filter(function (p) { return p.costUsd > 0; })
       .map(function (p, i) {
         return { label: basename(p.project) || p.project, sub: fmtCost(p.costUsd) + " · " + p.sessions + " sessions", value: p.costUsd, idx: i };
       });
-    var vizSplit = "";
     var strips = TracetapCharts.ttftStrips(a.perModel);
-    if (tmItems.length || strips) {
-      vizSplit = '<div class="split">' +
+    document.getElementById("an-viz").innerHTML = (tmItems.length || strips)
+      ? '<div class="split">' +
         (tmItems.length
-          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.2</span>Spend by project</div><div id="tm">' +
+          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.3</span>Spend by project</div><div id="tm">' +
             TracetapCharts.treemap(tmItems, { width: 620, height: 200 }) + "</div></div>"
           : "") +
         (strips
-          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.3</span>TTFT distribution by model · box p25–p75 · tick p50 · amber p95</div><div id="ts">' +
+          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.4</span>TTFT distribution by model &middot; box p25&ndash;p75 &middot; tick p50 &middot; amber p95</div><div id="ts">' +
             strips + "</div></div>"
           : "") +
-        "</div>";
-    }
+        "</div>"
+      : "";
 
     var modelRows = a.perModel.map(function (m) {
       return "<tr><td>" + esc(m.model) + "</td>" +
@@ -871,10 +919,8 @@
         '<td class="num">' + fmtCost(s.costUsd) + "</td></tr>";
     }).join("");
 
-    setView(
-      '<div class="cards">' + cards + "</div>" +
-      trendHtml +
-      vizSplit +
+    var tables = document.getElementById("an-tables");
+    tables.innerHTML =
       '<div class="split">' +
       '<div><h2 class="sec">Per model <small>(wire latency &amp; reliability)</small></h2>' +
       '<div class="tbl-wrap"><table><thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Err</th><th class="num">TTFT p50</th><th class="num">TTFT p95</th><th class="num">Dur p50</th><th class="num">Out</th></tr></thead><tbody>' +
@@ -887,10 +933,10 @@
       '<h2 class="sec">Top sessions by cost</h2>' +
       '<div class="tbl-wrap"><table><thead><tr><th>Session</th><th>Project</th><th>Started</th><th class="num">Dur</th><th class="num">Turns</th><th class="num">Cost</th></tr></thead><tbody>' +
       (topSessionRows || '<tr><td colspan="6" class="dim">no sessions</td></tr>') + "</tbody></table></div></div>" +
-      "</div>" +
-      '<div class="note">prices: ' + esc(a.priceSource) + "</div>"
-    );
-    view.querySelectorAll("tr[data-id]").forEach(function (tr) {
+      "</div>";
+    document.getElementById("an-note").innerHTML = "prices: " + esc(a.priceSource);
+
+    tables.querySelectorAll("tr[data-id]").forEach(function (tr) {
       tr.addEventListener("click", function () {
         location.hash = "#session/" + encodeURIComponent(tr.getAttribute("data-id"));
       });
@@ -928,6 +974,72 @@
         return h;
       });
     }
+    renumberFigs();
+  }
+
+  /** The bucketed drill-down: cost per bucket + the full token/spend table. */
+  function drawSeries(report) {
+    var host = document.getElementById("an-series");
+    if (!host) return;
+    if (!report.rows.length) {
+      host.innerHTML = '<div class="empty">No usage in scope. Capture sessions, then run <code>tracetap index</code>.</div>';
+      return;
+    }
+
+    // Chart: cost per bucket (collapse breakdown rows back into buckets).
+    var byBucket = {};
+    report.rows.forEach(function (r) {
+      byBucket[r.bucket] = (byBucket[r.bucket] || 0) + r.costUsd;
+    });
+    var items = Object.keys(byBucket).sort().map(function (b) {
+      return { label: b.slice(5) || b, value: byBucket[b], title: b + ": " + fmtCost(byBucket[b]) };
+    });
+    var chart = report.granularity !== "total" && items.length > 1
+      ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.2</span>Cost per ' +
+        ({ daily: "day", weekly: "week", monthly: "month" }[report.granularity] || report.granularity) + "</div>" +
+        columnChart(items, { height: 130, labels: true, colWidth: 34 }) + "</div>"
+      : "";
+
+    // The grouping column holds models when broken down and otherwise the
+    // agents that produced the bucket — say which, rather than "Group".
+    var showGroup = report.rows.some(function (r) { return r.group; });
+    var head = "<th>Bucket</th>" + (showGroup ? "<th>" + (an.breakdown ? "Model" : "Agents") + "</th>" : "") +
+      '<th class="num">In</th><th class="num">Out</th><th class="num">Cache R</th><th class="num">Cache W</th>' +
+      '<th class="num" title="Sessions with billable turns in this bucket">Sessions</th><th class="num">Cost</th>';
+    var rowsHtml = report.rows.map(function (r) {
+      return "<tr><td>" + esc(r.bucket) + "</td>" +
+        (showGroup ? "<td>" + esc(r.group) + "</td>" : "") +
+        '<td class="num">' + fmtTok(r.promptTokens) + "</td>" +
+        '<td class="num">' + fmtTok(r.completionTokens) + "</td>" +
+        '<td class="num">' + fmtTok(r.cacheRead) + "</td>" +
+        '<td class="num">' + fmtTok(r.cacheCreation) + "</td>" +
+        '<td class="num">' + r.sessions + "</td>" +
+        '<td class="num">' + fmtCost(r.costUsd, r.hasUnpriced) + "</td></tr>";
+    });
+    var t = report.totals;
+    rowsHtml.push('<tr class="total"><td>total</td>' + (showGroup ? "<td></td>" : "") +
+      '<td class="num">' + fmtTok(t.promptTokens) + "</td>" +
+      '<td class="num">' + fmtTok(t.completionTokens) + "</td>" +
+      '<td class="num">' + fmtTok(t.cacheRead) + "</td>" +
+      '<td class="num">' + fmtTok(t.cacheCreation) + "</td>" +
+      '<td class="num">' + t.sessions + "</td>" +
+      '<td class="num">' + fmtCost(t.costUsd, t.hasUnpriced) + "</td></tr>");
+
+    // Sessions here counts sessions that BILLED in the bucket, while the
+    // Sessions card counts every indexed session in scope — call out the gap
+    // rather than let two different numbers sit unexplained on one page.
+    var note = "Sessions counts sessions with billable turns in the bucket; the " +
+      "<b>Sessions</b> card above counts every indexed session in scope.";
+    if (report.unpricedModels.length) {
+      note += ' <span class="warn-text">Unpriced models excluded from $: ' +
+        esc(report.unpricedModels.join(", ")) + ".</span>";
+    }
+    note = '<div class="note">' + note + "</div>";
+
+    host.innerHTML = chart +
+      '<div class="tbl-wrap"><table><thead><tr>' + head + "</tr></thead><tbody>" +
+      rowsHtml.join("") + "</tbody></table></div>" + note;
+    renumberFigs();
   }
 
   // --------------------------------------------------------------- prompts
@@ -1136,7 +1248,7 @@
   }
 
   // ------------------------------------------------- keyboard + palette
-  var TABS = ["sessions", "usage", "analytics", "prompts", "audit"];
+  var TABS = ["sessions", "analytics", "prompts", "audit"];
 
   function isTyping(e) {
     var t = e.target;
@@ -1183,7 +1295,7 @@
     else if (e.key === "j") moveCursor(1);
     else if (e.key === "k") moveCursor(-1);
     else if (e.key === "Enter" && focusedRow()) { e.preventDefault(); activateCursor(); }
-    else if (e.key >= "1" && e.key <= "5") location.hash = "#" + TABS[Number(e.key) - 1];
+    else if (e.key >= "1" && e.key <= String(TABS.length)) location.hash = "#" + TABS[Number(e.key) - 1];
     else if (e.key === "?") toggleHelp();
     else if (e.key === "Escape") {
       if (current.name === "session") location.hash = "#sessions";
@@ -1324,7 +1436,7 @@
       ["/", "focus search"],
       ["j / k", "move row cursor"],
       ["↵", "open focused row"],
-      ["1–5", "switch view"],
+      ["1-" + TABS.length, "switch view"],
       ["esc", "back / close"],
       ["?", "this overlay"]
     ];
@@ -1360,7 +1472,7 @@
   var liveLabel = document.getElementById("live-label");
   var refresh = debounce(function () {
     if (current.name === "sessions") loadSessionData();
-    else if (current.name === "usage") loadUsage();
+    else if (current.name === "analytics") loadAnalytics();
     else route();
   }, 400);
 

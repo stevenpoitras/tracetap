@@ -567,13 +567,19 @@ Five views:
   minimap rail tracks scroll position. Search hits deep-link straight to the
   matching step. Links to the session's original self-contained HTML wire
   report when it exists on disk.
-- **Usage** — the `tracetap usage` report in chart + table form (granularity,
-  per-model breakdown, date range).
-- **Analytics** — fleet rollups: total cost / cache-hit rate / call error rate
-  stat cards, a **26-week cost calendar heatmap**, a **spend-by-project
-  treemap**, **TTFT distribution strips per model** (p10–p95 bands measured
-  from your own traffic, not provider status pages), per-model and per-agent
-  tables, top tools, top sessions by cost, mid-task compaction counts.
+- **Analytics** — one pane for "where is my time and money going", from the
+  snapshot down to the drill-down. A **scope bar** (since / until / agent) sits
+  at the top and governs *everything* below it — cards, charts, tables and the
+  time-series all answer for the same slice, and a scope line under the bar
+  restates what that slice is (`all time · all agents — 14 sessions · 334 API
+  calls`). Inside it: total cost / cache-hit rate / call error rate stat cards,
+  a **26-week cost calendar heatmap**, a **Spend over time** section (the
+  `tracetap usage` report as chart + table, with its own granularity and
+  per-model-breakdown controls that reshape that section alone), a
+  **spend-by-project treemap**, **TTFT distribution strips per model**
+  (p10–p95 bands measured from your own traffic, not provider status pages),
+  per-model and per-agent tables, top tools, top sessions by cost, and
+  mid-task compaction counts. `#usage` redirects here.
 - **Prompts** — the system-prompt registry: every distinct prompt version seen
   on the wire (content-addressed; volatile fragments normalized away), with
   usage counts and a **line diff between any two versions** — see exactly what
@@ -590,7 +596,7 @@ JSON API (everything the UI uses is scriptable):
 | `GET /api/search?q=…` | FTS5 search hits (`tool`/`agent`/`model`/`project`/`errored` filters) |
 | `GET /api/session/<id>` | One session: summary + transcript steps + per-request wire rows + compactions |
 | `GET /api/usage` | Bucketed usage report (`granularity`/`breakdown`/`since`/`until`/`timezone`…) |
-| `GET /api/analytics` | Fleet rollups (per-model TTFT percentiles, error rates, tools, trend…) |
+| `GET /api/analytics` | Fleet rollups (per-model TTFT percentiles, error rates, tools, trend…), scoped by the same `since`/`until`/`agent` as `/api/usage` |
 | `GET /api/prompts` / `GET /api/prompt/<hash>` | Prompt registry list / full content + sessions (prefix hash ok) |
 | `GET /api/audit?mode=standard\|strict` | Egress secret findings over all indexed source logs |
 | `GET /api/events` | SSE stream; `change` events fire when the index db changes |
