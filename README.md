@@ -535,7 +535,7 @@ db path, index counts, and price source.
 
 The whole UI is keyboard-driven: `⌘K` opens a fuzzy command palette over every
 session, prompt version, and view; `/` focuses search; `j`/`k` + `↵` walk and
-open rows; `1`–`5` switch views; `Esc` backs out; `?` shows the cheat sheet.
+open rows; `1`–`6` switch views; `Esc` backs out; `?` shows the cheat sheet.
 
 ```bash
 # Serve the observatory at http://127.0.0.1:4000
@@ -551,14 +551,15 @@ tracetap serve --port 8080 --host 127.0.0.1 --db ~/.tracetap/index.db
 | `--host <addr>` | Address to bind (default `127.0.0.1`)                   |
 | `--db <path>`   | Index database to read (default `~/.tracetap/index.db`) |
 
-Five views:
+Six views:
 
 - **Sessions** — sortable wire-metric table (duration, in/out tokens, cache-hit
   rate, errors, cost) over every indexed session; the search box switches to
   ranked FTS5 hits (same engine as `tracetap search`). Click through to…
-- **Session detail** — flight-recorder for one session with four panes:
+- **Session detail** — flight-recorder for one session with five panes:
   **Flow** (agent-loop graph), **Hooks** (Claude Code hook timeline + payloads),
   **Context X-Ray** (window composition + new/carried/dropped vs prior call),
+  **Tool Tax** (declared vs invoked tools for this session's toolset),
   and **Wire** (context-growth / token-flow lanes, request waterfall, transcript).
 - **Usage** — the `tracetap usage` report in chart + table form (granularity,
   per-model breakdown, date range).
@@ -572,6 +573,11 @@ Five views:
   usage counts and a **line diff between any two versions** — see exactly what
   changed when a harness update rewrites its prompt.
 - **Audit** — the `tracetap audit` report (next section) over all indexed logs.
+- **Tools** — the **dead-tool tax**: tool definitions ride along in every API
+  call, and most declared tools are never invoked. Crosses the content-addressed
+  toolset registry (sized per tool at index time) with each session's invoked
+  histogram; ranks tools and sessions by cumulative dead ≈tokens and prices the
+  waste at each model's cache-read rate.
 
 ### Claude Code hooks (`tracetap hooks`)
 
@@ -609,10 +615,13 @@ JSON API (everything the UI uses is scriptable):
 | `GET /api/search?q=…`                         | FTS5 search hits (`tool`/`agent`/`model`/`project`/`errored` filters)             |
 | `GET /api/session/<id>`                       | One session: summary + steps + requests + hooks + flow + compactions              |
 | `GET /api/session/<id>/context/<seq>`         | Context X-Ray for one API call (buckets, segments, delta)                         |
+| `GET /api/session/<id>/timeline`              | Per-call context composition timeline (precomputed at index time)                 |
+| `GET /api/session/<id>/tools`                 | Dead-tool tax for one session (declared toolsets × invoked histogram)             |
 | `GET /api/usage`                              | Bucketed usage report (`granularity`/`breakdown`/`since`/`until`/`timezone`…)     |
 | `GET /api/analytics`                          | Fleet rollups (per-model TTFT percentiles, error rates, tools, trend…)            |
 | `GET /api/prompts` / `GET /api/prompt/<hash>` | Prompt registry list / full content + sessions (prefix hash ok)                   |
 | `GET /api/audit?mode=standard\|strict`        | Egress secret findings over all indexed source logs                               |
+| `GET /api/tooltax`                            | Fleet dead-tool tax (per-tool + per-session dead ≈tokens, cache-read priced)      |
 | `GET /api/events`                             | SSE stream; `change` events fire when the index db changes                        |
 | `GET /report?session=<id>`                    | The session's HTML wire report, or `404` if it isn't on disk                      |
 

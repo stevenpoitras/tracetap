@@ -272,10 +272,10 @@
   function route() {
     var h = location.hash.replace(/^#/, "") || "sessions";
     var m;
-    // session/<id>[/flow|hooks|xray|wire][/step-N]
+    // session/<id>[/flow|hooks|xray|wire|tools][/step-N]
     if (
       (m = h.match(
-        /^session\/([^/]+)(?:\/(flow|hooks|xray|wire))?(?:\/step-(\d+))?$/,
+        /^session\/([^/]+)(?:\/(flow|hooks|xray|wire|tools))?(?:\/step-(\d+))?$/,
       ))
     ) {
       renderSession(
@@ -289,6 +289,7 @@
     else if (h === "analytics") renderAnalytics();
     else if (h === "prompts") renderPrompts();
     else if (h === "audit") renderAudit();
+    else if (h === "tooltax") renderToolTax();
     else renderSessions();
 
     var tab = h.split("/")[0];
@@ -1027,6 +1028,7 @@
       subnavBtn("flow", "Flow") +
       subnavBtn("hooks", "Hooks", hooks.length) +
       subnavBtn("xray", "Context X-Ray") +
+      subnavBtn("tools", "Tool Tax") +
       subnavBtn("wire", "Wire") +
       "</nav>" +
       '<div class="session-panes">' +
@@ -1044,6 +1046,13 @@
       (pane === "xray" ? " active" : "") +
       '" id="pane-xray">' +
       renderXrayPane(s.sessionId, reqs) +
+      "</section>" +
+      '<section class="session-pane' +
+      (pane === "tools" ? " active" : "") +
+      '" id="pane-tools">' +
+      // Filled in by loadToolTax once /tools responds — same lazy contract as
+      // the context timeline.
+      '<div id="tooltax-host"><div class="dim">loading tool tax…</div></div>' +
       "</section>" +
       '<section class="session-pane' +
       (pane === "wire" ? " active" : "") +
@@ -1204,6 +1213,7 @@
     }
     // The timeline arrives on its own endpoint; it renders and binds itself.
     if (reqs && reqs.length) loadTimeline(sessionId);
+    loadToolTax(sessionId);
   }
 
   function bindPayloadPopovers() {
@@ -2504,6 +2514,237 @@
     }
   }
 
+  // -------------------------------------------------------------- tool tax
+
+  /**
+   * Dead-tool-tax: tool definitions ride along in EVERY request, so a declared
+   * tool that is never invoked is paid for on every call. Both views cross the
+   * declared set (toolsets registry, sized at index time) with the invoked
+   * histogram; only the grouping differs (fleet per tool vs one session).
+   */
+  function toolStatusPill(t) {
+    if (t.dead) return '<span class="pill warn">dead</span>';
+    return '<span class="pill ok">' + t.calls + "×</span>";
+  }
+
+  function sessionToolsetHtml(ts, idx) {
+    var maxTok = ts.tools.length ? ts.tools[0].approxTokens : 1;
+    ts.tools.forEach(function (t) {
+      if (t.approxTokens > maxTok) maxTok = t.approxTokens;
+    });
+    var rows = ts.tools
+      .map(function (t) {
+        return (
+          "<tr" +
+          (t.dead ? ' class="tt-dead"' : "") +
+          '><td class="bar-cell"><div class="bar' +
+          (t.dead ? " warn" : "") +
+          '" style="width:' +
+          ((t.approxTokens / maxTok) * 100).toFixed(1) +
+          '%"></div><span>' +
+          esc(t.name) +
+          "</span></td>" +
+          '<td class="num">' +
+          fmtTok(t.approxTokens) +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(t.cumulativeTokens) +
+          "</td>" +
+          '<td class="num">' +
+          toolStatusPill(t) +
+          "</td></tr>"
+        );
+      })
+      .join("");
+    return (
+      '<div class="cards">' +
+      card("Declared", ts.declaredCount) +
+      card("Called", ts.calledCount) +
+      card("Dead", ts.deadCount, ts.deadCount > 0) +
+      card("Dead ≈tok / call", fmtTok(ts.deadTokensPerRequest)) +
+      card("Dead ≈tok total", fmtTok(ts.deadTokensCumulative), ts.deadTokensCumulative > 0) +
+      card("Est. dead cost", fmtCost(ts.deadCostUsd)) +
+      "</div>" +
+      '<h2 class="sec">Toolset ' +
+      esc(ts.toolsetHash.slice(0, 12)) +
+      " <small>(declared on " +
+      ts.requestCount +
+      " API call" +
+      (ts.requestCount === 1 ? "" : "s") +
+      (idx > 0 ? " · variant" : "") +
+      ", ranked by cumulative cost)</small></h2>" +
+      '<div class="tbl-wrap"><table><thead><tr>' +
+      "<th>tool</th>" +
+      '<th class="num">≈tok / call</th>' +
+      '<th class="num">≈tok total</th>' +
+      '<th class="num">calls</th>' +
+      "</tr></thead><tbody>" +
+      rows +
+      "</tbody></table></div>"
+    );
+  }
+
+  function loadToolTax(sessionId) {
+    var host = document.getElementById("tooltax-host");
+    if (!host) return;
+    fetchJSON("/api/session/" + encodeURIComponent(sessionId) + "/tools")
+      .then(function (data) {
+        if (!data.toolsets || !data.toolsets.length) {
+          host.innerHTML =
+            '<div class="empty-pane">No tool declarations captured for this session.</div>';
+          return;
+        }
+        host.innerHTML = data.toolsets.map(sessionToolsetHtml).join("");
+      })
+      .catch(function (err) {
+        host.innerHTML =
+          '<div class="empty-pane">tool tax unavailable — ' +
+          esc(String(err.message || err)) +
+          "</div>";
+      });
+  }
+
+  function renderToolTax() {
+    current = { name: "tooltax" };
+    setView(skeleton({ cards: 6, rows: 10 }));
+    fetchJSON("/api/tooltax")
+      .then(function (d) {
+        if (current.name !== "tooltax") return;
+        drawToolTax(d);
+      })
+      .catch(fail);
+  }
+
+  function drawToolTax(d) {
+    var t = d.totals;
+    if (!t.sessions) {
+      setView(
+        '<div class="empty">No toolsets indexed yet — run <code>tracetap index</code> ' +
+          "(a schema bump reindexes captured logs and records declared tools).</div>",
+      );
+      return;
+    }
+    var cards =
+      card("Sessions", t.sessions) +
+      card("Distinct tools", t.tools) +
+      card("Tool ≈tok paid", fmtTok(t.cumulativeToolTokens)) +
+      card("Dead ≈tok", fmtTok(t.deadTokensCumulative), t.deadTokensCumulative > 0) +
+      card("Dead share", fmtPct(t.deadShare), t.deadShare > 0.5) +
+      card("Est. dead cost", fmtCost(t.deadCostUsd, t.hasUnpriced));
+
+    var maxDead = d.tools.length
+      ? Math.max(d.tools[0].deadTokensCumulative, 1)
+      : 1;
+    var toolRows = d.tools
+      .map(function (tl) {
+        var dead = tl.sessionsCalled === 0;
+        return (
+          "<tr" +
+          (dead ? ' class="tt-dead"' : "") +
+          '><td class="bar-cell"><div class="bar' +
+          (dead ? " warn" : "") +
+          '" style="width:' +
+          ((tl.deadTokensCumulative / maxDead) * 100).toFixed(1) +
+          '%"></div><span>' +
+          esc(tl.name) +
+          "</span></td>" +
+          '<td class="num">' +
+          fmtTok(tl.approxTokens) +
+          "</td>" +
+          '<td class="num">' +
+          tl.sessionsDeclared +
+          "</td>" +
+          '<td class="num">' +
+          tl.sessionsCalled +
+          "</td>" +
+          '<td class="num">' +
+          tl.calls +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(tl.deadTokensCumulative) +
+          "</td>" +
+          '<td class="num">' +
+          fmtCost(tl.deadCostUsd, tl.hasUnpriced) +
+          "</td></tr>"
+        );
+      })
+      .join("");
+
+    var sessionRows = d.sessions
+      .map(function (s) {
+        return (
+          '<tr><td><a href="#session/' +
+          encodeURIComponent(s.sessionId) +
+          '/tools">' +
+          esc(s.sessionId.slice(0, 16)) +
+          "</a></td><td>" +
+          agentPill(s.agent) +
+          " " +
+          esc(s.model) +
+          "</td>" +
+          '<td class="num">' +
+          s.requestCount +
+          "</td>" +
+          '<td class="num">' +
+          s.declaredCount +
+          "</td>" +
+          '<td class="num">' +
+          s.calledCount +
+          "</td>" +
+          '<td class="num">' +
+          s.deadCount +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(s.deadTokensPerRequest) +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(s.deadTokensCumulative) +
+          "</td>" +
+          '<td class="num">' +
+          fmtCost(s.deadCostUsd) +
+          "</td></tr>"
+        );
+      })
+      .join("");
+
+    setView(
+      "<h1>Dead tool tax</h1>" +
+        '<p class="dim">Tool definitions are resent on every API call. A declared tool that is ' +
+        "never invoked still bills its schema each time — priced here at each model's " +
+        "cache-read rate.</p>" +
+        '<div class="cards">' +
+        cards +
+        "</div>" +
+        '<h2 class="sec">Tools <small>(' +
+        d.tools.length +
+        " distinct, ranked by dead ≈tokens)</small></h2>" +
+        '<div class="tbl-wrap"><table><thead><tr>' +
+        "<th>tool</th>" +
+        '<th class="num">≈tok / call</th>' +
+        '<th class="num">declared in</th>' +
+        '<th class="num">called in</th>' +
+        '<th class="num">calls</th>' +
+        '<th class="num">dead ≈tok</th>' +
+        '<th class="num">est. cost</th>' +
+        "</tr></thead><tbody>" +
+        toolRows +
+        "</tbody></table></div>" +
+        '<h2 class="sec">Sessions <small>(ranked by dead ≈tokens)</small></h2>' +
+        '<div class="tbl-wrap"><table><thead><tr>' +
+        "<th>session</th><th>agent · model</th>" +
+        '<th class="num">calls</th>' +
+        '<th class="num">declared</th>' +
+        '<th class="num">called</th>' +
+        '<th class="num">dead</th>' +
+        '<th class="num">dead ≈tok/call</th>' +
+        '<th class="num">dead ≈tok</th>' +
+        '<th class="num">est. cost</th>' +
+        "</tr></thead><tbody>" +
+        sessionRows +
+        "</tbody></table></div>",
+    );
+  }
+
   // --------------------------------------------------------------- prompts
   function renderPrompts() {
     current = { name: "prompts" };
@@ -2875,7 +3116,7 @@
   }
 
   // ------------------------------------------------- keyboard + palette
-  var TABS = ["sessions", "usage", "analytics", "prompts", "audit"];
+  var TABS = ["sessions", "usage", "analytics", "prompts", "audit", "tooltax"];
 
   function isTyping(e) {
     var t = e.target;
@@ -2942,7 +3183,7 @@
     else if (e.key === "Enter" && focusedRow()) {
       e.preventDefault();
       activateCursor();
-    } else if (e.key >= "1" && e.key <= "5")
+    } else if (e.key >= "1" && e.key <= "6")
       location.hash = "#" + TABS[Number(e.key) - 1];
     else if (e.key === "?") toggleHelp();
     else if (e.key === "Escape") {
@@ -3161,7 +3402,7 @@
       ["/", "focus search"],
       ["j / k", "move row cursor"],
       ["↵", "open focused row"],
-      ["1–5", "switch view"],
+      ["1–6", "switch view"],
       ["esc", "back / close"],
       ["?", "this overlay"],
     ];
