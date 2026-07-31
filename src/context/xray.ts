@@ -1,6 +1,7 @@
 import * as crypto from "crypto";
 import type { RawPair } from "../types";
 import { XRAY_BUCKETS, type XrayBucketId } from "./xray-buckets";
+import { toolName } from "./tooltax";
 
 export interface XraySegment {
   bucket: XrayBucketId;
@@ -150,11 +151,15 @@ export function segmentsFromRequestBody(body: any): XraySegment[] {
     pushSeg(segs, "system", body.instructions, "instructions");
   }
 
-  // Tools
+  // Tools — one segment per declared tool, so per-tool cost is visible in the
+  // segment list and the toolset registry sizes from the same numbers.
   const tools = body.tools ?? body.tools_list;
   if (Array.isArray(tools) && tools.length) {
-    const text = JSON.stringify(tools);
-    pushSeg(segs, "tools", text, `tools×${tools.length}`);
+    for (const tool of tools) {
+      const text = JSON.stringify(tool) ?? "";
+      if (!text) continue;
+      pushSeg(segs, "tools", text, `tool:${toolName(tool) || "(unnamed)"}`);
+    }
   }
 
   // Messages (Anthropic / chat)
