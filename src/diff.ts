@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import { RawPair } from "./types";
 import { buildTrajectories, Trajectory, TrajectoryMetrics } from "./trajectory/index";
+import { toolName, normalizeToolDefinition } from "./context/tooltax";
 
 /**
  * Structural diff across two captured runs.
@@ -197,24 +198,6 @@ function extractSystemPrompt(pair: RawPair): string {
     }
   }
   return "";
-}
-
-function toolName(tool: any): string {
-  if (!tool || typeof tool !== "object") return "";
-  if (typeof tool.name === "string") return tool.name;
-  if (tool.function && typeof tool.function.name === "string") return tool.function.name;
-  return "";
-}
-
-/** A stable, comparable tool definition: drop the volatile `cache_control` key. */
-function normalizeToolDefinition(tool: any): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  if (!tool || typeof tool !== "object") return out;
-  for (const [k, v] of Object.entries(tool)) {
-    if (k === "cache_control") continue;
-    out[k] = v;
-  }
-  return out;
 }
 
 function extractTools(pair: RawPair): ToolDefinition[] {

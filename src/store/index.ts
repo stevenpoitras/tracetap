@@ -19,6 +19,8 @@ import type { ContextXray } from "../context/xray";
 import type { AuditFileScan } from "../audit";
 import { buildContextTimeline } from "../context/timeline";
 import type { ContextMetrics, ContextTimeline } from "../context/timeline";
+import { toolsetFromBody } from "../context/tooltax";
+import type { ToolTokenEntry } from "../context/tooltax";
 
 /**
  * Local cross-session trace store + search.
@@ -269,6 +271,23 @@ export interface PromptDetail extends PromptSummary {
   sessionIds: string[];
 }
 
+/** One (session, toolset) pairing: which declared set a session paid for, how often. */
+export interface ToolsetUsageRow {
+  sessionId: string;
+  toolsetHash: string;
+  /** Requests in this session that declared this exact set. */
+  requestCount: number;
+  agent: string;
+  model: string;
+  projectCwd: string;
+  /** Calls made by responses to THESE requests (scoped per variant, not session-wide). */
+  toolHistogram: Record<string, number>;
+  toolCount: number;
+  totalApproxTokens: number;
+  /** Per-tool sizes in wire order. */
+  perTool: ToolTokenEntry[];
+}
+
 /** Session columns the dashboard is allowed to sort by (guards against SQL injection). */
 const SORTABLE_COLUMNS = new Set([
   "agent",
@@ -282,7 +301,7 @@ const SORTABLE_COLUMNS = new Set([
   "cost_usd",
 ]);
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 // ---------------------------------------------------------------------------
 // Paths / discovery
@@ -478,6 +497,7 @@ export class Store {
         DROP TABLE IF EXISTS requests;
         DROP TABLE IF EXISTS usage_events;
         DROP TABLE IF EXISTS prompts;
+        DROP TABLE IF EXISTS toolsets;
         DROP TABLE IF EXISTS hooks;
         DROP TABLE IF EXISTS hook_files;
         DROP TABLE IF EXISTS audit_scans;
@@ -549,7 +569,10 @@ export class Store {
         -- request body in the session; see sessionContextTimeline.
         ctx_total_chars  INTEGER,
         ctx_total_tokens INTEGER,
-        ctx_buckets_json TEXT
+        ctx_buckets_json TEXT,
+        -- Content address of the declared tool set (toolsets.toolset_hash);
+        -- NULL when the body declares no tools.
+        toolset_hash     TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id, seq);
       CREATE INDEX IF NOT EXISTS idx_requests_ts      ON requests(ts);
@@ -578,6 +601,19 @@ export class Store {
         content     TEXT NOT NULL,
         first_seen  REAL,
         last_seen   REAL
+      );
+      -- Content-addressed registry of declared tool sets (mirrors prompts).
+      -- Tool declarations are near-identical across a session's requests, so one
+      -- row per DISTINCT set keeps hundreds of per-request copies down to ~KBs.
+      CREATE TABLE IF NOT EXISTS toolsets (
+        toolset_hash TEXT PRIMARY KEY,
+        agent        TEXT,
+        tool_count   INTEGER NOT NULL,
+        total_chars  INTEGER NOT NULL,
+        total_tokens INTEGER NOT NULL,
+        per_tool_json TEXT NOT NULL,
+        first_seen   REAL,
+        last_seen    REAL
       );
       -- One cached secret-scan per (log, content, detector mode). Scanning is
       -- linear in log bytes and wire logs run to hundreds of MB, so a file whose
@@ -784,13 +820,28 @@ export class Store {
          prompt_tokens, completion_tokens, cache_read, cache_creation,
          reasoning_tokens, stop_reason, errored, transcript_items,
          prompt_hash, agent_step_index, source_path,
-         ctx_total_chars, ctx_total_tokens, ctx_buckets_json
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ctx_total_chars, ctx_total_tokens, ctx_buckets_json, toolset_hash
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const upsertPrompt = this.db.prepare(
       `INSERT INTO prompts(prompt_hash, agent, content, first_seen, last_seen)
        VALUES (@hash, @agent, @content, @ts, @ts)
        ON CONFLICT(prompt_hash) DO UPDATE SET
+         first_seen = CASE
+           WHEN excluded.first_seen IS NULL THEN first_seen
+           WHEN first_seen IS NULL THEN excluded.first_seen
+           ELSE MIN(first_seen, excluded.first_seen) END,
+         last_seen = CASE
+           WHEN excluded.last_seen IS NULL THEN last_seen
+           WHEN last_seen IS NULL THEN excluded.last_seen
+           ELSE MAX(last_seen, excluded.last_seen) END`,
+    );
+    const upsertToolset = this.db.prepare(
+      `INSERT INTO toolsets(
+         toolset_hash, agent, tool_count, total_chars, total_tokens,
+         per_tool_json, first_seen, last_seen
+       ) VALUES (@hash, @agent, @toolCount, @totalChars, @totalTokens, @perTool, @ts, @ts)
+       ON CONFLICT(toolset_hash) DO UPDATE SET
          first_seen = CASE
            WHEN excluded.first_seen IS NULL THEN first_seen
            WHEN first_seen IS NULL THEN excluded.first_seen
@@ -839,6 +890,18 @@ export class Store {
       // load re-read and re-parsed every body in the session. A body that will
       // not segment is stored as NULL, and the read path falls back for it.
       const ctx = contextMetricsForPair(seq, pair, promptHash);
+      const toolset = toolsetForPair(pair);
+      if (toolset) {
+        upsertToolset.run({
+          hash: toolset.hash,
+          agent: agentName,
+          toolCount: toolset.tools.length,
+          totalChars: toolset.totalChars,
+          totalTokens: toolset.totalApproxTokens,
+          perTool: JSON.stringify(toolset.tools),
+          ts: reqTs > 0 ? reqTs : null,
+        });
+      }
       ins.run(
         group.sessionId,
         seq,
@@ -861,6 +924,7 @@ export class Store {
         ctx?.totalChars ?? null,
         ctx?.totalApproxTokens ?? null,
         ctx ? JSON.stringify(ctx.buckets) : null,
+        toolset?.hash ?? null,
       );
     });
   }
@@ -1371,6 +1435,77 @@ export class Store {
     };
   }
 
+  /**
+   * Toolset usage joined per (session, toolset): the "declared" half of the
+   * dead-tool ledger. The "called" half rides along as a histogram of the tool
+   * calls made by responses to THESE requests — scoped per toolset variant, not
+   * session-wide, so a session that changes toolsets mid-flight doesn't
+   * attribute one variant's calls to another.
+   */
+  listToolsetUsage(sessionId?: string): ToolsetUsageRow[] {
+    const whereSql = sessionId ? "AND r.session_id = @sessionId" : "";
+    const params = sessionId ? { sessionId } : {};
+    const rows = this.db
+      .prepare(
+        `SELECT
+           r.session_id            AS sessionId,
+           r.toolset_hash          AS toolsetHash,
+           COUNT(*)                AS requestCount,
+           s.agent                 AS agent,
+           s.model                 AS model,
+           s.project_cwd           AS projectCwd,
+           t.tool_count            AS toolCount,
+           t.total_tokens          AS totalApproxTokens,
+           t.per_tool_json         AS perToolJson
+         FROM requests r
+         JOIN sessions s ON s.session_id = r.session_id
+         JOIN toolsets t ON t.toolset_hash = r.toolset_hash
+         WHERE r.toolset_hash IS NOT NULL ${whereSql}
+         GROUP BY r.session_id, r.toolset_hash
+         ORDER BY requestCount DESC`,
+      )
+      .all(params) as any[];
+
+    // Each request row remembers which agent step its response produced;
+    // that step's space-joined tool_name column holds the calls made while
+    // this request's toolset was the one on the wire.
+    const callRows = this.db
+      .prepare(
+        `SELECT
+           r.session_id   AS sessionId,
+           r.toolset_hash AS toolsetHash,
+           f.tool_name    AS toolNames
+         FROM requests r
+         JOIN steps_fts f
+           ON f.session_id = r.session_id AND f.step_index = r.agent_step_index
+         WHERE r.toolset_hash IS NOT NULL AND r.agent_step_index IS NOT NULL ${whereSql}`,
+      )
+      .all(params) as any[];
+    const histByKey = new Map<string, Record<string, number>>();
+    for (const c of callRows) {
+      const key = `${c.sessionId}\0${c.toolsetHash}`;
+      let h = histByKey.get(key);
+      if (!h) histByKey.set(key, (h = {}));
+      for (const name of String(c.toolNames ?? "").split(/\s+/)) {
+        if (!name) continue;
+        h[name] = (h[name] ?? 0) + 1;
+      }
+    }
+
+    return rows.map((r) => ({
+      sessionId: String(r.sessionId),
+      toolsetHash: String(r.toolsetHash),
+      requestCount: Number(r.requestCount ?? 0),
+      agent: String(r.agent ?? ""),
+      model: String(r.model ?? ""),
+      projectCwd: String(r.projectCwd ?? ""),
+      toolHistogram: histByKey.get(`${r.sessionId}\0${r.toolsetHash}`) ?? {},
+      toolCount: Number(r.toolCount ?? 0),
+      totalApproxTokens: Number(r.totalApproxTokens ?? 0),
+      perTool: parseJsonArray(r.perToolJson),
+    }));
+  }
+
   // -- hooks sidecar ---------------------------------------------------------
 
   /**
@@ -1793,6 +1928,24 @@ function hookRowFromDb(r: any): HookRow {
 
 function sha256Hex(text: string): string {
   return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+/** Toolset declared by one pair, or null. Never throws — see contextMetricsForPair. */
+function toolsetForPair(pair: RawPair) {
+  try {
+    return toolsetFromBody(pair?.request?.body);
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonArray(text: unknown): ToolTokenEntry[] {
+  try {
+    const v = JSON.parse(String(text ?? "[]"));
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
 }
 
 function promptSummaryFromRow(r: any): PromptSummary {

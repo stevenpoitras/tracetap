@@ -458,6 +458,13 @@ td.dim {
   background: rgba(127, 143, 255, 0.16);
   border-radius: 2px;
 }
+/* Dead-tool rows: the bar shifts to the warn colour, the label dims. */
+.bar-cell .bar.warn {
+  background: rgba(251, 191, 36, 0.13);
+}
+tr.tt-dead .bar-cell span {
+  color: var(--mid);
+}
 .bar-cell span {
   position: relative;
 }
@@ -500,6 +507,11 @@ td.dim {
   color: var(--green);
   border-color: rgba(74, 222, 128, 0.4);
   background: rgba(74, 222, 128, 0.07);
+}
+.pill.warn {
+  color: var(--amber);
+  border-color: rgba(251, 191, 36, 0.4);
+  background: rgba(251, 191, 36, 0.07);
 }
 .hash {
   color: var(--dim);
