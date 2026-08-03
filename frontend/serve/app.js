@@ -1172,6 +1172,7 @@
     hooksForPane = hooks;
     var flow = data.flow || { nodes: [], edges: [] };
     var siblings = data.siblings || [];
+    stepsForPane = steps;
     var compactSeqs = {};
     var compactionList = data.compactions || [];
     compactionList.forEach(function (c) {
@@ -1264,6 +1265,14 @@
         ? ' <a class="head-link" href="#prompt/' +
           esc(reqs[0].promptHash) +
           '">system prompt ↗</a>'
+        : "") +
+      // The ASK. It was in the transcript all along, buried some way down the
+      // steps list behind system-reminder scaffolding, so the one thing you
+      // most want when opening a session — what was this run even asked to
+      // do — took the most scrolling to find.
+      (initialUserStep(steps) != null
+        ? ' <button type="button" class="head-link" data-inspect="ask:0">' +
+          "user prompt</button>"
         : "") +
       "</span></div>" +
       '<div class="cards">' +
@@ -1368,6 +1377,11 @@
       ? pane.querySelector('[data-inspect="' + cssEscape(id) + '"]')
       : null;
     if (el) return; // still in scope — nothing to do
+    // Session-scoped selections (the ask, rendered in the header) belong to no
+    // pane and are valid in all of them. Only evict something that lives in a
+    // DIFFERENT pane, not something that lives outside panes entirely.
+    var anywhere = document.querySelector('[data-inspect="' + cssEscape(id) + '"]');
+    if (anywhere && !anywhere.closest(".session-pane")) return;
     Inspector.clear();
     var remembered = paneCursor[name];
     if (!remembered || !pane) return;
@@ -1429,6 +1443,7 @@
         else if (type === "ctp") inspectTimelinePoint(id);
         else if (type === "tool") inspectTool(id);
         else if (type === "prov") inspectProvider(id);
+        else if (type === "ask") inspectAsk();
       }
       panesEl.addEventListener("click", function (e) {
         var el = e.target.closest("[data-inspect]");
@@ -1623,6 +1638,16 @@
         kind: g.calls ? "provider" : "dead provider",
         title: providerLabel(g),
         body: lines.join("\n"),
+      });
+    }
+
+    function inspectAsk() {
+      var st = initialUserStep(stepsForPane);
+      if (!st) return;
+      Inspector.show("ask:0", {
+        kind: "user prompt",
+        title: "what this session was asked to do",
+        body: String(st.message || ""),
       });
     }
 
@@ -2012,6 +2037,25 @@
    * (workflow-orchestrated agents are marked but have no parent record), so
    * the honest presentation is "subagent, unnamed", not silence.
    */
+  /**
+   * The first genuinely user-authored step.
+   *
+   * Claude Code prepends `<system-reminder>` steps carrying CLAUDE.md, the
+   * skills roster and environment context, so step 0 is scaffolding on every
+   * session. Taking it literally would show the harness talking to itself
+   * rather than the ask.
+   */
+  function initialUserStep(steps) {
+    for (var i = 0; i < (steps || []).length; i++) {
+      var st = steps[i];
+      if (st.role !== "user") continue;
+      var m = String(st.message || "");
+      if (m.trim().indexOf("<system-reminder>") === 0) continue;
+      return st;
+    }
+    return null;
+  }
+
   function renderConversations(reqs) {
     var groups = {};
     var order = [];
@@ -2132,6 +2176,21 @@
       "</tbody></table></div>"
     );
   }
+
+  // Session-header inspect targets. The pane listener is mounted on
+  // `.session-panes`, so anything rendered in the header — the ask, and
+  // whatever joins it later — would otherwise be inert.
+  document.addEventListener("click", function (e) {
+    var el = e.target.closest && e.target.closest('[data-inspect^="ask:"]');
+    if (!el) return;
+    var st = initialUserStep(stepsForPane);
+    if (!st) return;
+    Inspector.show("ask:0", {
+      kind: "user prompt",
+      title: "what this session was asked to do",
+      body: String(st.message || ""),
+    });
+  });
 
   document.addEventListener("click", function (e) {
     var tr = e.target.closest && e.target.closest("tr[data-goto]");
@@ -2376,6 +2435,7 @@
   var xrayForPane = null;
   var timelineForPane = null;
   var toolTaxForPane = null;
+  var stepsForPane = [];
 
   function loadXray(sessionId, seq) {
     var token = ++xrayToken;
