@@ -1608,6 +1608,31 @@ export class Store {
    * Hooks for a wire session: exact `session_id` match OR time-overlap with the
    * session window (±10 min slack). Wire conversation keys rarely equal Claude's
    * hook session_id, so time correlation is the practical bridge.
+   *
+   * The time arm is deliberately narrow, because on its own it is not a bridge
+   * but a firehose. Measured on a real index before this was constrained: 81%
+   * of hooks attached to no session while 46% of the attributions made were
+   * duplicates, three sessions were served byte-identical 86-hook lists, and a
+   * session with one request and four steps was served 927 hooks — 99.3% of
+   * them fired by a different project entirely.
+   *
+   * Two guards fix that without a schema change:
+   *
+   *  - Match `cwd`. A hook records the directory it fired in; a session records
+   *    its project. Hooks from another repo are never this session's. A hook
+   *    with NO recorded cwd still matches: absence is not evidence of being
+   *    foreign, and events captured before cwd was recorded would otherwise
+   *    vanish from panes that show them correctly today.
+   *  - Require a real window. `endedAt <= startedAt` means the session's span
+   *    is a single instant (it happens whenever no request produced a step),
+   *    and ±10 min around an instant scoops up every concurrent session on the
+   *    machine. With no duration to overlap, time tells us nothing, so we say
+   *    nothing rather than guess.
+   *
+   * The exact-id arm is unaffected and remains the only trustworthy one. It
+   * stays near-empty until `x-claude-code-session-id` — which is on every
+   * request and equals `hooks.session_id` byte-for-byte — is persisted on the
+   * wire side; that is the real fix, and it needs a schema bump.
    */
   listHooksForSession(sessionId: string): HookRow[] {
     const session = this.getSession(sessionId);
@@ -1621,20 +1646,25 @@ export class Store {
       .all(sessionId) as any[];
 
     let byTime: any[] = [];
-    if (session) {
+    const hasRealWindow =
+      !!session && session.startedAt > 0 && session.endedAt > session.startedAt;
+    if (session && hasRealWindow) {
       const slack = 600; // 10 minutes — long tool calls can lag the wire window
-      const start = session.startedAt > 0 ? session.startedAt - slack : 0;
-      const end = session.endedAt > 0 ? session.endedAt + slack : Number.MAX_SAFE_INTEGER;
+      const start = session.startedAt - slack;
+      const end = session.endedAt + slack;
       byTime = this.db
         .prepare(
           `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
                   stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
                   payload_json, source_path
            FROM hooks
-           WHERE ts >= ? AND ts <= ?
+           WHERE ts >= @start AND ts <= @end
+             AND (@cwd = ''
+                  OR json_extract(stdin_preview, '$.cwd') IS NULL
+                  OR json_extract(stdin_preview, '$.cwd') = @cwd)
            ORDER BY ts, id`,
         )
-        .all(start, end) as any[];
+        .all({ start, end, cwd: session.projectCwd || "" }) as any[];
     }
 
     const seen = new Set<number>();

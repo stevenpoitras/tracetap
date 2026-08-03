@@ -28,6 +28,13 @@ export class AnthropicAdapter implements AgentAdapter {
     // Responses shape (which uses input[]/instructions).
     if (Array.isArray((body as any).input)) return false;
     if (typeof (body as any).instructions === "string") return false;
+    // `/v1/messages/count_tokens` posts the same messages[] shape but is a
+    // sizing probe, not a model call: no completion, no usage, no cost. Indexed
+    // as a turn it manufactures phantom sessions — one real trace contributed
+    // 15 of these as a single session with 0 turns, 0 tokens and $0, and left a
+    // matching hole in usage_events. Match on the URL, since the body cannot
+    // tell the two apart.
+    if (/\/messages\/count_tokens/.test(String(pair?.request?.url ?? ""))) return false;
     if (Array.isArray((body as any).messages)) return true;
     return false;
   }
