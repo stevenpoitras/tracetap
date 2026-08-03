@@ -1309,6 +1309,29 @@ h2.sec small {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
+/* A 1px outline vanishes on a 12px-wide gradient bar, so the selected call was
+   effectively unmarked — you could read the panel but not see which bar it
+   described. Give the bar a filled state instead of an edge. */
+.ct-bar.selected {
+  outline: none;
+  background: linear-gradient(180deg, var(--accent), rgba(127, 143, 255, 0.35));
+  box-shadow: 0 0 0 1px var(--accent), 0 0 10px rgba(127, 143, 255, 0.5);
+  z-index: 3;
+}
+.ct-bar.selected .ct-seq {
+  color: var(--bright);
+}
+.inspector-back {
+  background: transparent;
+  border: 0;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 6px 0 0;
+}
+.inspector-back:hover {
+  color: var(--accent);
+}
 
 /* Below the split point the inspector becomes a bottom sheet, and stays out of
    the way entirely until something is selected. */

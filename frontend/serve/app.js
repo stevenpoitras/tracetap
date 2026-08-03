@@ -30,6 +30,17 @@
   var Inspector = (function () {
     var current = null;
     var token = 0;
+    /**
+     * Drill-downs only. Selecting a PEER (clicking another row, arrowing to the
+     * next one) replaces the top of the stack; following an action that changes
+     * what you are looking at pushes. Without that distinction, arrowing down a
+     * list of 238 tools would build a 238-deep history nobody wants to unwind.
+     */
+    var stack = [];
+    // Set by an action that navigates: the row it lands on becomes a
+    // drill-down (so `back` returns here) without teaching every caller of
+    // show() about the stack.
+    var pushNext = false;
 
     function host() {
       return document.getElementById("inspector");
@@ -38,6 +49,7 @@
     function clear() {
       var el = host();
       current = null;
+      stack.length = 0;
       token += 1;
       if (el) {
         el.innerHTML = INSPECTOR_EMPTY;
@@ -56,8 +68,36 @@
      *   `load` is an optional promise resolving to the full body; a stale
      *   response is discarded by comparing the token captured at show() time,
      *   which is what stops a slow fetch overwriting a newer selection.
+     * @param opts {push} — true when this is a drill-down that `back` should
+     *   return from; omitted for ordinary peer selection.
      */
-    function show(sourceId, spec) {
+    function show(sourceId, spec, opts) {
+      var doPush = pushNext || (opts && opts.push);
+      pushNext = false;
+      var frame = { id: sourceId, spec: spec };
+      if (doPush && stack.length) stack.push(frame);
+      else stack[stack.length ? stack.length - 1 : 0] = frame;
+      return render(sourceId, spec);
+    }
+
+    /** Make the NEXT show() a drill-down. Cleared whether or not it fires. */
+    function pushOnce() {
+      pushNext = true;
+    }
+    function cancelPush() {
+      pushNext = false;
+    }
+
+    /** Pop one drill-down. Returns false when there is nothing to pop. */
+    function back() {
+      if (stack.length < 2) return false;
+      stack.pop();
+      var top = stack[stack.length - 1];
+      render(top.id, top.spec);
+      return true;
+    }
+
+    function render(sourceId, spec) {
       var el = host();
       if (!el) return;
       current = sourceId;
@@ -65,6 +105,9 @@
 
       var head =
         '<div class="inspector-head">' +
+        (stack.length > 1
+          ? '<button type="button" class="inspector-back" title="Back (Esc)" aria-label="Back">\u2190</button>'
+          : "") +
         (spec.kind ? '<span class="pill">' + esc(spec.kind) + "</span> " : "") +
         '<span class="inspector-title">' +
         esc(spec.title || "") +
@@ -97,6 +140,8 @@
       el.classList.add("open");
 
       el.querySelector(".inspector-close").addEventListener("click", clear);
+      var backBtn = el.querySelector(".inspector-back");
+      if (backBtn) backBtn.addEventListener("click", back);
       (spec.actions || []).forEach(function (a, i) {
         var b = el.querySelector('[data-act="' + i + '"]');
         if (b) b.addEventListener("click", a.onClick);
@@ -133,7 +178,19 @@
       }
     }
 
-    return { show: show, clear: clear, selected: function () { return current; } };
+    return {
+      show: show,
+      pushOnce: pushOnce,
+      cancelPush: cancelPush,
+      back: back,
+      clear: clear,
+      depth: function () {
+        return stack.length;
+      },
+      selected: function () {
+        return current;
+      },
+    };
   })();
 
   /** Minimal attribute-selector escaping — ids here are ascii but may hold ':' and '/'. */
@@ -711,7 +768,9 @@
           (linked ? " click" : "") +
           '" data-seq="' +
           r.seq +
-          '"' +
+          '" data-inspect="ctp:' +
+          r.seq +
+          '" tabindex="0"' +
           (linked ? ' data-step="' + r.agentStepIndex + '"' : "") +
           ">" +
           '<div class="wf-label">' +
@@ -1351,6 +1410,7 @@
         }
       }
       if (!p) return;
+      selectedSeq = p.seq;
       var lines = [
         "context read   " + fmtTok(p.contextTokens) + " tokens",
         "  cache read   " + fmtTok(p.cacheRead),
@@ -1554,8 +1614,21 @@
         actions.push({
           label: "Open Context X-Ray for API #" + seq,
           onClick: function () {
+            // Follow the navigation. Leaving the panel on the flow node meant
+            // the button was still there, still offering to do the thing it
+            // had just done — a dead end that looked like a no-op. The
+            // destination is pushed, so Escape / ← returns to this node.
             activatePane("xray");
             loadXray(sessionId, Number(seq));
+            selectedSeq = Number(seq);
+            Inspector.pushOnce();
+            setTimeout(function () {
+              var bar = document.querySelector(
+                '[data-inspect="ctp:' + seq + '"]',
+              );
+              if (bar) selectTarget(bar);
+              else Inspector.cancelPush();
+            }, 0);
           },
         });
       }
@@ -1564,6 +1637,12 @@
           label: "Open Hooks pane",
           onClick: function () {
             activatePane("hooks");
+            Inspector.pushOnce();
+            setTimeout(function () {
+              var list = paneTargets();
+              if (list.length) selectTarget(list[0]);
+              else Inspector.cancelPush();
+            }, 0);
           },
         });
       }
@@ -3739,6 +3818,102 @@
     pane.innerHTML = renderHooksPane(hooksForPane);
   });
 
+  // -- session keyboard model ---------------------------------------------
+  //
+  // Two axes, which is the whole idea: UP/DOWN moves within the list you are
+  // looking at, LEFT/RIGHT moves the same selection to a different view of it.
+  // A turn stays selected as you cross panes, so "what did the context look
+  // like on this call" and "what did the wire do on this call" are one
+  // keystroke apart instead of a click, a scroll and a hunt.
+  var SESSION_PANES = ["flow", "hooks", "xray", "tools", "wire"];
+  var selectedSeq = null;
+  // Where you were in each pane. Returning a pane to its first row every time
+  // makes LEFT/RIGHT feel like it discards your place, which defeats the point
+  // of moving between views of the same work.
+  var paneCursor = {};
+
+  /** Inspectable rows in the active pane, in visual order, excluding hidden. */
+  function paneTargets() {
+    var pane = document.querySelector(".session-pane.active");
+    if (!pane) return [];
+    return Array.prototype.slice
+      .call(pane.querySelectorAll("[data-inspect]"))
+      .filter(function (el) {
+        // Hook chips live inside collapsed <details>; arrowing onto something
+        // the user cannot see reads as the keys being broken.
+        return el.offsetParent !== null;
+      });
+  }
+
+  function selectTarget(el) {
+    if (!el) return;
+    if (current.pane) paneCursor[current.pane] = el.getAttribute("data-inspect");
+    el.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // Re-use the delegated [data-inspect] resolver rather than a second
+    // dispatch table — one place decides what a row means.
+    el.click();
+  }
+
+  /** After switching panes, land on the same turn if this pane has it. */
+  function reselectInPane() {
+    var list = paneTargets();
+    if (!list.length) return;
+    // A turn wins over a remembered cursor: if this pane can show the call you
+    // were just looking at, that is what "the same thing, another view" means.
+    var wanted = selectedSeq != null ? "ctp:" + selectedSeq : null;
+    var remembered = paneCursor[current.pane];
+    for (var pass = 0; pass < 2; pass++) {
+      var want = pass === 0 ? wanted : remembered;
+      if (!want) continue;
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].getAttribute("data-inspect") === want) {
+          selectTarget(list[i]);
+          return;
+        }
+      }
+    }
+    selectTarget(list[0]);
+  }
+
+  function sessionArrowNav(e) {
+    var k = e.key;
+    var vertical = k === "ArrowDown" || k === "ArrowUp";
+    var horizontal = k === "ArrowRight" || k === "ArrowLeft";
+    if (!vertical && !horizontal) return false;
+
+    if (horizontal) {
+      var cur = SESSION_PANES.indexOf(current.pane || "flow");
+      if (cur < 0) cur = 0;
+      var step = k === "ArrowRight" ? 1 : SESSION_PANES.length - 1;
+      e.preventDefault();
+      activatePane(SESSION_PANES[(cur + step) % SESSION_PANES.length]);
+      // Panes render lazily; give the new one a frame before selecting in it.
+      setTimeout(reselectInPane, 0);
+      return true;
+    }
+
+    var list = paneTargets();
+    if (!list.length) return false;
+    e.preventDefault();
+    var curId = Inspector.selected();
+    var i = -1;
+    for (var n = 0; n < list.length; n++) {
+      if (list[n].getAttribute("data-inspect") === curId) {
+        i = n;
+        break;
+      }
+    }
+    var d = k === "ArrowDown" ? 1 : -1;
+    var next =
+      i < 0
+        ? d > 0
+          ? 0
+          : list.length - 1
+        : Math.min(list.length - 1, Math.max(0, i + d));
+    selectTarget(list[next]);
+    return true;
+  }
+
   document.addEventListener("keydown", function (e) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
@@ -3751,6 +3926,7 @@
       if (e.key === "Escape") e.target.blur();
       return;
     }
+    if (current.name === "session" && sessionArrowNav(e)) return;
     if (e.key === "/") {
       e.preventDefault();
       focusSearch();
@@ -3763,9 +3939,11 @@
       location.hash = "#" + TABS[Number(e.key) - 1];
     else if (e.key === "?") toggleHelp();
     else if (e.key === "Escape") {
-      // Dismiss the inspector before leaving the page. Escape meaning "close
-      // what I just opened" has to win over Escape meaning "go back", or there
-      // is no way to close a selection without losing your place.
+      // Escape unwinds one level at a time: a drill-down first, then the
+      // inspector, then the page. "Close what I just opened" has to win over
+      // "go back", or there is no way to dismiss a selection without losing
+      // your place — and a drill-down is something you just opened too.
+      if (Inspector.back()) return;
       if (Inspector.selected()) {
         Inspector.clear();
         return;
@@ -3986,6 +4164,10 @@
       ["j / k", "move row cursor"],
       ["↵", "open focused row"],
       ["1–6", "switch view"],
+      // Two axes inside a session: down the list you are in, across the views
+      // of the thing you have selected.
+      ["↑ / ↓", "in a session: previous / next row"],
+      ["← / →", "in a session: same turn, previous / next pane"],
       ["esc", "back / close"],
       ["?", "this overlay"],
     ];
