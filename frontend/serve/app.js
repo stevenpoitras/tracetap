@@ -153,13 +153,18 @@
           n.classList.remove("selected");
           n.removeAttribute("aria-current");
         });
-      var src = document.querySelector(
-        '[data-inspect="' + cssEscape(sourceId) + '"]',
-      );
-      if (src) {
-        src.classList.add("selected");
-        src.setAttribute("aria-current", "true");
-      }
+      // ALL matches, not the first. A turn id (`ctp:<seq>`) deliberately
+      // appears in three views — the X-Ray timeline bar, the Wire waterfall
+      // row and the turn spine — because they are the same turn. Marking only
+      // `querySelector`'s first hit highlighted whichever happened to come
+      // earlier in the DOM, which was routinely in a pane the user was not
+      // looking at, and left the visible one unmarked.
+      document
+        .querySelectorAll('[data-inspect="' + cssEscape(sourceId) + '"]')
+        .forEach(function (src) {
+          src.classList.add("selected");
+          src.setAttribute("aria-current", "true");
+        });
 
       if (typeof spec.load === "function") {
         spec.load()
@@ -657,6 +662,141 @@
         })
         .join("") +
       "</nav>"
+    );
+  }
+
+
+  // ------------------------------------------------------- turn spine
+  /**
+   * One row per turn, expandable into everything that happened during it.
+   *
+   * The Wire pane showed three parallel views of the same 18 calls — two
+   * summary charts and a waterfall — while the hooks that fired during those
+   * calls lived in another pane and the compactions in a third. Answering
+   * "what happened on turn 13, and what caused it" meant reading four places
+   * and correlating by eye on a `seq` that is not even time-ordered.
+   *
+   * A turn is the unit of work, so it is the row. Its events hang under it.
+   */
+  function buildTurns(reqs, hooks, steps, compactSeqs) {
+    var byStep = {};
+    (steps || []).forEach(function (st) {
+      byStep[st.stepIndex] = st;
+    });
+    return (reqs || []).map(function (r, i) {
+      var next = reqs[i + 1];
+      // Hooks are timestamped, not seq-tagged, so a turn owns the hooks that
+      // fired between its start and the next turn's. Imperfect where turns
+      // interleave across agents — which is why the turn carries its agent
+      // label, so a mis-attributed hook is at least visible as such.
+      var evs = [];
+      var st = r.agentStepIndex != null ? byStep[r.agentStepIndex] : null;
+      if (st && st.toolName) {
+        evs.push({
+          kind: "tool",
+          label: st.toolName,
+          detail: String(st.toolInput || ""),
+          n: (String(st.observation || "").length || 0),
+        });
+      }
+      (hooks || []).forEach(function (h) {
+        if (h.ts < r.ts) return;
+        if (next && h.ts >= next.ts) return;
+        evs.push({
+          kind: "hook",
+          label: (h.event || "hook") + " · " + (h.hookName || ""),
+          detail: JSON.stringify(h.stdoutPreview || {}, null, 2),
+          n: h.durationMs,
+        });
+      });
+      var c = compactSeqs[r.seq];
+      if (c) {
+        evs.push({
+          kind: "compaction",
+          label: "compaction " + c.from + " → " + c.to + " items",
+          detail: "",
+          n: c.from - c.to,
+        });
+      }
+      return {
+        seq: r.seq,
+        req: r,
+        agent: r.isSubagent ? r.agentLabel || "subagent (unnamed)" : "main thread",
+        events: evs,
+      };
+    });
+  }
+
+  function turnSpineHtml(turns) {
+    if (!turns.length) return '<div class="dim">No wire data for this session.</div>';
+    var maxCtx = 1;
+    turns.forEach(function (t) {
+      var c = (t.req.promptTokens || 0) + (t.req.cacheRead || 0) + (t.req.cacheCreation || 0);
+      if (c > maxCtx) maxCtx = c;
+    });
+    var kinds = {};
+    turns.forEach(function (t) {
+      t.events.forEach(function (e) {
+        kinds[e.kind] = (kinds[e.kind] || 0) + 1;
+      });
+    });
+    var filters = Object.keys(kinds)
+      .sort()
+      .map(function (k) {
+        return (
+          '<button type="button" class="turn-filter" data-turn-filter="' +
+          esc(k) +
+          '" aria-pressed="false">' +
+          esc(k) +
+          " <small>" +
+          kinds[k] +
+          "</small></button>"
+        );
+      })
+      .join("");
+
+    var rows = turns
+      .map(function (t) {
+        var ctx = (t.req.promptTokens || 0) + (t.req.cacheRead || 0) + (t.req.cacheCreation || 0);
+        var evHtml = t.events
+          .map(function (e, j) {
+            return (
+              '<div class="turn-ev ev-' + esc(e.kind) + '" data-ev-kind="' + esc(e.kind) +
+              '" data-inspect="ev:' + t.seq + ":" + j + '" tabindex="0">' +
+              '<span class="ev-kind">' + esc(e.kind) + "</span>" +
+              '<span class="ev-label">' + esc(e.label) + "</span>" +
+              '<span class="ev-n">' + (e.n == null ? "" : esc(String(e.n))) + "</span>" +
+              "</div>"
+            );
+          })
+          .join("");
+        return (
+          '<div class="turn" data-turn="' + t.seq + '">' +
+          '<div class="turn-row" data-inspect="ctp:' + t.seq + '" tabindex="0">' +
+          '<span class="turn-caret" data-expand="' + t.seq + '">' +
+          (t.events.length ? "\u25b8" : "\u00b7") +
+          "</span>" +
+          '<span class="turn-seq">' + t.seq + "</span>" +
+          '<span class="turn-agent' + (t.req.isSubagent ? " sub" : "") + '">' +
+          esc(t.agent) + "</span>" +
+          '<span class="turn-bar"><span style="width:' +
+          ((ctx / maxCtx) * 100).toFixed(1) + '%"></span></span>' +
+          '<span class="turn-ctx">' + fmtTok(ctx) + "</span>" +
+          '<span class="turn-dur">' + fmtDur(t.req.durationMs) + "</span>" +
+          '<span class="turn-evn">' +
+          (t.events.length ? t.events.length + " ev" : "") + "</span>" +
+          "</div>" +
+          '<div class="turn-events" hidden>' + evHtml + "</div>" +
+          "</div>"
+        );
+      })
+      .join("");
+
+    return (
+      '<h2 class="sec">Turns <small>(' + turns.length +
+      " · \u2191\u2193 move · \u2192 expand · \u2190 collapse · click for detail)</small></h2>" +
+      '<div class="turn-filters">' + filters + "</div>" +
+      '<div class="turn-spine" id="turn-spine">' + rows + "</div>"
     );
   }
 
@@ -1178,6 +1318,9 @@
     compactionList.forEach(function (c) {
       compactSeqs[c.seq] = c;
     });
+    // AFTER compactSeqs is populated: a turn needs to know whether it compacted,
+    // and building it a few lines earlier read an empty (hoisted) object.
+    turnsForPane = buildTurns(reqs, hooks, steps, compactSeqs);
 
     var ttfts = reqs
       .map(function (r) {
@@ -1314,6 +1457,7 @@
       '<section class="session-pane' +
       (pane === "wire" ? " active" : "") +
       '" id="pane-wire">' +
+      turnSpineHtml(turnsForPane) +
       laneSection(reqs, compactSeqs) +
       '<h2 class="sec">Request waterfall <small>(' +
       reqs.length +
@@ -1444,6 +1588,7 @@
         else if (type === "tool") inspectTool(id);
         else if (type === "prov") inspectProvider(id);
         else if (type === "ask") inspectAsk();
+        else if (type === "ev") inspectTurnEvent(id);
       }
       panesEl.addEventListener("click", function (e) {
         var el = e.target.closest("[data-inspect]");
@@ -1648,6 +1793,30 @@
         kind: "user prompt",
         title: "what this session was asked to do",
         body: String(st.message || ""),
+      });
+    }
+
+    function inspectTurnEvent(id) {
+      var parts = id.split(":"); // ev:<seq>:<index>
+      var seq = Number(parts[1]);
+      var t = null;
+      for (var i = 0; i < turnsForPane.length; i++) {
+        if (turnsForPane[i].seq === seq) {
+          t = turnsForPane[i];
+          break;
+        }
+      }
+      if (!t) return;
+      var e = t.events[Number(parts[2])];
+      if (!e) return;
+      Inspector.show(id, {
+        kind: e.kind,
+        title: "turn " + seq + " · " + e.label,
+        body:
+          "agent          " + t.agent + "\n" +
+          "at             " + new Date(t.req.ts * 1000).toLocaleTimeString() + "\n" +
+          (e.n != null ? "size / dur     " + e.n + "\n" : "") +
+          (e.detail ? "\n" + e.detail : ""),
       });
     }
 
@@ -2177,6 +2346,52 @@
     );
   }
 
+  /** Expand or collapse one turn. */
+  function setTurnExpanded(seq, open) {
+    var turn = document.querySelector('.turn[data-turn="' + seq + '"]');
+    if (!turn) return false;
+    var box = turn.querySelector(".turn-events");
+    var caret = turn.querySelector(".turn-caret");
+    if (!box || !box.children.length) return false;
+    box.hidden = !open;
+    if (caret) caret.textContent = open ? "\u25be" : "\u25b8";
+    return true;
+  }
+
+  document.addEventListener("click", function (e) {
+    var c = e.target.closest && e.target.closest("[data-expand]");
+    if (c) {
+      e.stopPropagation();
+      var seq = c.getAttribute("data-expand");
+      var box = c.closest(".turn").querySelector(".turn-events");
+      setTurnExpanded(seq, box.hidden);
+      return;
+    }
+    var f = e.target.closest && e.target.closest("[data-turn-filter]");
+    if (!f) return;
+    f.setAttribute("aria-pressed", f.getAttribute("aria-pressed") === "true" ? "false" : "true");
+    var on = {};
+    var any = false;
+    document.querySelectorAll("[data-turn-filter]").forEach(function (b) {
+      if (b.getAttribute("aria-pressed") === "true") {
+        on[b.getAttribute("data-turn-filter")] = 1;
+        any = true;
+      }
+    });
+    // Filtering EVENTS also filters TURNS: a turn with nothing left to show is
+    // noise when you have asked "show me only the compactions".
+    document.querySelectorAll(".turn").forEach(function (t) {
+      var shown = 0;
+      t.querySelectorAll("[data-ev-kind]").forEach(function (ev) {
+        var vis = !any || on[ev.getAttribute("data-ev-kind")] === 1;
+        ev.hidden = !vis;
+        if (vis) shown++;
+      });
+      t.hidden = any && shown === 0;
+      if (any && shown) setTurnExpanded(t.getAttribute("data-turn"), true);
+    });
+  });
+
   // Session-header inspect targets. The pane listener is mounted on
   // `.session-panes`, so anything rendered in the header — the ask, and
   // whatever joins it later — would otherwise be inert.
@@ -2436,6 +2651,7 @@
   var timelineForPane = null;
   var toolTaxForPane = null;
   var stepsForPane = [];
+  var turnsForPane = [];
 
   function loadXray(sessionId, seq) {
     var token = ++xrayToken;
@@ -4213,6 +4429,17 @@
     if (!vertical && !horizontal) return false;
 
     if (horizontal) {
+      // On a turn row, LEFT/RIGHT means expand/collapse rather than change
+      // pane — drilling into the thing you have selected is the nearer
+      // meaning, and the pane switch is still there once it is collapsed.
+      var sel = Inspector.selected() || "";
+      if (sel.indexOf("ctp:") === 0) {
+        var seq = sel.slice(4);
+        if (setTurnExpanded(seq, k === "ArrowRight")) {
+          e.preventDefault();
+          return true;
+        }
+      }
       var cur = SESSION_PANES.indexOf(current.pane || "flow");
       if (cur < 0) cur = 0;
       var step = k === "ArrowRight" ? 1 : SESSION_PANES.length - 1;
