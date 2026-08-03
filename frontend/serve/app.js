@@ -5,6 +5,12 @@
   // ------------------------------------------------------------------ utils
   var view = document.getElementById("view");
 
+  // Hooks pane filter. Held here rather than per-render so the choice survives
+  // pane switches within a session; the list is stashed so the toggle can
+  // re-render without another fetch.
+  var hooksShowObserveOnly = false;
+  var hooksForPane = [];
+
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
       return {
@@ -941,6 +947,7 @@
       reqs = data.requests,
       steps = data.steps;
     var hooks = data.hooks || [];
+    hooksForPane = hooks;
     var flow = data.flow || { nodes: [], edges: [] };
     var compactSeqs = {};
     var compactionList = data.compactions || [];
@@ -984,7 +991,15 @@
       ) +
       card("Cache hit", fmtPct(cacheRate(s))) +
       card("TTFT p50", ttftP50 != null ? fmtDur(ttftP50) : "—") +
-      card("Hooks", hooks.length) +
+      // Headline the count that can actually tell you something. "Hooks 869"
+      // when all 869 are stubs is a number that reads as signal and is not.
+      card(
+        "Hooks",
+        signalHooks(hooks).length +
+          (signalHooks(hooks).length !== hooks.length
+            ? ' <small class="dim">of ' + hooks.length + "</small>"
+            : ""),
+      ) +
       card("Compactions", compactionList.length, compactionList.length > 0);
 
     var pane = initialPane || "flow";
@@ -1026,7 +1041,7 @@
       sectionErrorBanner(data.sectionErrors) +
       '<nav class="session-subnav" id="session-subnav">' +
       subnavBtn("flow", "Flow") +
-      subnavBtn("hooks", "Hooks", hooks.length) +
+      subnavBtn("hooks", "Hooks", signalHooks(hooks).length) +
       subnavBtn("xray", "Context X-Ray") +
       subnavBtn("tools", "Tool Tax") +
       subnavBtn("wire", "Wire") +
@@ -1237,7 +1252,13 @@
       pop.style.top = top + "px";
       pop.style.left = Math.max(8, left) + "px";
     }
+    // Idempotent by construction. This runs on every session draw AND on every
+    // x-ray load, so without the marker a second pass adds a second click
+    // handler to the same element — and since the handler toggles `hidden`,
+    // two of them cancel out and click-to-expand silently stops working.
     document.querySelectorAll("[data-full-payload]").forEach(function (el) {
+      if (el.dataset.popBound === "1") return;
+      el.dataset.popBound = "1";
       el.addEventListener("mouseenter", function () {
         var raw = el.getAttribute("data-full-payload");
         if (!raw) return;
@@ -1330,6 +1351,25 @@
     );
   }
 
+  /**
+   * An observe-only tap wraps `true`, so it can never carry a returned payload.
+   * One `hooks install` is enough to make them the overwhelming majority of the
+   * table, at which point the pane reports thousands of events that say nothing
+   * and the few real returns are unfindable. Hide them by default.
+   *
+   * Keyed on the stored `observeOnly` flag, never on empty stdout: a wrapped
+   * hook that returned nothing is a genuine result and must stay visible.
+   */
+  function isObserveOnly(h) {
+    return (h.stdoutPreview || {}).observeOnly === true;
+  }
+
+  function signalHooks(hooks) {
+    return hooks.filter(function (h) {
+      return !isObserveOnly(h);
+    });
+  }
+
   function renderHooksPane(hooks) {
     if (!hooks.length) {
       return (
@@ -1338,12 +1378,43 @@
         "If Flow shows hooks but this pane was blank before, it was a hash-route bug — use the buttons above.</span></div>"
       );
     }
+    var shown = hooksShowObserveOnly ? hooks : signalHooks(hooks);
+    var hidden = hooks.length - shown.length;
+    var toggle =
+      hidden || hooksShowObserveOnly
+        ? '<label class="hooks-filter"><input type="checkbox" id="hooks-observe-toggle"' +
+          (hooksShowObserveOnly ? " checked" : "") +
+          "/> show observe-only (" +
+          (hooks.length - signalHooks(hooks).length) +
+          ")</label>"
+        : "";
+    if (!shown.length) {
+      // Reporting "0 events" over a pane that holds thousands reads as a bug, so
+      // say plainly that everything here is a stub and what to do about it.
+      return (
+        '<div class="hooks-timeline">' +
+        '<div class="dim hooks-hint">0 of ' +
+        hooks.length +
+        " hook event(s) returned anything" +
+        toggle +
+        "</div>" +
+        '<div class="empty-pane">All ' +
+        hooks.length +
+        " event(s) for this session are observe-only taps.<br/>" +
+        '<span class="dim">They wrap <code>true</code>, so no payload exists to show. Wrap the real hooks with ' +
+        "<code>tracetap hooks track --mode inject</code>, then re-index.<br/>" +
+        "Clear the historical noise with <code>tracetap hooks prune</code>.</span></div></div>"
+      );
+    }
     return (
       '<div class="hooks-timeline">' +
       '<div class="dim hooks-hint">' +
-      hooks.length +
-      " hook event(s) · expand a card for stdin + returned stdout payload</div>" +
-      hooks
+      shown.length +
+      (hidden ? " of " + hooks.length : "") +
+      " hook event(s) · expand a card for stdin + returned stdout payload" +
+      toggle +
+      "</div>" +
+      shown
         .map(function (h) {
           var badge =
             h.decision === "block"
@@ -3162,6 +3233,21 @@
     }
     return false;
   }
+
+  // Delegated: the hooks pane is re-rendered as innerHTML, so a listener bound
+  // to the checkbox itself would not survive a toggle.
+  document.addEventListener("change", function (e) {
+    var t = e.target;
+    if (!t || t.id !== "hooks-observe-toggle") return;
+    hooksShowObserveOnly = !!t.checked;
+    var pane = document.getElementById("pane-hooks");
+    if (!pane) return;
+    // Re-rendering the pane throws away every element the popovers were bound
+    // to, so the new hotspots need binding or they are inert on hover and
+    // click. Safe to call repeatedly — bindPayloadPopovers marks what it binds.
+    pane.innerHTML = renderHooksPane(hooksForPane);
+    bindPayloadPopovers();
+  });
 
   document.addEventListener("keydown", function (e) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {

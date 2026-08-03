@@ -10,7 +10,7 @@ import { trackInject, trackSettings, uninstallTracking } from "./configure";
 
 /**
  * CLI for `tracetap hooks …`:
- *   hooks tap | install | uninstall | status | discover | track | help
+ *   hooks tap | install | uninstall | status | discover | track | prune | help
  */
 
 const HELP = `tracetap hooks <subcommand>
@@ -44,6 +44,13 @@ SUBCOMMANDS:
                     Remove tracetap tap wrappers from ~/.claude/settings.json.
                     With --restore [path], also restore *.tracetap.bak hooks.json
                     under that repo (default: cwd).
+
+  prune [--observe-only] [--dry-run] [--db <path>]
+                    Drop observe-only tap events from the index. They wrap \`true\`
+                    and can never carry a returned payload, so once installed they
+                    crowd out the hooks that do. --dry-run counts without deleting.
+                    This cleans the index only — run \`hooks uninstall\` to stop
+                    generating them, or re-indexing a changed log restores them.
 
   status            Show hooks directory, recent logs, install state.
 
@@ -279,6 +286,29 @@ export async function runHooksCli(argv: string[]): Promise<void> {
   }
   if (sub === "status") {
     runHooksStatus();
+    return;
+  }
+  if (sub === "prune") {
+    let dryRun = false;
+    let dbPath: string | undefined;
+    for (let i = 1; i < argv.length; i++) {
+      const a = argv[i];
+      if (a === "--dry-run" || a === "-n") dryRun = true;
+      // Accepted explicitly so the command reads intentionally at a call site,
+      // and so a future --errored/--all mode is not a breaking change.
+      else if (a === "--observe-only") continue;
+      else if (a === "--db") dbPath = argv[++i];
+      else throw new Error(`Unknown prune option '${a}'`);
+    }
+    const { Store, defaultDbPath } = await import("../store/index");
+    const store = new Store(dbPath || defaultDbPath());
+    const res = store.pruneObserveOnlyHooks({ dryRun });
+    if (dryRun) {
+      console.log(`prune --dry-run: ${res.matched} observe-only event(s) would be removed`);
+    } else {
+      console.log(`prune: removed ${res.deleted} observe-only event(s)`);
+    }
+    console.log(`Stop generating them with: tracetap hooks uninstall`);
     return;
   }
   if (sub === "uninstall") {

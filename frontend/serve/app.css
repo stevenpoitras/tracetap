@@ -1702,6 +1702,9 @@ h2.sec small {
   border-color: rgba(45, 212, 191, 0.4);
 }
 .hooks-hint { margin-bottom: 8px; font-size: 11px; }
+.hooks-filter { margin-left: 10px; cursor: pointer; user-select: none; white-space: nowrap; }
+.hooks-filter input { vertical-align: -1px; margin-right: 4px; cursor: pointer; }
+.hooks-filter:hover { color: var(--mid); }
 .context-timeline {
   display: flex;
   align-items: flex-end;

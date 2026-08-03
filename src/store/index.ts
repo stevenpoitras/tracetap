@@ -1605,6 +1605,36 @@ export class Store {
   }
 
   /**
+   * Delete observe-only hook events — taps that wrapped the shell no-op `true`
+   * (what `tracetap hooks install` writes). They record that an event fired but
+   * can never carry a returned payload, and at scale they bury the hooks that
+   * did: a real install can leave 99% of the table unable to say anything.
+   *
+   * Matches on the stored classification rather than on empty stdout, because
+   * an empty payload is ambiguous — see {@link buildStdoutPreview}. Events
+   * captured before the flag existed report `observeOnly: undefined` and are
+   * deliberately left alone; we cannot prove they were stubs.
+   *
+   * The source `.jsonl` files are untouched. If one changes, indexing replaces
+   * every row for that file and its stubs come back — this cleans the index,
+   * it does not stop the capture. `tracetap hooks uninstall` does that.
+   */
+  pruneObserveOnlyHooks(opts?: { dryRun?: boolean }): {
+    matched: number;
+    deleted: number;
+  } {
+    const where = `json_extract(stdout_preview, '$.observeOnly') = 1`;
+    const matched = (
+      this.db.prepare(`SELECT COUNT(*) AS n FROM hooks WHERE ${where}`).get() as {
+        n: number;
+      }
+    ).n;
+    if (opts?.dryRun) return { matched, deleted: 0 };
+    const info = this.db.prepare(`DELETE FROM hooks WHERE ${where}`).run();
+    return { matched, deleted: info.changes };
+  }
+
+  /**
    * Hooks for a wire session: exact `session_id` match OR time-overlap with the
    * session window (±10 min slack). Wire conversation keys rarely equal Claude's
    * hook session_id, so time correlation is the practical bridge.
