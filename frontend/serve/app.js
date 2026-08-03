@@ -1314,6 +1314,36 @@
     }
   }
 
+  /**
+   * The inspector is shared, but what it can describe is NOT.
+   *
+   * The panes have different scopes, and this is a property of the data, not a
+   * layout choice: Context X-Ray and Wire are per API call (215 distinct
+   * context sizes across 224 calls), while Tool Tax is per TOOLSET — one
+   * toolset covered all 224 calls of the session this was found on, and the
+   * `tools` bucket had exactly one distinct value throughout. A dead-tool
+   * selection therefore says nothing about the call you just switched to.
+   *
+   * Leaving it up made the panel look like it described the new pane. So a
+   * selection that does not live in the pane you are now looking at is
+   * dropped, and if you had been somewhere in THIS pane before, you land back
+   * there rather than on nothing.
+   */
+  function syncInspectorToPane(name) {
+    var id = Inspector.selected();
+    if (!id) return;
+    var pane = document.getElementById("pane-" + name);
+    var el = pane
+      ? pane.querySelector('[data-inspect="' + cssEscape(id) + '"]')
+      : null;
+    if (el) return; // still in scope — nothing to do
+    Inspector.clear();
+    var remembered = paneCursor[name];
+    if (!remembered || !pane) return;
+    var back = pane.querySelector('[data-inspect="' + cssEscape(remembered) + '"]');
+    if (back && back.offsetParent !== null) back.click();
+  }
+
   function activatePane(name) {
     document
       .querySelectorAll("#session-subnav [data-pane]")
@@ -1331,6 +1361,12 @@
         history.replaceState(null, "", next);
       }
     }
+    // LAST, and the order is load-bearing twice over: after the class swap so
+    // scope is tested against the pane that is now up, and after `current.pane`
+    // so the restore click records its cursor under the pane it lands in. With
+    // this call earlier, restoring pane B wrote B's row into A's cursor slot
+    // and A could never be restored again.
+    syncInspectorToPane(name);
   }
 
   function bindSessionPanes(sessionId, reqs) {
@@ -1351,6 +1387,10 @@
     if (panesEl) {
       function activate(el) {
         var id = el.getAttribute("data-inspect") || "";
+        // Recorded here, not in the arrow-key helper, so a mouse click and a
+        // keypress leave the same trace. Otherwise leaving a pane by mouse and
+        // returning would land on nothing, while the keyboard remembered.
+        if (current.pane) paneCursor[current.pane] = id;
         var type = id.slice(0, id.indexOf(":"));
         if (type === "flow") inspectFlowNode(el, sessionId);
         else if (type === "seg") inspectSegment(id);
@@ -1379,8 +1419,7 @@
       var part = parts[2];
       var sp = h.stdoutPreview || {};
       var body;
-      if (part === "stdin") body = JSON.stringify(h.stdinPreview || {}, null, 2);
-      else if (part === "full") body = JSON.stringify(h.payload || {}, null, 2);
+      if (part === "full") body = JSON.stringify(h.payload || {}, null, 2);
       else if (part === "return")
         body =
           sp.additional_context ||
@@ -1865,15 +1904,17 @@
             // <pre> — and both copies HTML-escaped. On a session with hundreds
             // of hook events that was the largest single source of DOM weight
             // in the app, for text most users never open.
-            "<div><h3>stdin preview " +
-            inspectChip("hook:" + hi + ":stdin", null, "stdin preview") +
-            "</h3>" +
+            // No inspect chip on these two. The <pre> already holds the
+            // WHOLE preview object — opening it in the panel reproduced the
+            // same text verbatim, which teaches the reader that `inspect`
+            // means nothing. Chips are kept only where the panel shows
+            // something the row cannot: the full stdin payload, and a
+            // returned payload longer than its preview.
+            "<div><h3>stdin preview</h3>" +
             '<pre class="payload compact">' +
             esc(JSON.stringify(h.stdinPreview || {}, null, 2)) +
             "</pre></div>" +
-            "<div><h3>stdout preview " +
-            inspectChip("hook:" + hi + ":stdout", null, "stdout preview") +
-            "</h3>" +
+            "<div><h3>stdout preview</h3>" +
             '<pre class="payload compact">' +
             esc(JSON.stringify(h.stdoutPreview || {}, null, 2)) +
             "</pre></div>" +
@@ -2213,6 +2254,50 @@
     return pct < 0.1 ? "<0.1%" : pct.toFixed(1) + "%";
   }
 
+  /**
+   * Bucket rows double as filters for the segment list beneath them.
+   *
+   * The composition bar answers "what is eating the window" and the segment
+   * list answers "which specific text", but the two were unconnected: seeing
+   * TOOLS at 72% meant scrolling a mixed list of 244 segments hunting for the
+   * tool ones. Clicking a row now narrows the list to that bucket. Multiple
+   * rows can be active — an OR, since the question is usually "show me tools
+   * AND skills, hide the conversation".
+   */
+  function applyBucketFilter(pane) {
+    var on = {};
+    var any = false;
+    pane.querySelectorAll("[data-bucket-filter]").forEach(function (b) {
+      if (b.getAttribute("aria-pressed") === "true") {
+        on[b.getAttribute("data-bucket-filter")] = 1;
+        any = true;
+      }
+    });
+    var shown = 0;
+    pane.querySelectorAll("[data-bucket]").forEach(function (seg) {
+      var vis = !any || on[seg.getAttribute("data-bucket")] === 1;
+      seg.hidden = !vis;
+      if (vis) shown++;
+    });
+    var note = pane.querySelector("#xray-seg-count");
+    if (note) {
+      note.textContent = any
+        ? shown + " of " + pane.querySelectorAll("[data-bucket]").length + " shown"
+        : "";
+    }
+  }
+
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest && e.target.closest("[data-bucket-filter]");
+    if (!btn) return;
+    var pane = btn.closest(".session-pane") || document;
+    btn.setAttribute(
+      "aria-pressed",
+      btn.getAttribute("aria-pressed") === "true" ? "false" : "true",
+    );
+    applyBucketFilter(pane);
+  });
+
   function drawXray(x) {
     var total = 0;
     x.buckets.forEach(function (b) {
@@ -2228,15 +2313,17 @@
         .map(function (b) {
           var pct = sharePct(b.approxTokens, total);
           return (
-            '<div class="xray-row bucket-' +
+            '<button type="button" class="xray-row bucket-' +
             esc(b.bucket) +
-            '" title="' +
+            '" data-bucket-filter="' +
+            esc(b.bucket) +
+            '" aria-pressed="false" title="' +
             esc(b.label) +
             " · " +
             fmtTok(b.approxTokens) +
             " approx tokens · " +
             b.segments +
-            ' segment(s)">' +
+            ' segment(s) · click to filter the segments below">' +
             '<span class="xray-row-label">' +
             esc(b.label) +
             "</span>" +
@@ -2251,7 +2338,7 @@
             "</span>" +
             '<span class="xray-row-pct">' +
             fmtShare(pct) +
-            "</span></div>"
+            "</span></button>"
           );
         })
         .join("") +
@@ -2310,7 +2397,7 @@
     var segs =
       '<h2 class="sec">Segments <small>(' +
       x.segments.length +
-      ")</small></h2>" +
+      ' <span id="xray-seg-count"></span></small></h2>' +
       '<div class="xray-segs">' +
       x.segments
         .slice(0, 80)
@@ -2325,6 +2412,8 @@
             // other. The inspector reads the segment from the cached response.
             '" data-inspect="seg:' +
             i +
+            '" data-bucket="' +
+            esc(s.bucket) +
             // The row is shaded to its own share of the context, so the segments
             // actually eating the window are visible without reading a number.
             '" style="--share:' +
@@ -3847,7 +3936,6 @@
 
   function selectTarget(el) {
     if (!el) return;
-    if (current.pane) paneCursor[current.pane] = el.getAttribute("data-inspect");
     el.scrollIntoView({ block: "nearest", inline: "nearest" });
     // Re-use the delegated [data-inspect] resolver rather than a second
     // dispatch table — one place decides what a row means.

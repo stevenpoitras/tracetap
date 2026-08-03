@@ -1848,6 +1848,35 @@ tr[data-inspect]:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
+/* Bucket rows are buttons now (they filter the segment list), so they need the
+   button reset the other converted rows got — `font: inherit` would reset
+   font-size and break the row's grid columns. */
+/* The UA rule `[hidden] { display: none }` loses to ANY author rule that sets
+   display — and `.xray-seg` sets `display: grid`. So filtered-out segments kept
+   their layout box and stayed on screen while the count said they were gone.
+   Property set, pixels unchanged: only a screenshot catches this. */
+[data-bucket][hidden] {
+  display: none !important;
+}
+button.xray-row {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+}
+button.xray-row[aria-pressed="true"] {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  background: var(--surface);
+}
+button.xray-row[aria-pressed="true"] .xray-row-label {
+  color: var(--bright);
+}
+#xray-seg-count {
+  color: var(--accent);
+}
 .ct-legend {
   font-size: 10px;
   margin: 0 0 14px 5.2ch;
