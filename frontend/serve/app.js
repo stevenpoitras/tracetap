@@ -548,24 +548,6 @@
   // --------------------------------------------------------- wire pane (FIG/waterfall)
 
   function bindSessionInteractions(reqs, compactSeqs, steps) {
-    var wf = document.getElementById("wf");
-    if (wf) {
-      var bySeq = {};
-      reqs.forEach(function (r) {
-        bySeq[r.seq] = r;
-      });
-      TT.bind(wf, ".wf-row", function (rowEl) {
-        var r = bySeq[rowEl.getAttribute("data-seq")];
-        return r ? wfTooltip(r, compactSeqs[r.seq]) : null;
-      });
-      wf.addEventListener("click", function (e) {
-        var rowEl = e.target.closest(".wf-row");
-        if (!rowEl) return;
-        var step = rowEl.getAttribute("data-step");
-        if (step) flashStep(step);
-      });
-    }
-
     var mm = document.getElementById("minimap");
     if (mm) {
       mm.addEventListener("click", function (e) {
@@ -600,36 +582,6 @@
     }
   }
 
-  function wfTooltip(r, compaction) {
-    var stream = r.durationMs != null && r.ttftMs != null ? r.durationMs - r.ttftMs : null;
-    var h = TT.title("call " + r.seq + (r.model ? " · " + r.model : ""));
-    h += TT.row(
-      "status",
-      r.status == null
-        ? '<span class="warn-text">no response</span>'
-        : r.status >= 400
-          ? '<span class="warn-text">' + r.status + "</span>"
-          : String(r.status),
-    );
-    if (r.ttftMs != null) h += TT.row("ttft", fmtDur(r.ttftMs));
-    if (stream != null) h += TT.row("stream", fmtDur(stream));
-    h += TT.row("total", fmtDur(r.durationMs));
-    h += TT.row("fresh in", fmtTok(r.promptTokens));
-    h += TT.row("cache read", fmtTok(r.cacheRead));
-    if (r.cacheCreation) h += TT.row("cache write", fmtTok(r.cacheCreation));
-    h += TT.row("output", fmtTok(r.completionTokens));
-    if (r.reasoningTokens) h += TT.row("reasoning", fmtTok(r.reasoningTokens));
-    if (r.stopReason) h += TT.row("stop", TT.esc(r.stopReason));
-    h += TT.row("transcript", r.transcriptItems + " items");
-    if (compaction)
-      h += TT.row(
-        "compaction",
-        '<span class="warn-text">' + compaction.from + " → " + compaction.to + " items</span>",
-      );
-    if (r.promptHash) h += TT.row("prompt", r.promptHash.slice(0, 8));
-    if (r.agentStepIndex != null) h += TT.row("step", "#" + r.agentStepIndex + " · click to jump");
-    return h;
-  }
 
   function minimapHtml(steps) {
     if (steps.length < 8) return "";
@@ -800,149 +752,6 @@
     );
   }
 
-  function laneSection(reqs, compactSeqs) {
-    if (!reqs.length) return "";
-    var ctxItems = reqs.map(function (r) {
-      var c = compactSeqs[r.seq];
-      return {
-        label: String(r.seq),
-        value: r.transcriptItems,
-        warn: !!c,
-        title:
-          "call " +
-          r.seq +
-          ": " +
-          r.transcriptItems +
-          " transcript items" +
-          (c ? " — COMPACTION (was " + c.from + ")" : ""),
-      };
-    });
-    var tokItems = reqs.map(function (r) {
-      return {
-        label: String(r.seq),
-        title:
-          "call " +
-          r.seq +
-          ": fresh in " +
-          fmtTok(r.promptTokens) +
-          " · cache read " +
-          fmtTok(r.cacheRead) +
-          " · cache write " +
-          fmtTok(r.cacheCreation) +
-          " · out " +
-          fmtTok(r.completionTokens),
-        parts: [
-          { value: r.cacheRead, color: "var(--cache)" },
-          { value: r.cacheCreation, color: "var(--purple)" },
-          { value: r.promptTokens, color: "var(--accent)" },
-          { value: r.completionTokens, color: "var(--ok)" },
-        ],
-      };
-    });
-    return (
-      '<div class="split">' +
-      '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Context growth — transcript items per call · amber = mid-task compaction</div>' +
-      columnChart(ctxItems, { height: 110, labels: false }) +
-      "</div>" +
-      '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.2</span>Token flow per call</div>' +
-      stackedChart(tokItems, { height: 110 }) +
-      '<div class="legend">' +
-      '<span><span class="sw" style="background:var(--cache)"></span>cache read</span>' +
-      '<span><span class="sw" style="background:var(--purple)"></span>cache write</span>' +
-      '<span><span class="sw" style="background:var(--accent)"></span>fresh input</span>' +
-      '<span><span class="sw" style="background:var(--ok)"></span>output</span>' +
-      "</div></div></div>"
-    );
-  }
-
-  function waterfall(reqs, compactSeqs) {
-    if (!reqs.length)
-      return '<div class="dim">No wire data (re-index with tracetap ≥ 0.3).</div>';
-    var t0 = Infinity,
-      t1 = -Infinity;
-    reqs.forEach(function (r) {
-      if (r.ts > 0) t0 = Math.min(t0, r.ts);
-      var end = r.ts + (r.durationMs || 0) / 1000;
-      t1 = Math.max(t1, end);
-    });
-    if (!isFinite(t0) || t1 <= t0) {
-      t0 = 0;
-      t1 = 1;
-    }
-    var span = t1 - t0;
-    return reqs
-      .map(function (r) {
-        var left = r.ts > 0 ? ((r.ts - t0) / span) * 100 : 0;
-        var durW =
-          r.durationMs != null ? Math.max(0.4, (r.durationMs / 1000 / span) * 100) : 0.6;
-        var ttftW = r.ttftMs != null ? (r.ttftMs / 1000 / span) * 100 : 0;
-        var bars = "";
-        if (ttftW > 0) {
-          bars +=
-            '<div class="wf-bar wait" style="left:' +
-            left.toFixed(2) +
-            "%;width:" +
-            ttftW.toFixed(2) +
-            '%"></div>';
-          bars +=
-            '<div class="wf-bar' +
-            (r.errored ? " errored" : "") +
-            '" style="left:' +
-            (left + ttftW).toFixed(2) +
-            "%;width:" +
-            Math.max(0.3, durW - ttftW).toFixed(2) +
-            '%"></div>';
-        } else {
-          bars +=
-            '<div class="wf-bar' +
-            (r.errored ? " errored" : "") +
-            '" style="left:' +
-            left.toFixed(2) +
-            "%;width:" +
-            durW.toFixed(2) +
-            '%"></div>';
-        }
-        var c = compactSeqs[r.seq];
-        var meta =
-          (r.status == null ? "no response" : r.status) +
-          " · " +
-          fmtDur(r.durationMs) +
-          (r.ttftMs != null ? " · ttft " + fmtDur(r.ttftMs) : "") +
-          " · " +
-          fmtTok(r.completionTokens) +
-          " out" +
-          (r.stopReason ? " · " + esc(r.stopReason) : "");
-        var linked = r.agentStepIndex != null;
-        return (
-          '<div class="wf-row' +
-          (linked ? " click" : "") +
-          '" data-seq="' +
-          r.seq +
-          '" data-inspect="ctp:' +
-          r.seq +
-          '" tabindex="0"' +
-          (linked ? ' data-step="' + r.agentStepIndex + '"' : "") +
-          ">" +
-          '<div class="wf-label">' +
-          r.seq +
-          (c ? ' <span class="wf-compact">⇣</span>' : "") +
-          (r.isSubagent
-            ? ' <span class="agent-dot" title="' +
-              esc(r.agentLabel || "subagent (unnamed)") +
-              '"></span>'
-            : "") +
-          "</div>" +
-          '<div class="wf-track">' +
-          bars +
-          "</div>" +
-          '<div class="wf-meta">' +
-          meta +
-          "</div>" +
-          "</div>"
-        );
-      })
-      .join("");
-  }
 
   // ------------------------------------------------------------- sessions
   var sess = {
@@ -1457,14 +1266,17 @@
       '<section class="session-pane' +
       (pane === "wire" ? " active" : "") +
       '" id="pane-wire">' +
+      // The spine REPLACES what used to sit here rather than sitting above it:
+      // FIG.1 (transcript items per call), FIG.2 (token flow per call) and the
+      // request waterfall were three renderings of the same 18 calls, and
+      // adding a fourth is not consolidation. Every number they carried is on
+      // a spine row or one click into the inspector — context read, duration,
+      // compaction, and the cache read/write/fresh/output split.
+      //
+      // What genuinely died with the waterfall is TIME OVERLAP: it was the only
+      // view showing calls running concurrently. That returns with the range
+      // selector, which needs a time axis anyway.
       turnSpineHtml(turnsForPane) +
-      laneSection(reqs, compactSeqs) +
-      '<h2 class="sec">Request waterfall <small>(' +
-      reqs.length +
-      " API calls · hover for wire metrics · click to jump to the step)</small></h2>" +
-      '<div class="chart-box waterfall" id="wf">' +
-      waterfall(reqs, compactSeqs) +
-      "</div>" +
       '<h2 class="sec">Transcript <small>(' +
       steps.length +
       " steps)</small></h2>" +
