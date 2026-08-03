@@ -154,8 +154,8 @@
           n.removeAttribute("aria-current");
         });
       // ALL matches, not the first. A turn id (`ctp:<seq>`) deliberately
-      // appears in three views — the X-Ray timeline bar, the Wire waterfall
-      // row and the turn spine — because they are the same turn. Marking only
+      // appears in more than one view — the X-Ray timeline bar and the turn
+      // spine row — because they are the same turn. Marking only
       // `querySelector`'s first hit highlighted whichever happened to come
       // earlier in the DOM, which was routinely in a pane the user was not
       // looking at, and left the visible one unmarked.
@@ -545,7 +545,7 @@
     );
   }
 
-  // --------------------------------------------------------- wire pane (FIG/waterfall)
+  // ------------------------------------------------------- wire pane (turn spine)
 
   function bindSessionInteractions(reqs, compactSeqs, steps) {
     var mm = document.getElementById("minimap");
@@ -1339,9 +1339,9 @@
           encodeURIComponent(s.sessionId) +
           '" target="_blank" rel="noopener">wire report ↗</a>'
         : "") +
-      // The system prompt was reachable only as 8 characters of hash inside a
-      // waterfall row's hover tooltip — you could see that a prompt existed
-      // but never read it without hunting the Prompts tab by eye.
+      // The system prompt used to be reachable only as 8 characters of hash
+      // inside a hover tooltip — you could see that a prompt existed but never
+      // read it without hunting the Prompts tab by eye.
       (reqs.length && reqs[0].promptHash
         ? ' <a class="head-link" href="#prompt/' +
           esc(reqs[0].promptHash) +
@@ -4397,10 +4397,17 @@
     return view.querySelector(".kb-focus");
   }
 
+  /**
+   * `.kb-focus` cursor for the LIST pages (sessions, usage, prompts, …).
+   *
+   * Session pages have their own cursor — the inspector selection driven by
+   * `sessionArrowNav` — so j/k are routed there instead of here. Two cursors
+   * on one page means two highlights disagreeing about where you are.
+   */
   function moveCursor(dir) {
-    var rows = Array.prototype.slice.call(
-      view.querySelectorAll("tr.click, .wf-row.click"),
-    );
+    // `.wf-row.click` used to be here for the request waterfall. The waterfall
+    // is gone; the selector went with it.
+    var rows = Array.prototype.slice.call(view.querySelectorAll("tr.click"));
     if (!rows.length) return;
     var cur = focusedRow();
     var idx = cur ? rows.indexOf(cur) : -1;
@@ -4499,7 +4506,12 @@
 
   function sessionArrowNav(e) {
     var k = e.key;
-    var vertical = k === "ArrowDown" || k === "ArrowUp";
+    // j/k are the vim spelling of ↓/↑ and must mean the same thing here. Left
+    // to fall through they reached `moveCursor`, a second cursor that paints
+    // `.kb-focus` on transcript rows while ↑/↓ moved the inspector selection
+    // — two highlights, on different elements, both claiming to be "where you
+    // are".
+    var vertical = k === "ArrowDown" || k === "ArrowUp" || k === "j" || k === "k";
     var horizontal = k === "ArrowRight" || k === "ArrowLeft";
     if (!vertical && !horizontal) return false;
 
@@ -4536,7 +4548,7 @@
         break;
       }
     }
-    var d = k === "ArrowDown" ? 1 : -1;
+    var d = k === "ArrowDown" || k === "j" ? 1 : -1;
     var next =
       i < 0
         ? d > 0

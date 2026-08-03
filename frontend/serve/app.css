@@ -755,66 +755,6 @@ h2.sec small {
   font-size: 11px;
 }
 
-.waterfall {
-  font-size: 11px;
-}
-.wf-row {
-  display: grid;
-  grid-template-columns: 44px 1fr 200px;
-  gap: 10px;
-  align-items: center;
-  padding: 3px 0;
-  border-radius: 3px;
-}
-.wf-row.click {
-  cursor: pointer;
-}
-.wf-row:hover {
-  background: var(--surface-2);
-}
-.wf-row.kb-focus {
-  background: var(--surface-2);
-  box-shadow: inset 2px 0 0 var(--accent);
-}
-.wf-label {
-  color: var(--dim);
-  text-align: right;
-  font-family: var(--font-chrome);
-  font-size: 10px;
-}
-.wf-track {
-  position: relative;
-  height: 14px;
-  background: var(--surface-2);
-  border-radius: 3px;
-  overflow: hidden;
-}
-.wf-bar {
-  position: absolute;
-  top: 2px;
-  height: 10px;
-  border-radius: 2px;
-  background: var(--accent);
-  opacity: 0.9;
-}
-.wf-bar.wait {
-  background: var(--muted);
-  opacity: 0.8;
-}
-.wf-bar.errored {
-  background: var(--red);
-}
-.wf-meta {
-  color: var(--dim);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-size: 10.5px;
-}
-.wf-compact {
-  color: var(--amber);
-  font-weight: 500;
-}
 
 /* -- transcript --------------------------------------------------------- */
 .steps {
@@ -1867,8 +1807,8 @@ tr[data-inspect]:focus-visible {
 .head-link:hover {
   text-decoration: underline;
 }
-/* A subagent's calls are interleaved with the main thread's in the waterfall;
-   the dot is the only thing that says which conversation a row belongs to. */
+/* A subagent's calls are interleaved with the main thread's in every session
+   view; the dot is the only thing that says which conversation a row is. */
 .agent-dot {
   display: inline-block;
   width: 5px;
