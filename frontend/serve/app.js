@@ -1278,6 +1278,7 @@
         var id = el.getAttribute("data-inspect") || "";
         var type = id.slice(0, id.indexOf(":"));
         if (type === "flow") inspectFlowNode(el, sessionId);
+        else if (type === "seg") inspectSegment(id);
       }
       panesEl.addEventListener("click", function (e) {
         var el = e.target.closest("[data-inspect]");
@@ -1289,6 +1290,23 @@
         if (!el) return;
         e.preventDefault();
         activate(el);
+      });
+    }
+
+    function inspectSegment(id) {
+      var i = Number(id.slice(id.indexOf(":") + 1));
+      var segs = (xrayForPane && xrayForPane.segments) || [];
+      var s = segs[i];
+      if (!s) return;
+      var total = xrayForPane.totalApproxTokens || 0;
+      var pct = sharePct(s.approxTokens, total);
+      Inspector.show(id, {
+        kind: s.bucket,
+        title:
+          fmtTok(s.approxTokens) + " approx tokens · " + fmtShare(pct) + " of context",
+        // `full` when the server sent it, otherwise the preview — same source
+        // the popover used, just resolved on demand instead of pre-stringified.
+        body: s.full || s.preview || "",
       });
     }
 
@@ -1855,6 +1873,9 @@
    * after a click and overwrite it — the button appears to do nothing.
    */
   var xrayToken = 0;
+  // The rendered x-ray response, kept so the inspector can resolve a segment
+  // by index instead of every row carrying its full text in a DOM attribute.
+  var xrayForPane = null;
 
   function loadXray(sessionId, seq) {
     var token = ++xrayToken;
@@ -1879,6 +1900,7 @@
               ? " · wire " + fmtTok(x.wirePromptTokens) + " prompt"
               : "");
         }
+        xrayForPane = x;
         if (viewEl) {
           viewEl.innerHTML = drawXray(x);
           bindPayloadPopovers();
@@ -2017,26 +2039,22 @@
       '<div class="xray-segs">' +
       x.segments
         .slice(0, 80)
-        .map(function (s) {
-          var full = s.preview; // preview already truncated; prefer longer if present
-          if (s.full) full = s.full;
+        .map(function (s, i) {
           var pct = sharePct(s.approxTokens, total);
           return (
             '<button type="button" class="xray-seg bucket-' +
             esc(s.bucket) +
-            ' payload-hotspot" data-full-payload="' +
-            esc(full) +
+            // No payload in the attribute and no native title=. The segment
+            // carried both a data-full-payload popover and a title tooltip, so
+            // two independent tooltips fired on one hover and drew over each
+            // other. The inspector reads the segment from the cached response.
+            '" data-inspect="seg:' +
+            i +
             // The row is shaded to its own share of the context, so the segments
             // actually eating the window are visible without reading a number.
             '" style="--share:' +
             Math.min(100, pct).toFixed(2) +
-            '%" title="' +
-            esc(s.bucket) +
-            " · " +
-            fmtTok(s.approxTokens) +
-            " approx tokens · " +
-            fmtShare(pct) +
-            ' of context — hover for full text">' +
+            '%">' +
             '<span class="xray-seg-bucket">' +
             esc(s.bucket) +
             "</span>" +

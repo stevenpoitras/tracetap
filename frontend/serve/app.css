@@ -1624,17 +1624,17 @@ h2.sec small {
   text-align: left;
   background: var(--surface);
 }
-/* Segment rows are ALSO `.payload-hotspot`, a generic affordance declared later
-   in this file with `display:block`, a transparent background, a dashed border
-   and zero padding. Equal specificity + later in source = it silently won and
-   flattened these rows into running text. The compound selector both outranks
-   it and states the rule honestly: when a hotspot is a segment row, the row
-   wins. Everything re-asserted here is a property .payload-hotspot sets.
+/* Shaded to its own share of the context — the fill stops at --share, so what
+   is eating the window is visible without reading the number.
 
-   Shaded to its own share of the context — the fill stops at --share, so what
-   is eating the window is visible without reading the number. */
-.xray-seg,
-.xray-seg.payload-hotspot {
+   These rows used to also carry `.payload-hotspot`, a generic affordance whose
+   display:block/transparent/zero-padding rules had equal specificity and came
+   later in the file, so it silently won and flattened the grid into running
+   text (fixed in 4dcf8c1 by a compound-selector override). The row no longer
+   carries that class, so the override is gone with it — a shared class that
+   has to be re-defeated at every call site is the duplication it was meant to
+   remove. */
+.xray-seg {
   display: grid;
   padding: 5px 8px;
   border: 1px solid var(--border);
@@ -1647,7 +1647,7 @@ h2.sec small {
     ),
     var(--surface);
 }
-.xray-seg.payload-hotspot:hover {
+.xray-seg:hover {
   border-color: var(--accent);
   border-left-color: rgb(var(--bkt));
 }
