@@ -229,9 +229,14 @@ function percentile(sorted: number[], q: number): number | null {
  * require an actual context drop — reported 54 on the same session. Two
  * implementations of one concept will always drift; the only reliable fix is
  * for there to be one.
+ *
+ * Sorting is this caller's job: `findCompactionPoints` diffs neighbours, so it
+ * requires TIME order. Rows arrive here in seq order, and on a session that
+ * runs a fleet those differ — which is itself one of the two things that made
+ * the old count wrong.
  */
 export function findCompactions(requests: RequestRow[]): { seq: number; from: number; to: number }[] {
-  return findCompactionPoints(requests);
+  return findCompactionPoints([...requests].sort((a, b) => a.ts - b.ts || a.seq - b.seq));
 }
 
 function fleetAnalytics(store: Store, prices: PriceTable) {
