@@ -560,6 +560,15 @@ tr.tt-dead .bar-cell span {
   color: var(--dim);
   font-weight: 300;
 }
+/* Provenance / scope line under a card's headline number. Its own line because
+   it qualifies the number rather than continuing it. */
+.card .card-sub {
+  font-family: var(--font-chrome);
+  font-size: 9.5px;
+  color: var(--dim);
+  margin-top: 3px;
+  letter-spacing: 0.02em;
+}
 .card.alert {
   border-color: rgba(248, 113, 113, 0.35);
 }

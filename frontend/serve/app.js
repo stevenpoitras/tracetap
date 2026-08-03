@@ -800,6 +800,48 @@
     );
   }
 
+  /**
+   * The Compactions card, preferring the measurement over the guess.
+   *
+   * Two provenances, never merged. `recorded` is Claude Code's own
+   * `compact_boundary` records — exact pre/post sizes and, uniquely, WHY it
+   * happened. `inferred` is our wire-side detector, which measured 75% false
+   * positives against the live index and cannot recover the trigger at all.
+   *
+   * The recorded set is scoped to the whole Claude Code session, not to this
+   * system-prompt group, so the card says so. It is suppressed on subagent-only
+   * groups: a subagent's context is not what got compacted.
+   */
+  function compactionCard(inferred, recorded) {
+    var recs = (recorded && recorded.records) || [];
+    if (!recs.length || (recorded && recorded.subagentOnly)) {
+      return card(
+        "Compactions",
+        inferred.length + ' <small class="dim">inferred</small>',
+        inferred.length > 0,
+      );
+    }
+    var byTrigger = {};
+    var dropped = 0;
+    recs.forEach(function (r) {
+      byTrigger[r.trigger] = (byTrigger[r.trigger] || 0) + 1;
+      dropped += r.droppedTokens || 0;
+    });
+    var mix = Object.keys(byTrigger)
+      .sort()
+      .map(function (k) {
+        return byTrigger[k] + " " + k;
+      })
+      .join(" · ");
+    return card(
+      "Compactions",
+      recs.length +
+        ' <small class="dim">' + esc(mix) + "</small>" +
+        '<div class="card-sub">' + fmtTok(dropped) + " dropped · session-wide</div>",
+      recs.length > 0,
+    );
+  }
+
   function turnSpineHtml(turns) {
     if (!turns.length) return '<div class="dim">No wire data for this session.</div>';
     var maxCtx = 1;
@@ -1305,7 +1347,7 @@
             ? ' <small class="dim">of ' + hooks.length + "</small>"
             : ""),
       ) +
-      card("Compactions", compactionList.length, compactionList.length > 0);
+      compactionCard(compactionList, data.recordedCompactions);
 
     var pane = initialPane || "flow";
     function subnavBtn(name, label, count) {

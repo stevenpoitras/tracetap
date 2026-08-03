@@ -1022,7 +1022,17 @@ export async function handleRequest(
         requests,
         hooks,
         flow,
+        // Compactions come in two provenances and the page says which. The
+        // recorded set is Claude Code's own `compact_boundary` records, which
+        // carry the trigger (auto vs /compact) and exact pre/post sizes; the
+        // inferred set is our wire-side guess, kept as the fallback for agents
+        // and captures that have no transcript. Never merged — a measurement
+        // and a guess that disagree is information, and averaging them away
+        // would be the worst of both.
         compactions: findCompactions(requests),
+        recordedCompactions: paneSection(sectionErrors, "recordedCompactions", () =>
+          store.recordedCompactions(sessionId),
+        ),
         siblings: paneSection(sectionErrors, "siblings", () =>
           store.sessionsFromSameSource(sessionId),
         ),
