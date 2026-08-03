@@ -1297,6 +1297,8 @@
         else if (type === "seg") inspectSegment(id);
         else if (type === "hook") inspectHook(id);
         else if (type === "ctp") inspectTimelinePoint(id);
+        else if (type === "tool") inspectTool(id);
+        else if (type === "prov") inspectProvider(id);
       }
       panesEl.addEventListener("click", function (e) {
         var el = e.target.closest("[data-inspect]");
@@ -1389,6 +1391,107 @@
       Inspector.show(id, {
         kind: p.compaction ? "compaction" : "api call",
         title: "#" + p.seq + " · " + fmtTok(p.contextTokens) + " context tokens",
+        body: lines.join("\n"),
+      });
+    }
+
+    /** Split "kind:<toolsetIdx>:<rest>" where rest may itself contain colons. */
+    function toolTaxTarget(id) {
+      var first = id.indexOf(":");
+      var second = id.indexOf(":", first + 1);
+      var ts = (toolTaxForPane || [])[Number(id.slice(first + 1, second))];
+      return { toolset: ts, name: id.slice(second + 1) };
+    }
+
+    function inspectTool(id) {
+      var t = toolTaxTarget(id);
+      if (!t.toolset) return;
+      var tool = null;
+      for (var i = 0; i < t.toolset.tools.length; i++) {
+        if (t.toolset.tools[i].name === t.name) {
+          tool = t.toolset.tools[i];
+          break;
+        }
+      }
+      if (!tool) return;
+      var total =
+        t.toolset.tools.reduce(function (a, x) {
+          return a + x.approxTokens;
+        }, 0) || 1;
+      var g = toolProvider(tool.name);
+      var lines = [
+        "provider       " + (g.kind === "builtin" ? "built-in" : g.kind + " · " + g.key),
+        "declared on    " + t.toolset.requestCount + " API calls",
+        "",
+        "size / call    " + fmtTok(tool.approxTokens) + " tokens",
+        "share of tools " + ((tool.approxTokens / total) * 100).toFixed(1) + "%",
+        "cumulative     " + fmtTok(tool.cumulativeTokens) + " tokens",
+        "invocations    " + tool.calls,
+      ];
+      if (tool.dead && t.toolset.deadTokensCumulative > 0) {
+        // Apportioned by cumulative share — the toolset cost is measured, the
+        // per-tool split is arithmetic on it, not a second estimate.
+        var share = tool.cumulativeTokens / t.toolset.deadTokensCumulative;
+        lines.push(
+          "",
+          "DEAD — declared on every call, never invoked",
+          "est. cost      " + fmtCost(share * t.toolset.deadCostUsd),
+        );
+      }
+      Inspector.show(id, { kind: tool.dead ? "dead tool" : "tool", title: tool.name, body: lines.join("\n") });
+    }
+
+    function inspectProvider(id) {
+      var t = toolTaxTarget(id);
+      if (!t.toolset) return;
+      var groups = toolProviderGroups(t.toolset.tools);
+      var g = null;
+      for (var i = 0; i < groups.length; i++) {
+        if (groups[i].key === t.name) {
+          g = groups[i];
+          break;
+        }
+      }
+      if (!g) return;
+      var total =
+        t.toolset.tools.reduce(function (a, x) {
+          return a + x.approxTokens;
+        }, 0) || 1;
+      var lines = [
+        "tools declared " + g.tools.length,
+        "size / call    " + fmtTok(g.approxTokens) + " tokens",
+        "share of tools " + ((g.approxTokens / total) * 100).toFixed(1) + "%",
+        "cumulative     " + fmtTok(g.cumulativeTokens) + " tokens",
+        "invocations    " + g.calls,
+      ];
+      if (g.deferred) {
+        lines.push(
+          "",
+          "DEFERRED — only the auth stubs are loaded. The full tool surface",
+          "arrives after authenticating, and authenticating is sticky: it opts",
+          "the connector into full loading on every later call.",
+        );
+      } else if (g.kind === "plugin" || g.kind === "mcp") {
+        lines.push(
+          "",
+          "Plugins and local MCP servers load in full regardless of the",
+          '"load tools when needed" setting, which only defers connectors.',
+        );
+      }
+      lines.push("", "TOOLS (by size)");
+      g.tools
+        .slice()
+        .sort(function (a, b) {
+          return b.approxTokens - a.approxTokens;
+        })
+        .forEach(function (x) {
+          lines.push(
+            "  " + fmtTok(x.approxTokens).padStart(7) + "  " + (x.calls ? "     " : "dead ") + x.name,
+          );
+        });
+      Inspector.show(id, {
+        kind: g.calls ? "provider" : "dead provider",
+        title: providerLabel(g),
         body: lines.join("\n"),
       });
     }
@@ -1969,6 +2072,7 @@
   // by index instead of every row carrying its full text in a DOM attribute.
   var xrayForPane = null;
   var timelineForPane = null;
+  var toolTaxForPane = null;
 
   function loadXray(sessionId, seq) {
     var token = ++xrayToken;
@@ -2848,6 +2952,75 @@
     return '<span class="pill ok">' + t.calls + "×</span>";
   }
 
+  /**
+   * Which provider shipped this tool, from the name alone.
+   *
+   * Claude Code namespaces every MCP tool as `mcp__<server>__<tool>`, and the
+   * server segment says where it came from: `plugin_<plugin>_<server>` for a
+   * plugin, `claude_ai_<Connector>` for a hosted connector, a bare name for a
+   * local server. Anything without the prefix is built in.
+   */
+  function toolProvider(name) {
+    if (name.indexOf("mcp__") !== 0) return { key: "built-in", kind: "builtin" };
+    var server = name.slice(5).split("__")[0];
+    if (server.indexOf("plugin_") === 0) {
+      return { key: server.slice(7).split("_")[0], kind: "plugin" };
+    }
+    if (server.indexOf("claude_ai_") === 0) {
+      return { key: server.slice(10), kind: "connector" };
+    }
+    return { key: server, kind: "mcp" };
+  }
+
+  // A connector that ships ONLY these is not really loaded — it is a stub the
+  // model can call to trigger auth, which is what "load tools when needed"
+  // leaves behind. Distinguishing stubs from full surfaces is the whole point
+  // of the breakdown: they cost ~350 tokens instead of ~8,000.
+  var AUTH_STUBS = { authenticate: 1, complete_authentication: 1 };
+
+  /** Group a toolset's tools by provider, with the deferral state resolved. */
+  function toolProviderGroups(tools) {
+    var byKey = {};
+    tools.forEach(function (t) {
+      var p = toolProvider(t.name);
+      var g = byKey[p.key];
+      if (!g) {
+        g = byKey[p.key] = {
+          key: p.key,
+          kind: p.kind,
+          tools: [],
+          approxTokens: 0,
+          cumulativeTokens: 0,
+          calls: 0,
+        };
+      }
+      g.tools.push(t);
+      g.approxTokens += t.approxTokens;
+      g.cumulativeTokens += t.cumulativeTokens;
+      g.calls += t.calls;
+    });
+    return Object.keys(byKey)
+      .map(function (k) {
+        var g = byKey[k];
+        g.deferred =
+          g.kind === "connector" &&
+          g.tools.every(function (t) {
+            return AUTH_STUBS[t.name.split("__").pop()] === 1;
+          });
+        return g;
+      })
+      .sort(function (a, b) {
+        return b.approxTokens - a.approxTokens;
+      });
+  }
+
+  function providerLabel(g) {
+    if (g.kind === "builtin") return "built-in";
+    if (g.kind === "plugin") return "plugin · " + g.key;
+    if (g.kind === "connector") return "connector · " + g.key;
+    return "mcp · " + g.key;
+  }
+
   function sessionToolsetHtml(ts, idx) {
     var maxTok = ts.tools.length ? ts.tools[0].approxTokens : 1;
     ts.tools.forEach(function (t) {
@@ -2858,7 +3031,11 @@
         return (
           "<tr" +
           (t.dead ? ' class="tt-dead"' : "") +
-          '><td class="bar-cell"><div class="bar' +
+          ' data-inspect="tool:' +
+          idx +
+          ":" +
+          esc(t.name) +
+          '" tabindex="0"><td class="bar-cell"><div class="bar' +
           (t.dead ? " warn" : "") +
           '" style="width:' +
           ((t.approxTokens / maxTok) * 100).toFixed(1) +
@@ -2877,6 +3054,67 @@
         );
       })
       .join("");
+
+    // Per-provider roll-up. 238 individually-ranked tools answer "which tool is
+    // biggest" but not "which integration am I paying for", and the second is
+    // the actionable one: a provider is something you can turn off, a tool is
+    // not. It also makes deferral state legible — 28 connectors sitting at two
+    // auth stubs look identical to 28 cheap connectors until they are grouped.
+    var groups = toolProviderGroups(ts.tools);
+    var totalTok = ts.tools.reduce(function (a, t) {
+      return a + t.approxTokens;
+    }, 0) || 1;
+    var maxGroup = groups.length ? groups[0].approxTokens : 1;
+    var groupRows = groups
+      .map(function (g) {
+        var deadTok = g.tools.reduce(function (a, t) {
+          return a + (t.dead ? t.approxTokens : 0);
+        }, 0);
+        return (
+          "<tr" +
+          (g.calls === 0 ? ' class="tt-dead"' : "") +
+          ' data-inspect="prov:' +
+          idx +
+          ":" +
+          esc(g.key) +
+          '" tabindex="0"><td class="bar-cell"><div class="bar' +
+          (g.calls === 0 ? " warn" : "") +
+          '" style="width:' +
+          ((g.approxTokens / maxGroup) * 100).toFixed(1) +
+          '%"></div><span>' +
+          esc(providerLabel(g)) +
+          (g.deferred ? ' <span class="pill dim">deferred</span>' : "") +
+          "</span></td>" +
+          '<td class="num">' +
+          g.tools.length +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(g.approxTokens) +
+          "</td>" +
+          '<td class="num">' +
+          ((g.approxTokens / totalTok) * 100).toFixed(1) +
+          "%</td>" +
+          '<td class="num">' +
+          (g.calls
+            ? '<span class="pill">' + g.calls + "</span>"
+            : '<span class="pill warn">0 · ' + fmtTok(deadTok) + " dead</span>") +
+          "</td></tr>"
+        );
+      })
+      .join("");
+    var providerTable =
+      '<h2 class="sec">By provider <small>(' +
+      groups.length +
+      " providers · a provider is something you can switch off; a tool is not)</small></h2>" +
+      '<div class="tbl-wrap"><table><thead><tr>' +
+      "<th>provider</th>" +
+      '<th class="num">tools</th>' +
+      '<th class="num">≈tok / call</th>' +
+      '<th class="num">share</th>' +
+      '<th class="num">calls</th>' +
+      "</tr></thead><tbody>" +
+      groupRows +
+      "</tbody></table></div>";
     return (
       '<div class="cards">' +
       card("Declared", ts.declaredCount) +
@@ -2894,6 +3132,8 @@
       (ts.requestCount === 1 ? "" : "s") +
       (idx > 0 ? " · variant" : "") +
       ", ranked by cumulative cost)</small></h2>" +
+      providerTable +
+      '<h2 class="sec">By tool</h2>' +
       '<div class="tbl-wrap"><table><thead><tr>' +
       "<th>tool</th>" +
       '<th class="num">≈tok / call</th>' +
@@ -2915,6 +3155,7 @@
             '<div class="empty-pane">No tool declarations captured for this session.</div>';
           return;
         }
+        toolTaxForPane = data.toolsets;
         host.innerHTML = data.toolsets.map(sessionToolsetHtml).join("");
       })
       .catch(function (err) {

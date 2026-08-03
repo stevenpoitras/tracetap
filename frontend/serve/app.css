@@ -1810,6 +1810,21 @@ h2.sec small {
   position: relative;
   z-index: 2;
 }
+/* Table rows became inspect targets; they need the affordance the chips and
+   segments already have, without turning into buttons. */
+tr[data-inspect] {
+  cursor: pointer;
+}
+tr[data-inspect]:hover td {
+  background: var(--surface);
+}
+tr[data-inspect].selected td {
+  box-shadow: inset 0 -1px 0 var(--accent), inset 0 1px 0 var(--accent);
+}
+tr[data-inspect]:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
 .ct-legend {
   font-size: 10px;
   margin: 0 0 14px 5.2ch;
