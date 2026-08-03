@@ -49,6 +49,16 @@ test("buildContextTimeline marks compaction pre/post sizes", () => {
   assert.equal(tl.peakContextTokens, 150_000);
 });
 
+/**
+ * Every rejection case below is paired with a POSITIVE twin.
+ *
+ * `compactionCount === 0` is also what a fixture that never reached the
+ * detector produces, so a lone negative assertion cannot tell "correctly
+ * rejected" from "never ran". Each pair changes ONE property and asserts the
+ * verdict flips, which proves the fixture is live and that the named gate is
+ * the thing doing the work.
+ */
+
 test("a drop far below the observed floor is not a compaction", () => {
   // 350 tokens. Real ones start at 24,287 — see `call` above. This exact shape
   // (items fall by one, context falls by a few hundred, and the session's
@@ -62,6 +72,17 @@ test("a drop far below the observed floor is not a compaction", () => {
   });
   assert.equal(tl.compactionCount, 0);
   assert.equal(tl.points[1].compaction, undefined);
+
+  // Twin: identical but for the size of the drop. Proves the fixture reaches
+  // the detector and that the FLOOR is what rejected the first one.
+  const real = buildContextTimeline({
+    requests: [
+      call({ seq: 0, ts: 100, promptTokens: 166_784, transcriptItems: 12 }),
+      call({ seq: 1, ts: 200, promptTokens: 130_000, transcriptItems: 9 }),
+    ],
+  });
+  assert.equal(real.compactionCount, 1);
+  assert.equal(real.points[1].compaction.droppedTokens, 36_784);
 });
 
 test("two calls in flight together are never a compaction", () => {
@@ -100,6 +121,19 @@ test("detection follows TIME order, not seq order", () => {
     ],
   });
   assert.equal(tl.compactionCount, 0);
+
+  // Twin: the SAME three rows with only the timestamps permuted, so that time
+  // order now agrees with seq order and the drop at seq 2 is genuine. If the
+  // fixture were inert, this would also read 0.
+  const ordered = buildContextTimeline({
+    requests: [
+      call({ seq: 0, ts: 100, promptTokens: 40_000, transcriptItems: 10 }),
+      call({ seq: 1, ts: 200, promptTokens: 240_000, transcriptItems: 60 }),
+      call({ seq: 2, ts: 400, promptTokens: 120_000, transcriptItems: 30 }),
+    ],
+  });
+  assert.equal(ordered.compactionCount, 1);
+  assert.equal(ordered.points[2].compaction.fromItems, 60);
 });
 
 test("compaction pre-size comes from the time predecessor, not seq-1", () => {
