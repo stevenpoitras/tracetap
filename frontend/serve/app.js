@@ -1252,7 +1252,13 @@
       pop.style.top = top + "px";
       pop.style.left = Math.max(8, left) + "px";
     }
+    // Idempotent by construction. This runs on every session draw AND on every
+    // x-ray load, so without the marker a second pass adds a second click
+    // handler to the same element — and since the handler toggles `hidden`,
+    // two of them cancel out and click-to-expand silently stops working.
     document.querySelectorAll("[data-full-payload]").forEach(function (el) {
+      if (el.dataset.popBound === "1") return;
+      el.dataset.popBound = "1";
       el.addEventListener("mouseenter", function () {
         var raw = el.getAttribute("data-full-payload");
         if (!raw) return;
@@ -3235,7 +3241,12 @@
     if (!t || t.id !== "hooks-observe-toggle") return;
     hooksShowObserveOnly = !!t.checked;
     var pane = document.getElementById("pane-hooks");
-    if (pane) pane.innerHTML = renderHooksPane(hooksForPane);
+    if (!pane) return;
+    // Re-rendering the pane throws away every element the popovers were bound
+    // to, so the new hotspots need binding or they are inert on hover and
+    // click. Safe to call repeatedly — bindPayloadPopovers marks what it binds.
+    pane.innerHTML = renderHooksPane(hooksForPane);
+    bindPayloadPopovers();
   });
 
   document.addEventListener("keydown", function (e) {
