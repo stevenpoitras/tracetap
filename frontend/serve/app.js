@@ -1296,6 +1296,7 @@
         if (type === "flow") inspectFlowNode(el, sessionId);
         else if (type === "seg") inspectSegment(id);
         else if (type === "hook") inspectHook(id);
+        else if (type === "ctp") inspectTimelinePoint(id);
       }
       panesEl.addEventListener("click", function (e) {
         var el = e.target.closest("[data-inspect]");
@@ -1330,6 +1331,65 @@
         kind: h.event || "hook",
         title: (h.hookName || "") + " · " + part,
         body: body,
+      });
+    }
+
+    /**
+     * One timeline bar. This is where the compaction cards went: the same
+     * numbers, on the point they describe, in the panel every other pane uses.
+     */
+    function inspectTimelinePoint(id) {
+      var seq = Number(id.slice(id.indexOf(":") + 1));
+      var pts = (timelineForPane && timelineForPane.points) || [];
+      var p = null;
+      for (var i = 0; i < pts.length; i++) {
+        if (pts[i].seq === seq) {
+          p = pts[i];
+          break;
+        }
+      }
+      if (!p) return;
+      var lines = [
+        "context read   " + fmtTok(p.contextTokens) + " tokens",
+        "  cache read   " + fmtTok(p.cacheRead),
+        "  cache write  " + fmtTok(p.cacheCreation),
+        "  fresh input  " + fmtTok(p.promptTokens),
+        "output         " + fmtTok(p.completionTokens),
+        "transcript     " + p.transcriptItems + " items",
+        "approx (chars) " + fmtTok(p.approxTokens) + " tokens",
+        "model          " + (p.model || "—"),
+        "at             " + new Date(p.ts * 1000).toLocaleTimeString(),
+      ];
+      if (p.compaction) {
+        var c = p.compaction;
+        lines.push(
+          "",
+          "COMPACTION",
+          "  items        " + c.fromItems + " → " + c.toItems + " (dropped " + c.droppedItems + ")",
+          "  context      " +
+            fmtTok(c.preContextTokens) +
+            " → " +
+            fmtTok(c.postContextTokens) +
+            " (freed " +
+            fmtTok(c.droppedTokens) +
+            ")",
+          "  approx       " + fmtTok(c.preApproxTokens) + " → " + fmtTok(c.postApproxTokens),
+        );
+      }
+      if (p.buckets) {
+        lines.push("", "COMPOSITION (approx tokens)");
+        Object.keys(p.buckets)
+          .sort(function (a, b) {
+            return p.buckets[b] - p.buckets[a];
+          })
+          .forEach(function (k) {
+            lines.push("  " + (k + "            ").slice(0, 13) + fmtTok(p.buckets[k]));
+          });
+      }
+      Inspector.show(id, {
+        kind: p.compaction ? "compaction" : "api call",
+        title: "#" + p.seq + " · " + fmtTok(p.contextTokens) + " context tokens",
+        body: lines.join("\n"),
       });
     }
 
@@ -1659,11 +1719,46 @@
     );
   }
 
+  /**
+   * Round a peak up to a readable axis maximum, so the top gridline is a
+   * number a human would choose (150K, not 147,312).
+   */
+  function niceCeil(v) {
+    if (v <= 0) return 1;
+    var mag = Math.pow(10, Math.floor(Math.log10(v)));
+    var steps = [1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10];
+    for (var i = 0; i < steps.length; i++) {
+      if (steps[i] * mag >= v) return steps[i] * mag;
+    }
+    return 10 * mag;
+  }
+
   function renderContextTimeline(tl) {
     if (!tl || !tl.points || !tl.points.length) {
       return '<div class="dim">No context timeline points.</div>';
     }
-    var peak = Math.max(1, tl.peakPromptTokens || tl.peakApproxTokens || 1);
+    // Height is keyed to contextTokens — what the model actually read. The old
+    // series was `promptTokens`, which under prompt caching is the UNCACHED
+    // remainder: literally 2 on every call of a cached agentic session, so the
+    // chart was 224 identical bars and the header read "peak 2 prompt tokens".
+    var peak = Math.max(1, tl.peakContextTokens || tl.peakApproxTokens || 1);
+    var axisMax = niceCeil(peak);
+    var ticks = [1, 0.75, 0.5, 0.25, 0];
+
+    var caveat =
+      tl.outOfOrderPairs > 0
+        ? ' <span class="warn-note" title="' +
+          esc(
+            tl.outOfOrderPairs +
+              " adjacent call pairs run backwards in wall-clock time, so this " +
+              "session interleaves concurrent conversations (a main thread plus " +
+              "subagents). Neighbouring bars are not neighbouring turns.",
+          ) +
+          '">⚠ ' +
+          tl.outOfOrderPairs +
+          " interleaved</span>"
+        : "";
+
     var html =
       '<h2 class="sec">Context size timeline <small>' +
       tl.points.length +
@@ -1671,40 +1766,51 @@
       tl.compactionCount +
       " compaction(s) · peak " +
       fmtTok(peak) +
-      " prompt tokens</small></h2>" +
+      " context tokens</small>" +
+      caveat +
+      "</h2>" +
+      // The axis is the point of this block: without it the bars were a shape
+      // with no magnitude, and the only number on screen was a wrong one.
+      '<div class="ct-frame">' +
+      '<div class="ct-axis" aria-hidden="true">' +
+      ticks
+        .map(function (t) {
+          return (
+            '<span class="ct-tick" style="bottom:' +
+            t * 100 +
+            '%">' +
+            (t === 0 ? "0" : fmtTok(Math.round(axisMax * t))) +
+            "</span>"
+          );
+        })
+        .join("") +
+      "</div>" +
+      '<div class="ct-plot">' +
+      ticks
+        .map(function (t) {
+          return '<span class="ct-grid" style="bottom:' + t * 100 + '%"></span>';
+        })
+        .join("") +
       '<div class="context-timeline" id="context-timeline">';
+
     tl.points.forEach(function (p) {
-      var h = Math.max(4, Math.round((p.promptTokens / peak) * 100));
+      var h = Math.max(1, Math.round((p.contextTokens / axisMax) * 100));
       var cls =
         "ct-bar" +
         (p.compaction ? " compact" : "") +
         (p.errored ? " errored" : "");
-      var title =
-        "#" +
-        p.seq +
-        " · " +
-        fmtTok(p.promptTokens) +
-        " prompt · " +
-        p.transcriptItems +
-        " items" +
-        (p.compaction
-          ? " · COMPACTION " +
-            p.compaction.fromItems +
-            "→" +
-            p.compaction.toItems +
-            " items · tokens " +
-            fmtTok(p.compaction.prePromptTokens) +
-            "→" +
-            fmtTok(p.compaction.postPromptTokens)
-          : "");
       html +=
         '<button type="button" class="' +
         cls +
         '" data-seq="' +
         p.seq +
-        '" title="' +
-        esc(title) +
-        '" style="height:' +
+        '" data-inspect="ctp:' +
+        p.seq +
+        '" aria-label="call ' +
+        p.seq +
+        ", " +
+        fmtTok(p.contextTokens) +
+        ' context tokens" style="height:' +
         h +
         '%">' +
         '<span class="ct-seq">' +
@@ -1713,41 +1819,17 @@
         (p.compaction ? '<span class="ct-compact">⇣</span>' : "") +
         "</button>";
     });
-    html += "</div>";
-    var comps = tl.points.filter(function (p) {
-      return p.compaction;
-    });
-    if (comps.length) {
-      html += '<div class="compaction-list">';
-      comps.forEach(function (p) {
-        var c = p.compaction;
-        html +=
-          '<div class="compaction-card">' +
-          '<span class="pill">compaction</span> API #' +
-          p.seq +
-          " · items <b>" +
-          c.fromItems +
-          " → " +
-          c.toItems +
-          "</b> (dropped " +
-          c.droppedItems +
-          ")" +
-          " · tokens <b>" +
-          fmtTok(c.prePromptTokens) +
-          " → " +
-          fmtTok(c.postPromptTokens) +
-          "</b>" +
-          " · approx <b>" +
-          fmtTok(c.preApproxTokens) +
-          " → " +
-          fmtTok(c.postApproxTokens) +
-          "</b>" +
-          ' <button type="button" class="btn-xray" data-seq="' +
-          p.seq +
-          '">inspect</button></div>';
-      });
-      html += "</div>";
-    }
+    html += "</div></div></div>";
+    // The compaction cards used to stack below as a second, parallel list —
+    // 85 of them on this session, each with its own `inspect` button and its
+    // own idea of what detail looks like. They are the same points already on
+    // the timeline, so the bar IS the row now: it carries the ⇣ marker and
+    // opens the identical detail in the shared inspector.
+    html +=
+      '<div class="ct-legend dim">' +
+      "bar height = context tokens read (uncached input + cache read + cache write) · " +
+      "⇣ = compaction · click a bar to inspect" +
+      "</div>";
     return html;
   }
 
@@ -1852,15 +1934,10 @@
     if (!host) return;
     fetchJSON("/api/session/" + encodeURIComponent(sessionId) + "/timeline")
       .then(function (tl) {
+        timelineForPane = tl;
         host.innerHTML = renderContextTimeline(tl);
-        host
-          .querySelectorAll(".compaction-card .btn-xray[data-seq]")
-          .forEach(function (btn) {
-            btn.addEventListener("click", function () {
-              activatePane("xray");
-              loadXray(sessionId, Number(btn.getAttribute("data-seq")));
-            });
-          });
+        // The separate compaction-card list is gone; each card's `inspect`
+        // button is now the bar itself, via the delegated [data-inspect].
         var tlEl = host.querySelector("#context-timeline");
         if (tlEl) {
           tlEl.addEventListener("click", function (e) {
@@ -1891,6 +1968,7 @@
   // The rendered x-ray response, kept so the inspector can resolve a segment
   // by index instead of every row carrying its full text in a DOM attribute.
   var xrayForPane = null;
+  var timelineForPane = null;
 
   function loadXray(sessionId, seq) {
     var token = ++xrayToken;

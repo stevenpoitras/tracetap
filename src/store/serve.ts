@@ -15,6 +15,7 @@ import { auditOneFilePath, reportFromScans } from "../audit";
 import type { AuditFileScan, AuditReport } from "../audit";
 import type { FlowGraph } from "../flow/derive";
 import type { ContextTimeline } from "../context/timeline";
+import { findCompactions as findCompactionPoints } from "../context/timeline";
 
 /**
  * `tracetap serve` — the local observatory over the cross-session store.
@@ -219,15 +220,18 @@ function percentile(sorted: number[], q: number): number | null {
   return sorted[idx];
 }
 
-/** Compaction points: requests where the resent transcript SHRANK vs the previous call. */
+/**
+ * Compaction points for one session.
+ *
+ * Delegates to the timeline's definition rather than keeping a second copy.
+ * The copy that used to live here tested transcript items only, so the session
+ * summary card reported 85 compactions while the timeline — already fixed to
+ * require an actual context drop — reported 54 on the same session. Two
+ * implementations of one concept will always drift; the only reliable fix is
+ * for there to be one.
+ */
 export function findCompactions(requests: RequestRow[]): { seq: number; from: number; to: number }[] {
-  const out: { seq: number; from: number; to: number }[] = [];
-  for (let i = 1; i < requests.length; i++) {
-    const prev = requests[i - 1].transcriptItems;
-    const cur = requests[i].transcriptItems;
-    if (prev > 0 && cur < prev) out.push({ seq: requests[i].seq, from: prev, to: cur });
-  }
-  return out;
+  return findCompactionPoints(requests);
 }
 
 function fleetAnalytics(store: Store, prices: PriceTable) {
@@ -372,14 +376,20 @@ function fleetAnalytics(store: Store, prices: PriceTable) {
     .slice(0, 20);
 
   // Mid-task compactions: transcript shrank between consecutive calls.
+  // Both the transcript AND the context must shrink — see findCompactions.
+  // Counting item drops alone swept up every hop between interleaved subagent
+  // conversations, which on a fleet session is most adjacent pairs.
   const compactionRow = store.db
     .prepare(
       `SELECT COUNT(*) AS total, COUNT(DISTINCT session_id) AS sessions FROM (
          SELECT session_id,
                 transcript_items - LAG(transcript_items)
-                  OVER (PARTITION BY session_id ORDER BY seq) AS delta
+                  OVER (PARTITION BY session_id ORDER BY seq) AS item_delta,
+                (prompt_tokens + cache_read + cache_creation)
+                  - LAG(prompt_tokens + cache_read + cache_creation)
+                  OVER (PARTITION BY session_id ORDER BY seq) AS ctx_delta
          FROM requests
-       ) WHERE delta < 0`,
+       ) WHERE item_delta < 0 AND ctx_delta < 0`,
     )
     .get() as { total: number; sessions: number };
 

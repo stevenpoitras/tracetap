@@ -396,7 +396,7 @@ test("GET /api/session/<id>/timeline serves the context timeline separately", as
   assert.ok(Array.isArray(tl.points));
   assert.ok(tl.points.length >= 1);
   assert.equal(typeof tl.compactionCount, "number");
-  assert.equal(typeof tl.peakPromptTokens, "number");
+  assert.equal(typeof tl.peakContextTokens, "number");
   // Every point carries composition, whether precomputed at index time or
   // recovered by the fallback — the pane renders off these numbers.
   assert.ok(tl.points.every((p) => typeof p.approxTokens === "number"));
