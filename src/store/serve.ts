@@ -1018,6 +1018,9 @@ export async function handleRequest(
         hooks,
         flow,
         compactions: findCompactions(requests),
+        siblings: paneSection(sectionErrors, "siblings", () =>
+          store.sessionsFromSameSource(sessionId),
+        ),
         reportAvailable: fs.existsSync(reportPathFor(session.sourcePath)),
         ...(Object.keys(sectionErrors).length ? { sectionErrors } : {}),
       });

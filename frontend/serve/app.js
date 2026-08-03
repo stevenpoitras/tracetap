@@ -483,10 +483,20 @@
   function route() {
     var h = location.hash.replace(/^#/, "") || "sessions";
     var m;
-    // session/<id>[/flow|hooks|xray|wire|tools][/step-N]
+    // session/<id>[/<pane>][/step-N]
+    //
+    // The pane list is built from SESSION_PANES rather than spelled out here.
+    // It used to be a literal, so adding a pane silently broke its own URL:
+    // the whole route stopped matching and fell through to the session LIST,
+    // which looks like the pane failed to render rather than like a routing
+    // miss. One list, one place to add to.
     if (
       (m = h.match(
-        /^session\/([^/]+)(?:\/(flow|hooks|xray|wire|tools))?(?:\/step-(\d+))?$/,
+        new RegExp(
+          "^session\\/([^/]+)(?:\\/(" +
+            SESSION_PANES.join("|") +
+            "))?(?:\\/step-(\\d+))?$",
+        ),
       ))
     ) {
       renderSession(
@@ -1156,6 +1166,7 @@
     var hooks = data.hooks || [];
     hooksForPane = hooks;
     var flow = data.flow || { nodes: [], edges: [] };
+    var siblings = data.siblings || [];
     var compactSeqs = {};
     var compactionList = data.compactions || [];
     compactionList.forEach(function (c) {
@@ -1241,6 +1252,14 @@
           encodeURIComponent(s.sessionId) +
           '" target="_blank" rel="noopener">wire report ↗</a>'
         : "") +
+      // The system prompt was reachable only as 8 characters of hash inside a
+      // waterfall row's hover tooltip — you could see that a prompt existed
+      // but never read it without hunting the Prompts tab by eye.
+      (reqs.length && reqs[0].promptHash
+        ? ' <a class="head-link" href="#prompt/' +
+          esc(reqs[0].promptHash) +
+          '">system prompt ↗</a>'
+        : "") +
       "</span></div>" +
       '<div class="cards">' +
       cards +
@@ -1252,6 +1271,7 @@
       subnavBtn("xray", "Context X-Ray") +
       subnavBtn("tools", "Tool Tax") +
       subnavBtn("wire", "Wire") +
+      subnavBtn("related", "Related", siblings.length || null) +
       "</nav>" +
       '<div class="session-body">' +
       '<div class="session-panes">' +
@@ -1294,6 +1314,11 @@
       steps.map(stepCard).join("") +
       "</div>" +
       minimapHtml(steps) +
+      "</section>" +
+      '<section class="session-pane' +
+      (pane === "related" ? " active" : "") +
+      '" id="pane-related">' +
+      renderRelatedPane(siblings, s) +
       "</section>" +
       "</div>" +
       // One inspector for all five panes. It lives beside `.session-panes`
@@ -1955,6 +1980,78 @@
     }
     return 10 * mag;
   }
+
+  /**
+   * Sessions captured in the same trace log.
+   *
+   * One `.claude-trace` log is one proxied CLI process, so everything in it
+   * shares a terminal, a directory and a stretch of wall-clock time. A live
+   * capture put 24 sessions in a single log — a main thread and the fleet it
+   * spawned — which the session list rendered as 24 unrelated rows.
+   *
+   * Presented flat, not as a tree. Which session SPAWNED which needs per-agent
+   * identity the rows do not carry yet, and a tree would assert a parentage
+   * that has not been established.
+   */
+  function renderRelatedPane(siblings, s) {
+    if (!siblings.length) {
+      return (
+        '<div class="empty-pane">No other sessions were captured in this trace log.</div>'
+      );
+    }
+    var totalCost = siblings.reduce(function (a, x) {
+      return a + (x.costUsd || 0);
+    }, 0);
+    var log = (s.sourcePath || "").split("/").pop();
+    var rows = siblings
+      .map(function (x) {
+        return (
+          '<tr class="click" data-goto="' +
+          esc(x.sessionId) +
+          '"><td>' +
+          agentPill(x.agent) +
+          "</td><td>" +
+          esc(x.model || "—") +
+          "</td><td>" +
+          fmtTime(x.startedAt) +
+          "</td><td class=\"num\">" +
+          fmtDur(x.durationMs) +
+          "</td><td class=\"num\">" +
+          (x.turns == null ? "—" : x.turns) +
+          "</td><td class=\"num\">" +
+          fmtCost(x.costUsd) +
+          "</td></tr>"
+        );
+      })
+      .join("");
+    return (
+      '<h2 class="sec">Captured alongside <small>(' +
+      siblings.length +
+      " other session" +
+      (siblings.length === 1 ? "" : "s") +
+      " in " +
+      esc(log) +
+      " · " +
+      fmtCost(totalCost) +
+      " combined)</small></h2>" +
+      '<div class="dim rel-note">One trace log is one CLI process. These share a ' +
+      "terminal and a time window with this session — siblings, not children: " +
+      "establishing which spawned which needs per-agent identity that is not " +
+      "captured yet.</div>" +
+      '<div class="tbl-wrap"><table><thead><tr>' +
+      "<th>agent</th><th>model</th><th>started</th>" +
+      '<th class="num">duration</th><th class="num">turns</th><th class="num">cost</th>' +
+      "</tr></thead><tbody>" +
+      rows +
+      "</tbody></table></div>"
+    );
+  }
+
+  document.addEventListener("click", function (e) {
+    var tr = e.target.closest && e.target.closest("tr[data-goto]");
+    if (!tr) return;
+    location.hash = "#session/" + encodeURIComponent(tr.getAttribute("data-goto"));
+  });
 
   function renderContextTimeline(tl) {
     if (!tl || !tl.points || !tl.points.length) {
@@ -3914,7 +4011,7 @@
   // A turn stays selected as you cross panes, so "what did the context look
   // like on this call" and "what did the wire do on this call" are one
   // keystroke apart instead of a click, a scroll and a hunt.
-  var SESSION_PANES = ["flow", "hooks", "xray", "tools", "wire"];
+  var SESSION_PANES = ["flow", "hooks", "xray", "tools", "wire", "related"];
   var selectedSeq = null;
   // Where you were in each pane. Returning a pane to its first row every time
   // makes LEFT/RIGHT feel like it discards your place, which defeats the point

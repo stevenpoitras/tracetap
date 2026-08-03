@@ -1858,6 +1858,20 @@ tr[data-inspect]:focus-visible {
 [data-bucket][hidden] {
   display: none !important;
 }
+.head-link {
+  color: var(--accent);
+  text-decoration: none;
+  margin-left: 10px;
+  font-size: 11px;
+}
+.head-link:hover {
+  text-decoration: underline;
+}
+.rel-note {
+  font-size: 11px;
+  max-width: 78ch;
+  margin-bottom: 10px;
+}
 button.xray-row {
   font-family: inherit;
   font-size: inherit;
@@ -1865,11 +1879,24 @@ button.xray-row {
   text-align: left;
   cursor: pointer;
   width: 100%;
+  /* Turning these rows into buttons handed every one of them the UA's default
+     border, so all six read as outlined and the pressed state was
+     indistinguishable from the rest. A button used as a row has to give the
+     chrome back. */
+  border: 0;
+  background: transparent;
+  padding: 2px 4px;
+  margin: 0;
+  appearance: none;
 }
 button.xray-row[aria-pressed="true"] {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
   background: var(--surface);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+/* Unpressed rows dim while ANY filter is on, so "which of these am I looking
+   at" is answered by contrast rather than by reading six outlines. */
+.xray-stack:has([aria-pressed="true"]) button.xray-row[aria-pressed="false"] {
+  opacity: 0.4;
 }
 button.xray-row[aria-pressed="true"] .xray-row-label {
   color: var(--bright);

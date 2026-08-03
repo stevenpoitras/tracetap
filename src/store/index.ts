@@ -1635,6 +1635,33 @@ export class Store {
   }
 
   /**
+   * Other sessions captured in the SAME trace log, oldest first.
+   *
+   * The strongest "related sessions" signal available without per-agent
+   * identity: one `.claude-trace` log is one proxied CLI process, so every
+   * session in it shares a terminal, a working directory and a stretch of
+   * wall-clock time. On a live capture, one log held 24 sessions spanning
+   * 00:40 to 03:20 — a main thread and the fleet it spawned, which the session
+   * list showed as 24 unrelated rows.
+   *
+   * This is a SIBLING relation, not a parent/child one. Establishing which
+   * session spawned which needs agent identity that the rows do not carry yet,
+   * so the shape here is deliberately a flat list rather than a tree that
+   * would imply knowledge we do not have.
+   */
+  sessionsFromSameSource(sessionId: string): SessionSummary[] {
+    // One listSessions() pass, not one per sibling: getSession re-lists every
+    // session on each call, so mapping ids through it would be quadratic — and
+    // this is the case with 24 siblings, not 2.
+    const all = this.listSessions();
+    const self = all.find((s) => s.sessionId === sessionId);
+    if (!self) return [];
+    return all
+      .filter((s) => s.sessionId !== sessionId && s.sourcePath === self.sourcePath)
+      .sort((a, b) => a.startedAt - b.startedAt);
+  }
+
+  /**
    * Hooks for a wire session: exact `session_id` match OR time-overlap with the
    * session window (±10 min slack). Wire conversation keys rarely equal Claude's
    * hook session_id, so time correlation is the practical bridge.
