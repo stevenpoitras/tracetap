@@ -11,6 +11,136 @@
   var hooksShowObserveOnly = false;
   var hooksForPane = [];
 
+  var INSPECTOR_EMPTY =
+    '<div class="dim inspector-empty">Select a row to inspect its payload</div>';
+
+  /**
+   * The one detail surface, shared by every pane.
+   *
+   * A docked panel rather than a hover popover, and that is a correctness
+   * choice more than a taste one: a popover has to compute its own position,
+   * flip near edges, out-race a hide timer, and win a z-index fight against
+   * every scroll container it floats over. A panel in normal flow has none of
+   * those failure modes, and its text can be selected, copied, and reached
+   * with a keyboard for free.
+   *
+   * Sources register by `data-inspect="<type>:<id>"` and are resolved lazily,
+   * so nothing has to be stringified into a DOM attribute to be inspectable.
+   */
+  var Inspector = (function () {
+    var current = null;
+    var token = 0;
+
+    function host() {
+      return document.getElementById("inspector");
+    }
+
+    function clear() {
+      var el = host();
+      current = null;
+      token += 1;
+      if (el) {
+        el.innerHTML = INSPECTOR_EMPTY;
+        el.classList.remove("open");
+      }
+      document
+        .querySelectorAll("[data-inspect].selected")
+        .forEach(function (n) {
+          n.classList.remove("selected");
+          n.removeAttribute("aria-current");
+        });
+    }
+
+    /**
+     * @param spec {kind,title,body,bodyType,actions,load}
+     *   `load` is an optional promise resolving to the full body; a stale
+     *   response is discarded by comparing the token captured at show() time,
+     *   which is what stops a slow fetch overwriting a newer selection.
+     */
+    function show(sourceId, spec) {
+      var el = host();
+      if (!el) return;
+      current = sourceId;
+      var mine = ++token;
+
+      var head =
+        '<div class="inspector-head">' +
+        (spec.kind ? '<span class="pill">' + esc(spec.kind) + "</span> " : "") +
+        '<span class="inspector-title">' +
+        esc(spec.title || "") +
+        "</span>" +
+        '<button type="button" class="inspector-close" title="Close (Esc)" aria-label="Close">×</button>' +
+        "</div>";
+
+      var body =
+        '<pre class="payload" id="inspector-body">' +
+        esc(spec.body == null ? "" : String(spec.body)) +
+        "</pre>";
+
+      var note = spec.loadingNote
+        ? '<div class="dim" id="inspector-note">' + esc(spec.loadingNote) + "</div>"
+        : "";
+
+      var actions = (spec.actions || [])
+        .map(function (a, i) {
+          return (
+            '<button type="button" class="btn-xray" data-act="' +
+            i +
+            '">' +
+            esc(a.label) +
+            "</button>"
+          );
+        })
+        .join("");
+
+      el.innerHTML = head + body + note + actions;
+      el.classList.add("open");
+
+      el.querySelector(".inspector-close").addEventListener("click", clear);
+      (spec.actions || []).forEach(function (a, i) {
+        var b = el.querySelector('[data-act="' + i + '"]');
+        if (b) b.addEventListener("click", a.onClick);
+      });
+
+      document
+        .querySelectorAll("[data-inspect].selected")
+        .forEach(function (n) {
+          n.classList.remove("selected");
+          n.removeAttribute("aria-current");
+        });
+      var src = document.querySelector(
+        '[data-inspect="' + cssEscape(sourceId) + '"]',
+      );
+      if (src) {
+        src.classList.add("selected");
+        src.setAttribute("aria-current", "true");
+      }
+
+      if (typeof spec.load === "function") {
+        spec.load()
+          .then(function (full) {
+            if (mine !== token) return; // superseded by a newer selection
+            var b = document.getElementById("inspector-body");
+            var n = document.getElementById("inspector-note");
+            if (b) b.textContent = full;
+            if (n) n.remove();
+          })
+          .catch(function (err) {
+            if (mine !== token) return;
+            var n = document.getElementById("inspector-note");
+            if (n) n.textContent = "full payload unavailable — " + (err.message || err);
+          });
+      }
+    }
+
+    return { show: show, clear: clear, selected: function () { return current; } };
+  })();
+
+  /** Minimal attribute-selector escaping — ids here are ascii but may hold ':' and '/'. */
+  function cssEscape(s) {
+    return String(s).replace(/["\\]/g, "\\$&");
+  }
+
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
       return {
@@ -1046,6 +1176,7 @@
       subnavBtn("tools", "Tool Tax") +
       subnavBtn("wire", "Wire") +
       "</nav>" +
+      '<div class="session-body">' +
       '<div class="session-panes">' +
       '<section class="session-pane' +
       (pane === "flow" ? " active" : "") +
@@ -1087,6 +1218,13 @@
       "</div>" +
       minimapHtml(steps) +
       "</section>" +
+      "</div>" +
+      // One inspector for all five panes. It lives beside `.session-panes`
+      // rather than inside any one of them, which is the whole point: a panel
+      // owned by the Flow pane can only ever serve the Flow pane.
+      '<aside class="inspector" id="inspector">' +
+      INSPECTOR_EMPTY +
+      "</aside>" +
       "</div>" +
       '<div id="payload-pop" class="payload-pop" hidden></div>';
     setView(html);
@@ -1130,93 +1268,92 @@
         activatePane(a.getAttribute("data-pane"));
       });
     }
-    var flowEl = document.getElementById("flow-graph");
-    if (flowEl) {
-      flowEl.addEventListener("click", function (e) {
-        var node = e.target.closest(".flow-node");
-        if (!node) return;
-        var detail = document.getElementById("flow-detail");
-        if (!detail) return;
-        var raw = node.getAttribute("data-detail");
-        var kind = node.getAttribute("data-kind");
-        var label = node.getAttribute("data-label");
-        var html =
-          '<div class="flow-detail-head"><span class="pill">' +
-          esc(kind) +
-          "</span> " +
-          esc(label) +
-          "</div>";
-        var preview = node.getAttribute("data-detail-preview");
-        if (raw) {
-          try {
-            html +=
-              '<pre class="payload">' +
-              esc(JSON.stringify(JSON.parse(raw), null, 2)) +
-              "</pre>";
-          } catch (err) {
-            html += '<pre class="payload">' + esc(raw) + "</pre>";
-          }
-        } else if (preview) {
-          // Show the preview immediately so the pane never looks empty, then
-          // swap in the full payload when it arrives.
-          html +=
-            '<pre class="payload" id="flow-detail-body">' +
-            esc(preview) +
-            "…</pre>" +
-            '<div class="dim" id="flow-detail-note">loading full payload (' +
-            fmtTok(Number(node.getAttribute("data-detail-chars") || 0)) +
-            " chars)…</div>";
+    // One delegated listener for every inspectable row in every pane. Panes
+    // re-render their own innerHTML freely (the hooks filter, the x-ray reload)
+    // and delegation means none of them ever need re-binding — the class of bug
+    // that made click-to-expand inert for months.
+    var panesEl = document.querySelector(".session-panes");
+    if (panesEl) {
+      function activate(el) {
+        var id = el.getAttribute("data-inspect") || "";
+        var type = id.slice(0, id.indexOf(":"));
+        if (type === "flow") inspectFlowNode(el, sessionId);
+      }
+      panesEl.addEventListener("click", function (e) {
+        var el = e.target.closest("[data-inspect]");
+        if (el) activate(el);
+      });
+      panesEl.addEventListener("keydown", function (e) {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        var el = e.target.closest && e.target.closest("[data-inspect]");
+        if (!el) return;
+        e.preventDefault();
+        activate(el);
+      });
+    }
+
+    function inspectFlowNode(node, sessionId) {
+      var raw = node.getAttribute("data-detail");
+      var preview = node.getAttribute("data-detail-preview");
+      var kind = node.getAttribute("data-kind");
+      var nodeId = node.getAttribute("data-node-id");
+      var seq = node.getAttribute("data-seq");
+
+      var body = "";
+      var loadingNote = "";
+      var load = null;
+      if (raw) {
+        try {
+          body = JSON.stringify(JSON.parse(raw), null, 2);
+        } catch (err) {
+          body = raw;
         }
-        var seq = node.getAttribute("data-seq");
-        if (seq != null && seq !== "") {
-          html +=
-            '<button type="button" class="btn-xray" data-seq="' +
-            esc(seq) +
-            '">Open Context X-Ray for API #' +
-            esc(seq) +
-            "</button>";
-        }
-        if (kind === "hook") {
-          html +=
-            '<button type="button" class="btn-xray" data-goto-hooks="1">Open Hooks pane</button>';
-        }
-        detail.innerHTML = html;
-        if (!raw && preview) {
-          var nodeId = node.getAttribute("data-node-id");
-          fetchJSON(
+      } else if (preview) {
+        // Show the preview immediately so the panel never looks empty, then
+        // swap in the full payload when it arrives.
+        body = preview + "…";
+        loadingNote =
+          "loading full payload (" +
+          fmtTok(Number(node.getAttribute("data-detail-chars") || 0)) +
+          " chars)…";
+        load = function () {
+          return fetchJSON(
             "/api/session/" +
               encodeURIComponent(sessionId) +
               "/flow/" +
               encodeURIComponent(nodeId),
-          )
-            .then(function (full) {
-              var body = document.getElementById("flow-detail-body");
-              var note = document.getElementById("flow-detail-note");
-              // The user may have clicked another node while this was in
-              // flight; only write if this node's placeholder is still shown.
-              if (!body || detail.getAttribute("data-showing") !== nodeId) return;
-              body.textContent = JSON.stringify(full.detail, null, 2);
-              if (note) note.remove();
-            })
-            .catch(function (err) {
-              var note = document.getElementById("flow-detail-note");
-              if (note) note.textContent = "full payload unavailable — " + (err.message || err);
-            });
-        }
-        detail.setAttribute("data-showing", node.getAttribute("data-node-id") || "");
-        var btn = detail.querySelector(".btn-xray[data-seq]");
-        if (btn) {
-          btn.addEventListener("click", function () {
+          ).then(function (full) {
+            return JSON.stringify(full.detail, null, 2);
+          });
+        };
+      }
+
+      var actions = [];
+      if (seq != null && seq !== "") {
+        actions.push({
+          label: "Open Context X-Ray for API #" + seq,
+          onClick: function () {
             activatePane("xray");
-            loadXray(sessionId, Number(btn.getAttribute("data-seq")));
-          });
-        }
-        var hb = detail.querySelector("[data-goto-hooks]");
-        if (hb) {
-          hb.addEventListener("click", function () {
+            loadXray(sessionId, Number(seq));
+          },
+        });
+      }
+      if (kind === "hook") {
+        actions.push({
+          label: "Open Hooks pane",
+          onClick: function () {
             activatePane("hooks");
-          });
-        }
+          },
+        });
+      }
+
+      Inspector.show("flow:" + nodeId, {
+        kind: kind,
+        title: node.getAttribute("data-label") || "",
+        body: body,
+        loadingNote: loadingNote,
+        actions: actions,
+        load: load,
       });
     }
     var xraySel = document.getElementById("xray-seq");
@@ -1633,7 +1770,9 @@
         esc(n.label) +
         '" data-node-id="' +
         esc(n.id) +
-        '"' +
+        '" data-inspect="flow:' +
+        esc(n.id) +
+        '" tabindex="0" role="button"' +
         (n.requestSeq != null ? ' data-seq="' + n.requestSeq + '"' : "") +
         // Large payloads arrive as a preview only; the rest is fetched on click.
         // Inlining every node's full detail put hundreds of KB into DOM
@@ -1661,8 +1800,9 @@
       if (i < nodes.length - 1)
         html += '<div class="flow-edge" aria-hidden="true"></div>';
     });
-    html +=
-      '</div><aside class="flow-detail" id="flow-detail"><div class="dim">Click a node to inspect payload</div></aside></div>';
+    // No local detail panel any more — the session-level inspector serves every
+    // pane, so the flow graph is just the graph.
+    html += "</div></div>";
     return html;
   }
 
@@ -3273,6 +3413,13 @@
       location.hash = "#" + TABS[Number(e.key) - 1];
     else if (e.key === "?") toggleHelp();
     else if (e.key === "Escape") {
+      // Dismiss the inspector before leaving the page. Escape meaning "close
+      // what I just opened" has to win over Escape meaning "go back", or there
+      // is no way to close a selection without losing your place.
+      if (Inspector.selected()) {
+        Inspector.clear();
+        return;
+      }
       if (current.name === "session") location.hash = "#sessions";
       else if (current.name === "prompt") location.hash = "#prompts";
     }
