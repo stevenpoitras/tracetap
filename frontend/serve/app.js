@@ -679,6 +679,127 @@
     });
   }
 
+  /**
+   * Lane index per interval, so overlapping intervals never share a lane.
+   *
+   * This IS the information the waterfall carried and a sorted list cannot:
+   * two bars on one lane are provably sequential, and anything stacked is
+   * provably concurrent. Greedy first-fit over start order, which is optimal
+   * for interval-graph colouring — the lane count it returns is exactly the
+   * maximum number of calls in flight at any instant.
+   *
+   * @param items `[{from, to}]` in render order (NOT required to be sorted).
+   * @returns lane index parallel to `items`.
+   */
+  function packLanes(items) {
+    var order = items
+      .map(function (_, i) { return i; })
+      .sort(function (a, b) { return items[a].from - items[b].from; });
+    var laneEnd = [];
+    var lanes = new Array(items.length);
+    order.forEach(function (i) {
+      var it = items[i];
+      var lane = -1;
+      for (var l = 0; l < laneEnd.length; l++) {
+        if (laneEnd[l] <= it.from) { lane = l; break; }
+      }
+      if (lane < 0) { lane = laneEnd.length; laneEnd.push(0); }
+      laneEnd[lane] = it.to;
+      lanes[i] = lane;
+    });
+    return lanes;
+  }
+
+  /**
+   * A request's [start, end) in EPOCH MILLISECONDS.
+   *
+   * `ts` is served in SECONDS (every other reader multiplies it by 1000) while
+   * `durationMs` is milliseconds. Adding them raw stretched every bar ~1000×,
+   * which made all 224 calls of one session overlap and reported "max 224 in
+   * flight" — a unit bug wearing the costume of a finding.
+   */
+  function reqSpanMs(r) {
+    var from = (r.ts || 0) * 1000;
+    return { from: from, to: from + Math.max(0, r.durationMs || 0) };
+  }
+
+  /** Ribbon height budget in px; past it the lanes scroll rather than grow. */
+  var RIBBON_H = 104;
+
+  /**
+   * The time ribbon: every call on a real wall-clock axis, drag to select.
+   *
+   * The turn spine orders by `seq`, which on a session that runs a fleet is not
+   * time order at all — 87 of 223 adjacent pairs ran backwards on the capture
+   * that motivated this. So the spine can show you WHAT ran but never WHEN, or
+   * what ran alongside it. This is the view that answers both, and the brush
+   * over it is the filter that carries the answer back into the spine.
+   *
+   * Height is bounded by dividing RIBBON_H among however many lanes the packer
+   * needs, rather than by capping the lane count: a 30-way fan-out renders as
+   * 30 thin lanes, which is honest, instead of 12 lanes that quietly imply
+   * calls were sequential when they were not.
+   */
+  function timeRibbonHtml(turns) {
+    var items = turns.map(function (t) {
+      return reqSpanMs(t.req);
+    });
+    var t0 = Infinity;
+    var t1 = -Infinity;
+    items.forEach(function (it) {
+      if (it.from < t0) t0 = it.from;
+      if (it.to > t1) t1 = it.to;
+    });
+    if (!isFinite(t0)) return "";
+    // A session whose calls all share one timestamp has no axis to draw on.
+    // Say so rather than dividing by zero and painting 18 full-width bars.
+    var span = t1 - t0;
+    if (span <= 0) {
+      return '<div class="ribbon-note dim">No time span recorded for these ' +
+        turns.length + " calls — range selection unavailable.</div>";
+    }
+    var lanes = packLanes(items);
+    var laneCount = Math.max.apply(null, lanes) + 1;
+    var laneH = Math.max(2, Math.min(11, Math.floor(RIBBON_H / laneCount)));
+
+    var bars = turns
+      .map(function (t, i) {
+        var it = items[i];
+        return (
+          '<span class="ribbon-bar' + (t.req.isSubagent ? " sub" : "") +
+          '" data-ribbon-seq="' + t.seq + '"' +
+          ' data-from="' + it.from + '" data-to="' + it.to + '"' +
+          ' title="#' + t.seq + " · " + esc(t.agent) + " · " +
+          esc(fmtDur(t.req.durationMs)) + '"' +
+          ' style="left:' + (((it.from - t0) / span) * 100).toFixed(3) + "%;width:" +
+          (((it.to - it.from) / span) * 100).toFixed(3) + "%;top:" +
+          lanes[i] * laneH + "px;height:" + Math.max(2, laneH - 1) + 'px"></span>'
+        );
+      })
+      .join("");
+
+    return (
+      // `.ribbon` caps the visible height and scrolls; `.ribbon-lanes` is the
+      // full-height content, so the budget is enforced instead of merely
+      // intended — a `Math.max(2, …)` floor on lane height silently blew past
+      // it at 224 lanes and rendered a 448px strip.
+      '<div class="ribbon" id="ribbon" data-t0="' + t0 + '" data-t1="' + t1 + '">' +
+      '<div class="ribbon-lanes" style="height:' + laneCount * laneH + 'px">' +
+      bars +
+      '<span class="ribbon-sel" hidden></span>' +
+      "</div></div>" +
+      '<div class="ribbon-axis"><span>0s</span><span>' +
+      esc(fmtDur(span / 2)) + "</span><span>" + esc(fmtDur(span)) + "</span></div>" +
+      // "first start → last finish", spelled out because it does NOT match the
+      // header's duration: the session's `ended_at` is the last call's START,
+      // so a long final call puts the two legitimately minutes apart.
+      '<div class="ribbon-note" id="ribbon-note">' +
+      turns.length + (turns.length === 1 ? " call" : " calls") +
+      " · first start → last finish " + esc(fmtDur(span)) + " · max " +
+      laneCount + " in flight · drag to select a window</div>"
+    );
+  }
+
   function turnSpineHtml(turns) {
     if (!turns.length) return '<div class="dim">No wire data for this session.</div>';
     var maxCtx = 1;
@@ -722,8 +843,12 @@
             );
           })
           .join("");
+        var span = reqSpanMs(t.req);
         return (
-          '<div class="turn" data-turn="' + t.seq + '">' +
+          // The window predicate reads these off the DOM rather than a parallel
+          // array, so a re-render can never leave the two out of step.
+          '<div class="turn" data-turn="' + t.seq + '" data-from="' + span.from +
+          '" data-to="' + span.to + '">' +
           '<div class="turn-row" data-inspect="ctp:' + t.seq + '" tabindex="0">' +
           '<span class="turn-caret" data-expand="' + t.seq + '">' +
           (t.events.length ? "\u25b8" : "\u00b7") +
@@ -747,6 +872,7 @@
     return (
       '<h2 class="sec">Turns <small>(' + turns.length +
       " · \u2191\u2193 move · \u2192 expand · \u2190 collapse · click for detail)</small></h2>" +
+      timeRibbonHtml(turns) +
       '<div class="turn-filters">' + filters + "</div>" +
       '<div class="turn-spine" id="turn-spine">' + rows + "</div>"
     );
@@ -1130,6 +1256,9 @@
     // AFTER compactSeqs is populated: a turn needs to know whether it compacted,
     // and building it a few lines earlier read an empty (hoisted) object.
     turnsForPane = buildTurns(reqs, hooks, steps, compactSeqs);
+    // The brush window is absolute epoch ms, so it is meaningless against a
+    // different session's ribbon. Drop it with the render that produced it.
+    turnRange = null;
 
     var ttfts = reqs
       .map(function (r) {
@@ -2182,27 +2311,161 @@
     var f = e.target.closest && e.target.closest("[data-turn-filter]");
     if (!f) return;
     f.setAttribute("aria-pressed", f.getAttribute("aria-pressed") === "true" ? "false" : "true");
+    applyTurnFilters();
+  });
+
+  /** Selected time window from the ribbon brush, or null for the whole session. */
+  var turnRange = null;
+
+  /**
+   * The ONE place `.turn[hidden]` is written.
+   *
+   * Two independent filters — the event-kind chips and the ribbon brush — both
+   * want to hide turns. Letting each write `hidden` directly means whichever
+   * ran last silently undoes the other; they have to be ANDed in one pass.
+   */
+  function applyTurnFilters() {
     var on = {};
-    var any = false;
+    var anyKind = false;
     document.querySelectorAll("[data-turn-filter]").forEach(function (b) {
       if (b.getAttribute("aria-pressed") === "true") {
         on[b.getAttribute("data-turn-filter")] = 1;
-        any = true;
+        anyKind = true;
       }
     });
-    // Filtering EVENTS also filters TURNS: a turn with nothing left to show is
-    // noise when you have asked "show me only the compactions".
+    var r = turnRange;
+    var total = 0;
+    var shownTurns = 0;
     document.querySelectorAll(".turn").forEach(function (t) {
+      total++;
       var shown = 0;
       t.querySelectorAll("[data-ev-kind]").forEach(function (ev) {
-        var vis = !any || on[ev.getAttribute("data-ev-kind")] === 1;
+        var vis = !anyKind || on[ev.getAttribute("data-ev-kind")] === 1;
         ev.hidden = !vis;
         if (vis) shown++;
       });
-      t.hidden = any && shown === 0;
-      if (any && shown) setTurnExpanded(t.getAttribute("data-turn"), true);
+      // OVERLAP, not containment: a call that straddles the edge of the window
+      // did run during it, and dropping it would understate what was in flight.
+      var inWindow =
+        !r ||
+        (+t.getAttribute("data-to") >= r.from && +t.getAttribute("data-from") <= r.to);
+      // Filtering EVENTS also filters TURNS: a turn with nothing left to show is
+      // noise when you have asked "show me only the compactions".
+      t.hidden = !inWindow || (anyKind && shown === 0);
+      if (!t.hidden) {
+        shownTurns++;
+        if (anyKind && shown) setTurnExpanded(t.getAttribute("data-turn"), true);
+      }
     });
+    document.querySelectorAll(".ribbon-bar").forEach(function (b) {
+      b.classList.toggle(
+        "out",
+        !!r && (+b.getAttribute("data-to") < r.from || +b.getAttribute("data-from") > r.to),
+      );
+    });
+    var note = document.getElementById("ribbon-note");
+    var rib = document.getElementById("ribbon");
+    if (note && rib && r) {
+      var t0 = +rib.getAttribute("data-t0");
+      note.innerHTML =
+        "window +" + esc(fmtDur(r.from - t0)) + " → +" + esc(fmtDur(r.to - t0)) +
+        " (" + esc(fmtDur(r.to - r.from)) + ") · " + shownTurns + " of " + total +
+        ' turns · <button type="button" class="ribbon-clear">clear</button>';
+    } else if (note && rib) {
+      note.textContent =
+        total + (total === 1 ? " call" : " calls") + " · first start → last finish " +
+        fmtDur(+rib.getAttribute("data-t1") - +rib.getAttribute("data-t0")) +
+        " · drag to select a window";
+    }
+  }
+
+  function setTurnRange(range) {
+    turnRange = range;
+    var sel = document.querySelector(".ribbon-sel");
+    var rib = document.getElementById("ribbon");
+    if (sel && rib) {
+      if (!range) {
+        sel.hidden = true;
+      } else {
+        var t0 = +rib.getAttribute("data-t0");
+        var span = +rib.getAttribute("data-t1") - t0 || 1;
+        sel.hidden = false;
+        sel.style.left = (((range.from - t0) / span) * 100).toFixed(3) + "%";
+        sel.style.width = (((range.to - range.from) / span) * 100).toFixed(3) + "%";
+      }
+    }
+    applyTurnFilters();
+  }
+
+  /**
+   * Brush over the ribbon.
+   *
+   * Bound on `document` rather than on the ribbon element: the spine is
+   * re-rendered wholesale on every pane switch, so a listener attached to the
+   * node would be discarded silently the first time you navigated away and back.
+   */
+  document.addEventListener("mousedown", function (e) {
+    var rib = e.target.closest && e.target.closest(".ribbon");
+    if (!rib) return;
+    e.preventDefault();
+    var lanes = rib.querySelector(".ribbon-lanes");
+    // Measure the LANES, not the scroll container: a vertical scrollbar on
+    // `.ribbon` would otherwise shift every fraction by its width.
+    var box = lanes.getBoundingClientRect();
+    var sel = rib.querySelector(".ribbon-sel");
+    var t0 = +rib.getAttribute("data-t0");
+    var span = +rib.getAttribute("data-t1") - t0 || 1;
+    var startX = e.clientX;
+    var moved = false;
+
+    function frac(clientX) {
+      return Math.max(0, Math.min(1, (clientX - box.left) / (box.width || 1)));
+    }
+    function paint(clientX) {
+      var a = Math.min(frac(startX), frac(clientX));
+      var b = Math.max(frac(startX), frac(clientX));
+      sel.hidden = false;
+      sel.style.left = (a * 100).toFixed(3) + "%";
+      sel.style.width = ((b - a) * 100).toFixed(3) + "%";
+      return [a, b];
+    }
+    function onMove(ev) {
+      // 3px of slop so a click that jitters is still a click, not a 0.2ms window.
+      if (Math.abs(ev.clientX - startX) > 3) moved = true;
+      if (moved) paint(ev.clientX);
+    }
+    function onUp(ev) {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      if (!moved) {
+        var bar = e.target.closest && e.target.closest(".ribbon-bar");
+        if (bar) {
+          // A click on a bar is navigation, not selection: jump the spine to
+          // that turn rather than filtering down to it.
+          var seq = bar.getAttribute("data-ribbon-seq");
+          var row = document.querySelector('.turn[data-turn="' + seq + '"] .turn-row');
+          if (row) {
+            row.scrollIntoView({ block: "center" });
+            row.click();
+          }
+        } else {
+          setTurnRange(null);
+        }
+        return;
+      }
+      var ab = paint(ev.clientX);
+      setTurnRange({ from: t0 + ab[0] * span, to: t0 + ab[1] * span });
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
   });
+
+  document.addEventListener("click", function (e) {
+    if (e.target.closest && e.target.closest(".ribbon-clear")) setTurnRange(null);
+  });
+
+  // Escape clearing the window is a rung on the existing unwind ladder, not a
+  // listener of its own — see the `Escape` branch in the keyboard handler.
 
   // Session-header inspect targets. The pane listener is mounted on
   // `.session-panes`, so anything rendered in the header — the ask, and
@@ -4316,6 +4579,13 @@
       if (Inspector.back()) return;
       if (Inspector.selected()) {
         Inspector.clear();
+        return;
+      }
+      // A brushed time window is a narrowing you applied, so it unwinds before
+      // the page does — otherwise Escape to drop the window also throws you out
+      // of the session, which is what a competing listener here used to do.
+      if (turnRange) {
+        setTurnRange(null);
         return;
       }
       if (current.name === "session") location.hash = "#sessions";

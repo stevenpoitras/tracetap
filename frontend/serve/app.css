@@ -1888,6 +1888,75 @@ tr[data-inspect]:focus-visible {
 .convo-main td:first-child {
   color: var(--bright);
 }
+/* Time ribbon: wall-clock axis + drag-to-select window over the turn spine.
+   Bars are absolutely positioned into lanes, so anything vertically stacked
+   was genuinely in flight at the same instant. */
+.ribbon {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  margin-bottom: 2px;
+  cursor: crosshair;
+  max-height: 132px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  user-select: none;
+}
+.ribbon-lanes {
+  position: relative;
+}
+.ribbon-bar {
+  position: absolute;
+  min-width: 2px; /* clamp the PAINT, not the geometry — left/width stay true */
+  border-radius: 1px;
+  background: var(--accent);
+  opacity: 0.75;
+}
+.ribbon-bar.sub {
+  background: var(--accent2);
+}
+.ribbon-bar.out {
+  opacity: 0.14;
+}
+.ribbon-bar:hover {
+  opacity: 1;
+}
+.ribbon-sel {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(127, 143, 255, 0.16);
+  border-left: 1px solid var(--accent);
+  border-right: 1px solid var(--accent);
+  pointer-events: none;
+}
+.ribbon-sel[hidden] {
+  display: none;
+}
+.ribbon-axis {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-chrome);
+  font-size: 9px;
+  color: var(--dim);
+  margin-bottom: 4px;
+}
+.ribbon-note {
+  font-family: var(--font-chrome);
+  font-size: 10px;
+  color: var(--dim);
+  margin-bottom: 8px;
+}
+.ribbon-clear {
+  font: inherit;
+  color: var(--accent);
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
 /* Turn spine: one row per turn, its events nested underneath. */
 .turn-filters {
   display: flex;
