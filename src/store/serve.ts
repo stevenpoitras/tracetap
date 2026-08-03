@@ -99,8 +99,86 @@ function assetDir(): string {
 }
 
 /**
+ * Newest mtime across the compiled tree, or 0 if it cannot be read.
+ *
+ * `composePage()` re-reads the frontend from disk on EVERY request, so CSS and
+ * client JS are always current. The compiled server is the opposite: it is
+ * whatever Node loaded at startup, and a later `npm run build` changes nothing
+ * until the process restarts. Nothing surfaced that asymmetry, and it hid a
+ * missing API route for two days — the page offered a Tool Tax pane that the
+ * running server had never heard of, so `/api/session/<id>/tools` fell through
+ * to the catch-all handler and 404'd with the path fragment glued onto the
+ * session id (`No indexed session 'claude:b5ba8662/tools'`).
+ *
+ * A start-time check cannot catch this: at startup, process and disk agree by
+ * definition. The drift only appears afterwards, so the stamp has to be taken
+ * once at load and re-compared while running.
+ */
+export function distBuildStamp(root: string = path.join(__dirname, "..")): number {
+  const stack = [root];
+  let newest = 0;
+  while (stack.length) {
+    const dir = stack.pop() as string;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue; // raced with a rebuild, or not a directory — not worth failing over
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.name.endsWith(".js")) {
+        try {
+          const m = fs.statSync(p).mtimeMs;
+          if (m > newest) newest = m;
+        } catch {
+          /* file vanished mid-walk */
+        }
+      }
+    }
+  }
+  return newest;
+}
+
+/** What was on disk when this process loaded — i.e. what Node actually ran. */
+const LOADED_BUILD_STAMP = distBuildStamp();
+
+// Re-walking dist on every /api/meta would be wasteful (the page polls it), and
+// a few seconds of lag on a "you should restart" notice costs nothing.
+const BUILD_STAMP_TTL_MS = 5000;
+let buildStampMemo: { at: number; value: number } | null = null;
+
+/**
+ * @returns `{ loadedAt, builtAt, stale }` — `stale` means a newer build is on
+ *   disk than the one this process is running.
+ *
+ * The one-second tolerance absorbs filesystem timestamp granularity; without
+ * it a rebuild that lands in the same second as startup can read as drift.
+ */
+export function buildFreshness(): {
+  loadedAt: number;
+  builtAt: number;
+  stale: boolean;
+} {
+  const now = Date.now();
+  if (!buildStampMemo || now - buildStampMemo.at >= BUILD_STAMP_TTL_MS) {
+    buildStampMemo = { at: now, value: distBuildStamp() };
+  }
+  const builtAt = buildStampMemo.value;
+  return {
+    loadedAt: LOADED_BUILD_STAMP,
+    builtAt,
+    stale: builtAt > LOADED_BUILD_STAMP + 1000,
+  };
+}
+
+/**
  * Compose the dashboard page: app.html with the CSS and JS inlined. Read per
  * request (the files are small) so editing the assets needs no server restart.
+ *
+ * Note the asymmetry this creates with the compiled server — see
+ * `distBuildStamp` for why that needs announcing rather than just documenting.
  */
 export function composePage(): string {
   const dir = assetDir();
@@ -770,7 +848,12 @@ export async function handleRequest(
         events: (store.db.prepare("SELECT COUNT(*) AS n FROM usage_events").get() as any).n,
       };
       const { source } = await getPrices();
-      sendJson(res, 200, { dbPath: store.dbPath, counts, priceSource: source });
+      sendJson(res, 200, {
+        dbPath: store.dbPath,
+        counts,
+        priceSource: source,
+        build: buildFreshness(),
+      });
       return;
     }
 
@@ -1067,6 +1150,9 @@ export async function runServe(argv: string[]): Promise<void> {
       const addr = server.address() as AddressInfo;
       const host = opts.host === "0.0.0.0" || opts.host === "::" ? "localhost" : opts.host;
       console.log(`tracetap serve → http://${host}:${addr.port}  (db: ${store.dbPath})`);
+      // Printed so a scrollback line can settle "is my fix in this process?"
+      // without inferring it from `ls -l dist` and `ps -o lstart`.
+      console.log(`build ${new Date(LOADED_BUILD_STAMP).toISOString()}`);
       console.log(`Press Ctrl+C to stop.`);
       resolve();
     });

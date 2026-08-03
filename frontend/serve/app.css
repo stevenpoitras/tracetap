@@ -209,6 +209,18 @@ h2.sec,
 .sb-spacer {
   flex: 1;
 }
+/* Loud on purpose. Everything else in the status bar is ambient; this one says
+   the numbers above it may be answers from a build you no longer have. */
+.sb-stale {
+  color: var(--amber, #d4a72c);
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 0 6px;
+  cursor: help;
+}
+.sb-stale[hidden] {
+  display: none;
+}
 .live {
   display: inline-flex;
   align-items: center;

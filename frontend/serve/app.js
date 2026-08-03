@@ -276,6 +276,24 @@
             " events";
         }
         if (prices) prices.textContent = "prices: " + m.priceSource;
+        // The page you are reading is re-composed from disk on every request,
+        // so it is always current — the SERVER is not. When they diverge the
+        // symptom is a pane calling an endpoint that does not exist yet, which
+        // reads as a data bug rather than a stale process. Say it plainly.
+        var stale = document.getElementById("sb-stale");
+        if (stale && m.build) {
+          stale.hidden = !m.build.stale;
+          if (m.build.stale) {
+            stale.textContent = "⚠ restart required — newer build on disk";
+            stale.title =
+              "running build " +
+              new Date(m.build.loadedAt).toLocaleString() +
+              "\non disk       " +
+              new Date(m.build.builtAt).toLocaleString() +
+              "\n\nThe frontend reloads from disk, but compiled server code is " +
+              "frozen at process start. Restart `tracetap serve`.";
+          }
+        }
       })
       .catch(function () {});
   }
