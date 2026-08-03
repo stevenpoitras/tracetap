@@ -1225,12 +1225,10 @@
       '<aside class="inspector" id="inspector">' +
       INSPECTOR_EMPTY +
       "</aside>" +
-      "</div>" +
-      '<div id="payload-pop" class="payload-pop" hidden></div>';
+      "</div>";
     setView(html);
     bindSessionInteractions(reqs, compactSeqs, steps);
     bindSessionPanes(s.sessionId, reqs);
-    bindPayloadPopovers();
     if (stepN != null) {
       activatePane("wire");
       setTimeout(function () {
@@ -1279,6 +1277,7 @@
         var type = id.slice(0, id.indexOf(":"));
         if (type === "flow") inspectFlowNode(el, sessionId);
         else if (type === "seg") inspectSegment(id);
+        else if (type === "hook") inspectHook(id);
       }
       panesEl.addEventListener("click", function (e) {
         var el = e.target.closest("[data-inspect]");
@@ -1290,6 +1289,29 @@
         if (!el) return;
         e.preventDefault();
         activate(el);
+      });
+    }
+
+    function inspectHook(id) {
+      var parts = id.split(":"); // hook:<index>:<part>
+      var h = hooksForPane[Number(parts[1])];
+      if (!h) return;
+      var part = parts[2];
+      var sp = h.stdoutPreview || {};
+      var body;
+      if (part === "stdin") body = JSON.stringify(h.stdinPreview || {}, null, 2);
+      else if (part === "full") body = JSON.stringify(h.payload || {}, null, 2);
+      else if (part === "return")
+        body =
+          sp.additional_context ||
+          sp.reason ||
+          sp.text ||
+          (sp.returned ? JSON.stringify(sp.returned, null, 2) : "");
+      else body = JSON.stringify(sp, null, 2);
+      Inspector.show(id, {
+        kind: h.event || "hook",
+        title: (h.hookName || "") + " · " + part,
+        body: body,
       });
     }
 
@@ -1386,67 +1408,7 @@
     loadToolTax(sessionId);
   }
 
-  function bindPayloadPopovers() {
-    var pop = document.getElementById("payload-pop");
-    if (!pop) return;
-    var hideTimer = null;
-    function hide() {
-      pop.hidden = true;
-      pop.innerHTML = "";
-    }
-    function show(el, html) {
-      clearTimeout(hideTimer);
-      pop.innerHTML = html;
-      pop.hidden = false;
-      var r = el.getBoundingClientRect();
-      var top = r.bottom + 8 + window.scrollY;
-      var left = Math.min(
-        r.left + window.scrollX,
-        window.scrollX + window.innerWidth - 360,
-      );
-      pop.style.top = top + "px";
-      pop.style.left = Math.max(8, left) + "px";
-    }
-    // Idempotent by construction. This runs on every session draw AND on every
-    // x-ray load, so without the marker a second pass adds a second click
-    // handler to the same element — and since the handler toggles `hidden`,
-    // two of them cancel out and click-to-expand silently stops working.
-    document.querySelectorAll("[data-full-payload]").forEach(function (el) {
-      if (el.dataset.popBound === "1") return;
-      el.dataset.popBound = "1";
-      el.addEventListener("mouseenter", function () {
-        var raw = el.getAttribute("data-full-payload");
-        if (!raw) return;
-        show(
-          el,
-          '<div class="payload-pop-head">full payload</div><pre class="payload">' +
-            esc(raw) +
-            "</pre>",
-        );
-      });
-      el.addEventListener("mouseleave", function () {
-        hideTimer = setTimeout(hide, 180);
-      });
-      el.addEventListener("click", function (e) {
-        e.preventDefault();
-        var raw = el.getAttribute("data-full-payload");
-        if (!raw) return;
-        el.classList.toggle("expanded");
-        var panel = el.nextElementSibling;
-        if (panel && panel.classList.contains("payload-expand")) {
-          panel.hidden = !panel.hidden;
-        }
-      });
-    });
-    pop.addEventListener("mouseenter", function () {
-      clearTimeout(hideTimer);
-    });
-    pop.addEventListener("mouseleave", function () {
-      hideTimer = setTimeout(hide, 120);
-    });
-  }
-
-  function hookReturnBlock(h) {
+  function hookReturnBlock(h, hi) {
     var sp = h.stdoutPreview || {};
     var returned =
       sp.additional_context ||
@@ -1495,14 +1457,16 @@
           ? " · " + fmtTok(sp.chars) + " chars"
           : "") +
       "</h3>" +
-      '<button type="button" class="payload-hotspot" data-full-payload="' +
-      esc(full) +
-      '">' +
+      '<pre class="payload">' +
       esc(preview) +
-      ' <span class="dim">hover / click to expand</span></button>' +
-      '<pre class="payload payload-expand" hidden>' +
-      esc(full) +
-      "</pre></div>"
+      "</pre>" +
+      // Compared by value, not by length: a preview is `slice(0,160) + "…"`,
+      // so a payload of exactly 161 chars produces two strings of equal length
+      // with the last character missing — and a `>` test would hide the chip.
+      (full !== preview
+        ? inspectChip("hook:" + hi + ":return", "inspect full", "returned payload")
+        : "") +
+      "</div>"
     );
   }
 
@@ -1517,6 +1481,26 @@
    */
   function isObserveOnly(h) {
     return (h.stdoutPreview || {}).observeOnly === true;
+  }
+
+  /**
+   * A small "open this in the inspector" affordance, used beside a preview.
+   *
+   * `what` is the accessible name. The visible label stays short because it
+   * sits under a heading that already says which payload it is, but the
+   * heading is not part of the button's accessible name — without `what`,
+   * a hooks pane is a list of eighty buttons all called "inspect".
+   */
+  function inspectChip(id, label, what) {
+    return (
+      '<button type="button" class="inspect-chip" data-inspect="' +
+      esc(id) +
+      '"' +
+      (what ? ' aria-label="inspect ' + esc(what) + '"' : "") +
+      ">" +
+      esc(label || "inspect") +
+      "</button>"
+    );
   }
 
   function signalHooks(hooks) {
@@ -1561,6 +1545,10 @@
         "Clear the historical noise with <code>tracetap hooks prune</code>.</span></div></div>"
       );
     }
+    var idxOf = new Map();
+    hooks.forEach(function (h, i) {
+      idxOf.set(h, i);
+    });
     return (
       '<div class="hooks-timeline">' +
       '<div class="dim hooks-hint">' +
@@ -1571,6 +1559,9 @@
       "</div>" +
       shown
         .map(function (h) {
+          // Index into the unfiltered list, so an inspect id stays valid when
+          // the observe-only filter changes which rows are on screen.
+          var hi = idxOf.get(h);
           var badge =
             h.decision === "block"
               ? "block"
@@ -1606,28 +1597,34 @@
               : "") +
             "</summary>" +
             '<div class="hook-body">' +
-            hookReturnBlock(h) +
+            hookReturnBlock(h, hi) +
             '<div class="hook-grid">' +
-            "<div><h3>stdin preview</h3>" +
-            '<button type="button" class="payload-hotspot" data-full-payload="' +
+            // Each payload is rendered once, as a preview, with a chip that
+            // opens it in the inspector. Previously every one was stringified
+            // TWICE — into a data-full-payload attribute and into the visible
+            // <pre> — and both copies HTML-escaped. On a session with hundreds
+            // of hook events that was the largest single source of DOM weight
+            // in the app, for text most users never open.
+            "<div><h3>stdin preview " +
+            inspectChip("hook:" + hi + ":stdin", null, "stdin preview") +
+            "</h3>" +
+            '<pre class="payload compact">' +
             esc(JSON.stringify(h.stdinPreview || {}, null, 2)) +
-            '"><pre class="payload compact">' +
-            esc(JSON.stringify(h.stdinPreview || {}, null, 2)) +
-            "</pre></button></div>" +
-            "<div><h3>stdout preview</h3>" +
-            '<button type="button" class="payload-hotspot" data-full-payload="' +
+            "</pre></div>" +
+            "<div><h3>stdout preview " +
+            inspectChip("hook:" + hi + ":stdout", null, "stdout preview") +
+            "</h3>" +
+            '<pre class="payload compact">' +
             esc(JSON.stringify(h.stdoutPreview || {}, null, 2)) +
-            '"><pre class="payload compact">' +
-            esc(JSON.stringify(h.stdoutPreview || {}, null, 2)) +
-            "</pre></button></div>" +
+            "</pre></div>" +
             "</div>" +
             (h.payload
-              ? "<h3>full stdin payload</h3>" +
-                '<button type="button" class="payload-hotspot" data-full-payload="' +
+              ? "<h3>full stdin payload " +
+                inspectChip("hook:" + hi + ":full", null, "full stdin payload") +
+                "</h3>" +
+                '<pre class="payload compact">' +
                 esc(JSON.stringify(h.payload, null, 2)) +
-                '"><pre class="payload compact">' +
-                esc(JSON.stringify(h.payload, null, 2)) +
-                "</pre></button>"
+                "</pre>"
               : '<div class="dim">Full stdin not stored — set <code>TRACETAP_HOOK_FULL=1</code> on capture.</div>') +
             '<div class="dim">digest ' +
             esc((h.stdinDigest || "").slice(0, 12)) +
@@ -1903,7 +1900,6 @@
         xrayForPane = x;
         if (viewEl) {
           viewEl.innerHTML = drawXray(x);
-          bindPayloadPopovers();
           viewEl
             .querySelectorAll(".btn-xray[data-seq]")
             .forEach(function (btn) {
@@ -3400,11 +3396,10 @@
     hooksShowObserveOnly = !!t.checked;
     var pane = document.getElementById("pane-hooks");
     if (!pane) return;
-    // Re-rendering the pane throws away every element the popovers were bound
-    // to, so the new hotspots need binding or they are inert on hover and
-    // click. Safe to call repeatedly — bindPayloadPopovers marks what it binds.
+    // Inspect chips are delegated off `.session-panes`, which contains every
+    // pane and survives this innerHTML swap — so a re-render needs no
+    // rebinding, which is the only reason the old popover code ran again here.
     pane.innerHTML = renderHooksPane(hooksForPane);
-    bindPayloadPopovers();
   });
 
   document.addEventListener("keydown", function (e) {

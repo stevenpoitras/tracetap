@@ -1628,12 +1628,10 @@ h2.sec small {
    is eating the window is visible without reading the number.
 
    These rows used to also carry `.payload-hotspot`, a generic affordance whose
-   display:block/transparent/zero-padding rules had equal specificity and came
-   later in the file, so it silently won and flattened the grid into running
-   text (fixed in 4dcf8c1 by a compound-selector override). The row no longer
-   carries that class, so the override is gone with it — a shared class that
-   has to be re-defeated at every call site is the duplication it was meant to
-   remove. */
+   display:block rules had equal specificity and came later in the file, so it
+   silently won and flattened the grid into running text. Both the class and
+   the override it needed are gone now: a shared class that has to be
+   re-defeated at every call site is the duplication it was meant to remove. */
 .xray-seg {
   display: grid;
   padding: 5px 8px;
@@ -1704,7 +1702,7 @@ h2.sec small {
   font-family: var(--font-chrome);
 }
 
-/* -- subnav buttons + payload hover/expand + context timeline ------------- */
+/* -- subnav buttons + payload previews + context timeline ----------------- */
 .session-subnav .subnav-btn {
   font-family: var(--font-chrome);
   font-size: 10.5px;
@@ -1722,38 +1720,25 @@ h2.sec small {
   color: var(--bright);
   border-bottom-color: var(--accent);
 }
-.payload-hotspot {
-  display: block;
-  width: 100%;
-  text-align: left;
-  background: transparent;
-  border: 1px dashed var(--border);
-  border-radius: 6px;
-  color: inherit;
-  cursor: pointer;
-  padding: 0;
-  margin: 0;
-}
-.payload-hotspot:hover { border-color: var(--accent); }
 .payload.compact { max-height: 140px; }
-.payload-pop {
-  position: absolute;
-  z-index: 40;
-  width: min(420px, 92vw);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
-  padding: 10px;
-}
-.payload-pop-head {
+/* Sits beside a preview rather than wrapping it. The popover this replaced had
+   to own the whole payload block to be a hover target, which is why it kept
+   fighting the layouts it was dropped into. */
+.inspect-chip {
   font-family: var(--font-chrome);
   font-size: 10px;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--dim);
-  margin-bottom: 6px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  cursor: pointer;
+  vertical-align: 1px;
 }
+.inspect-chip:hover { color: var(--accent); border-color: var(--accent); }
 .hook-return { margin: 10px 0; }
 .pill.hook-return-pill {
   color: var(--teal);
