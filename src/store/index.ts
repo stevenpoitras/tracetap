@@ -20,6 +20,8 @@ import type { AuditFileScan } from "../audit";
 import { buildContextTimeline } from "../context/timeline";
 import type { ContextMetrics, ContextTimeline } from "../context/timeline";
 import { toolsetFromBody } from "../context/tooltax";
+import { identifyRequest, spawnIndex } from "../trajectory/agent-identity";
+import type { AgentSpawn, IdentityPair } from "../trajectory/agent-identity";
 import type { ToolTokenEntry } from "../context/tooltax";
 
 /**
@@ -205,6 +207,11 @@ export interface RequestRow {
   promptHash: string;
   /** 1-based index of the transcript step this call produced, null when none. */
   agentStepIndex: number | null;
+  /** True when Claude Code marked this call as a subagent's. */
+  isSubagent: boolean;
+  /** The parent's label for that subagent, when the spawn was joined. */
+  agentLabel: string | null;
+  agentType: string | null;
 }
 
 /** One indexed step's text content (the transcript row the FTS index holds). */
@@ -301,7 +308,7 @@ const SORTABLE_COLUMNS = new Set([
   "cost_usd",
 ]);
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 // ---------------------------------------------------------------------------
 // Paths / discovery
@@ -570,6 +577,13 @@ export class Store {
         ctx_total_chars  INTEGER,
         ctx_total_tokens INTEGER,
         ctx_buckets_json TEXT,
+        -- Which conversation inside the session made this call. A session that
+        -- spawns a fleet writes every agent into one log under one session id,
+        -- so without these three columns every neighbour-diffing metric
+        -- compares across unrelated conversations. See trajectory/agent-identity.
+        is_subagent      INTEGER NOT NULL DEFAULT 0,
+        agent_label      TEXT,
+        agent_type       TEXT,
         -- Content address of the declared tool set (toolsets.toolset_hash);
         -- NULL when the body declares no tools.
         toolset_hash     TEXT
@@ -689,6 +703,11 @@ export class Store {
 
     const pairs = parsePairs(content);
     const groups = groupPairs(pairs);
+    // File-scoped, NOT group-scoped. Sessions are grouped by system prompt, and
+    // a subagent's system prompt differs from its parent's — so a subagent's
+    // group never contains the Agent tool_use that named it. Building the index
+    // per group produced 484 correctly-marked subagent rows and zero names.
+    const spawns = spawnIndex(pairs as unknown as IdentityPair[]);
 
     const run = this.db.transaction(() => {
       this.deleteSourceRows(sourcePath);
@@ -696,7 +715,14 @@ export class Store {
       let steps = 0;
       for (const group of groups) {
         const traj = buildTrajectory(group);
-        steps += this.insertTrajectory(traj, group, sourcePath, contentHash, opts?.projectCwd);
+        steps += this.insertTrajectory(
+          traj,
+          group,
+          sourcePath,
+          contentHash,
+          opts?.projectCwd,
+          spawns,
+        );
         sessions += 1;
       }
       this.db
@@ -730,7 +756,8 @@ export class Store {
     group: PairGroup,
     sourcePath: string,
     contentHash: string,
-    projectCwdOverride?: string,
+    projectCwdOverride: string | undefined,
+    spawns: AgentSpawn[],
   ): number {
     const stats = analyze(traj, this.prices ? { prices: this.prices } : {});
 
@@ -801,13 +828,18 @@ export class Store {
       steps += 1;
     }
 
-    this.insertRequests(group, traj, sourcePath);
+    this.insertRequests(group, traj, sourcePath, spawns);
     this.insertUsageEvents(traj, sourcePath);
     return steps;
   }
 
   /** Write one wire-metrics row per captured pair + upsert prompt versions. */
-  private insertRequests(group: PairGroup, traj: Trajectory, sourcePath: string): void {
+  private insertRequests(
+    group: PairGroup,
+    traj: Trajectory,
+    sourcePath: string,
+    spawns: AgentSpawn[],
+  ): void {
     const agentName = group.adapter.agentInfo(group.pairs[0]).name;
     // Agent steps were emitted by buildOne in pair order, one per pair whose
     // response parsed to items or usage. Replaying that predicate over the same
@@ -820,8 +852,9 @@ export class Store {
          prompt_tokens, completion_tokens, cache_read, cache_creation,
          reasoning_tokens, stop_reason, errored, transcript_items,
          prompt_hash, agent_step_index, source_path,
-         ctx_total_chars, ctx_total_tokens, ctx_buckets_json, toolset_hash
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ctx_total_chars, ctx_total_tokens, ctx_buckets_json, toolset_hash,
+         is_subagent, agent_label, agent_type
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const upsertPrompt = this.db.prepare(
       `INSERT INTO prompts(prompt_hash, agent, content, first_seen, last_seen)
@@ -890,6 +923,7 @@ export class Store {
       // load re-read and re-parsed every body in the session. A body that will
       // not segment is stored as NULL, and the read path falls back for it.
       const ctx = contextMetricsForPair(seq, pair, promptHash);
+      const identity = identifyRequest(pair as IdentityPair, spawns);
       const toolset = toolsetForPair(pair);
       if (toolset) {
         upsertToolset.run({
@@ -925,6 +959,9 @@ export class Store {
         ctx?.totalApproxTokens ?? null,
         ctx ? JSON.stringify(ctx.buckets) : null,
         toolset?.hash ?? null,
+        identity.isSubagent ? 1 : 0,
+        identity.label,
+        identity.subagentType,
       );
     });
   }
@@ -1338,7 +1375,7 @@ export class Store {
         `SELECT session_id, seq, ts, model, status, duration_ms, ttft_ms,
                 prompt_tokens, completion_tokens, cache_read, cache_creation,
                 reasoning_tokens, stop_reason, errored, transcript_items, prompt_hash,
-                agent_step_index
+                agent_step_index, is_subagent, agent_label, agent_type
          FROM requests WHERE session_id = ? ORDER BY seq`,
       )
       .all(sessionId) as any[];
@@ -1361,6 +1398,9 @@ export class Store {
         transcriptItems: Number(r.transcript_items ?? 0),
         promptHash: String(r.prompt_hash ?? ""),
         agentStepIndex: r.agent_step_index == null ? null : Number(r.agent_step_index),
+        isSubagent: Number(r.is_subagent ?? 0) === 1,
+        agentLabel: r.agent_label == null ? null : String(r.agent_label),
+        agentType: r.agent_type == null ? null : String(r.agent_type),
       }),
     );
   }

@@ -786,6 +786,11 @@
           '<div class="wf-label">' +
           r.seq +
           (c ? ' <span class="wf-compact">⇣</span>' : "") +
+          (r.isSubagent
+            ? ' <span class="agent-dot" title="' +
+              esc(r.agentLabel || "subagent (unnamed)") +
+              '"></span>'
+            : "") +
           "</div>" +
           '<div class="wf-track">' +
           bars +
@@ -1318,6 +1323,7 @@
       '<section class="session-pane' +
       (pane === "related" ? " active" : "") +
       '" id="pane-related">' +
+      renderConversations(reqs) +
       renderRelatedPane(siblings, s) +
       "</section>" +
       "</div>" +
@@ -1993,6 +1999,86 @@
    * identity the rows do not carry yet, and a tree would assert a parentage
    * that has not been established.
    */
+  /**
+   * The conversations inside ONE session.
+   *
+   * A session that spawns a fleet is not one conversation — the live capture
+   * behind this pane is 308 main-thread calls plus 430 subagent calls across
+   * 11 named agents, all under one session id. Grouping by agent is the only
+   * way the session view stops reading as one impossibly long thread.
+   *
+   * Unnamed subagents are kept as their own row rather than folded into the
+   * main thread or hidden: they were never spawned through the Agent tool
+   * (workflow-orchestrated agents are marked but have no parent record), so
+   * the honest presentation is "subagent, unnamed", not silence.
+   */
+  function renderConversations(reqs) {
+    var groups = {};
+    var order = [];
+    reqs.forEach(function (r) {
+      var key = !r.isSubagent ? "\u0000main" : r.agentLabel || "\u0001unnamed";
+      if (!groups[key]) {
+        groups[key] = { key: key, calls: 0, tokens: 0, out: 0, first: r.ts, last: r.ts,
+                        label: !r.isSubagent ? "main thread" : r.agentLabel || "subagent (unnamed)",
+                        type: r.agentType, sub: !!r.isSubagent };
+        order.push(key);
+      }
+      var g = groups[key];
+      g.calls++;
+      g.tokens += (r.promptTokens || 0) + (r.cacheRead || 0) + (r.cacheCreation || 0);
+      g.out += r.completionTokens || 0;
+      if (r.ts < g.first) g.first = r.ts;
+      if (r.ts > g.last) g.last = r.ts;
+    });
+    var list = order
+      .map(function (k) { return groups[k]; })
+      .sort(function (a, b) {
+        if (a.sub !== b.sub) return a.sub ? 1 : -1; // main thread first
+        return b.calls - a.calls;
+      });
+    if (list.length <= 1) {
+      return (
+        '<div class="empty-pane">This session is a single conversation — no ' +
+        "subagent calls were captured in it.</div>"
+      );
+    }
+    var namedSubs = list.filter(function (g) { return g.sub && g.label.indexOf("unnamed") < 0; }).length;
+    var rows = list
+      .map(function (g) {
+        return (
+          '<tr class="' + (g.sub ? "convo-sub" : "convo-main") + '">' +
+          "<td>" +
+          (g.sub ? '<span class="convo-indent">\u2514</span> ' : "") +
+          esc(g.label) +
+          (g.type ? ' <span class="dim">' + esc(g.type) + "</span>" : "") +
+          '</td><td class="num">' + g.calls +
+          '</td><td class="num">' + fmtTok(g.tokens) +
+          '</td><td class="num">' + fmtTok(g.out) +
+          '</td><td class="num">' + fmtDur((g.last - g.first) * 1000) +
+          "</td></tr>"
+        );
+      })
+      .join("");
+    return (
+      '<h2 class="sec">Conversations in this session <small>(' +
+      list.length +
+      " · " +
+      namedSubs +
+      " named agent" +
+      (namedSubs === 1 ? "" : "s") +
+      ")</small></h2>" +
+      '<div class="dim rel-note">One session id can hold a main thread and every ' +
+      "agent it spawned. Names come from the spawning Agent tool call; an agent " +
+      "started by a workflow rather than that tool has no parent record to join " +
+      'to and is shown as "unnamed" rather than merged into the main thread.</div>' +
+      '<div class="tbl-wrap"><table><thead><tr>' +
+      "<th>conversation</th>" +
+      '<th class="num">calls</th><th class="num">context read</th>' +
+      '<th class="num">output</th><th class="num">span</th>' +
+      "</tr></thead><tbody>" + rows + "</tbody></table></div>"
+    );
+  }
+
   function renderRelatedPane(siblings, s) {
     if (!siblings.length) {
       return (

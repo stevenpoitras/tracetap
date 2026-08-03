@@ -1867,6 +1867,27 @@ tr[data-inspect]:focus-visible {
 .head-link:hover {
   text-decoration: underline;
 }
+/* A subagent's calls are interleaved with the main thread's in the waterfall;
+   the dot is the only thing that says which conversation a row belongs to. */
+.agent-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--purple, #a78bfa);
+  vertical-align: middle;
+  margin-left: 3px;
+}
+.convo-sub td:first-child {
+  padding-left: 6px;
+  color: var(--mid);
+}
+.convo-indent {
+  color: var(--dim);
+}
+.convo-main td:first-child {
+  color: var(--bright);
+}
 .rel-note {
   font-size: 11px;
   max-width: 78ch;
