@@ -240,6 +240,54 @@ test("GET /api/analytics returns fleet rollups with wire metrics", async () => {
   }
 });
 
+test("GET /api/analytics scopes EVERY rollup by since/until/agent", async () => {
+  const all = JSON.parse((await get("/api/analytics")).text);
+  assert.ok(all.agentOptions.includes("claude"), "agent picker options are scope-independent");
+  assert.ok(all.agentOptions.includes("codex"));
+  assert.equal(all.filters.agent, "");
+
+  // Agent scope: cards, wire metrics, per-agent and per-session rollups must
+  // ALL narrow together — a filter that governs only half the pane is the bug
+  // this endpoint exists to prevent.
+  const claude = JSON.parse((await get("/api/analytics?agent=claude")).text);
+  assert.equal(claude.filters.agent, "claude");
+  assert.deepEqual(claude.perAgent.map((p) => p.agent), ["claude"]);
+  assert.ok(claude.totals.sessions >= 1);
+  assert.ok(claude.totals.sessions < all.totals.sessions, "codex sessions dropped");
+  assert.ok(claude.totals.requests < all.totals.requests, "codex wire rows dropped");
+  assert.ok(claude.totals.events < all.totals.events);
+  assert.ok(claude.topSessions.every((s) => s.agent === "claude"));
+  assert.ok(claude.agentOptions.includes("codex"), "filtered-away agents stay selectable");
+
+  // Exact (not substring) agent matching, matching /api/usage's semantics.
+  const partial = JSON.parse((await get("/api/analytics?agent=clau")).text);
+  assert.equal(partial.totals.sessions, 0);
+  assert.equal(partial.totals.requests, 0);
+
+  // Date scope: an empty window empties everything, including the wire tables.
+  const none = JSON.parse((await get("/api/analytics?since=1990-01-01&until=1990-01-02")).text);
+  assert.equal(none.totals.sessions, 0);
+  assert.equal(none.totals.requests, 0);
+  assert.equal(none.perModel.length, 0);
+  assert.equal(none.trend.length, 0);
+  assert.equal(none.compactions.totalCompactions, 0);
+  assert.equal(none.totals.costUsd, 0);
+
+  const bad = await get("/api/analytics?since=not-a-date");
+  assert.equal(bad.status, 400, "unparseable dates are a client error, not a 500");
+  assert.match(JSON.parse(bad.text).error, /Unrecognized date/);
+});
+
+test("/api/usage and /api/analytics agree on one scope", async () => {
+  const scope = "?agent=claude";
+  const usage = JSON.parse((await get("/api/usage" + scope + "&granularity=total")).text);
+  const analytics = JSON.parse((await get("/api/analytics" + scope)).text);
+  assert.equal(usage.totals.events, analytics.totals.events);
+  assert.equal(usage.totals.promptTokens, analytics.totals.promptTokens);
+  assert.equal(usage.totals.completionTokens, analytics.totals.completionTokens);
+  assert.equal(usage.totals.sessions, analytics.totals.sessions);
+});
+
 test("GET /api/prompts + /api/prompt/<hash> expose the registry", async () => {
   const r = await get("/api/prompts");
   assert.equal(r.status, 200);
