@@ -726,9 +726,23 @@
    */
   function buildTurns(reqs, hooks, steps, compactSeqs) {
     var byStep = {};
-    (steps || []).forEach(function (st) {
-      byStep[st.stepIndex] = st;
-    });
+    // The nearest USER step at or before each index — i.e. the prompt that
+    // produced the call. A request is joined to the AGENT step it emitted, and
+    // on many sessions that step is empty (the indexer stores the placeholder
+    // "<block>no" and no tool fields), so the agent side alone leaves every row
+    // blank. What was actually said is on the user side, one step earlier.
+    var prevUser = {};
+    var lastUser = null;
+    (steps || [])
+      .slice()
+      .sort(function (a, b) {
+        return a.stepIndex - b.stepIndex;
+      })
+      .forEach(function (st) {
+        byStep[st.stepIndex] = st;
+        if (st.role === "user") lastUser = st;
+        prevUser[st.stepIndex] = lastUser;
+      });
     return (reqs || []).map(function (r, i) {
       var next = reqs[i + 1];
       // Hooks are timestamped, not seq-tagged, so a turn owns the hooks that
@@ -738,11 +752,22 @@
       var evs = [];
       var st = r.agentStepIndex != null ? byStep[r.agentStepIndex] : null;
       if (st && st.toolName) {
-        evs.push({
-          kind: "tool",
-          label: st.toolName,
-          detail: String(st.toolInput || ""),
-          n: (String(st.observation || "").length || 0),
+        // `toolName` is space-joined and `toolInput` newline-joined, ONE entry
+        // per tool_use block on the step — so a step that called three tools
+        // arrived here as the single label "WebFetch WebFetch Bash" and counted
+        // as one event. Split them back apart against the same index: the count
+        // on the filter chip is only honest if each call is its own event.
+        var names = String(st.toolName).trim().split(/\s+/);
+        var inputs = String(st.toolInput || "").split("\n");
+        names.forEach(function (name, k) {
+          evs.push({
+            kind: "tool",
+            label: name + toolArgHint(inputs[k]),
+            detail: inputs[k] || "",
+            // The observation is stitched across ALL of the step's calls, so it
+            // can only be attributed when there was exactly one to attribute to.
+            n: names.length === 1 ? String(st.observation || "").length : null,
+          });
         });
       }
       (hooks || []).forEach(function (h) {
@@ -768,9 +793,122 @@
         seq: r.seq,
         req: r,
         agent: r.isSubagent ? r.agentLabel || "subagent (unnamed)" : "main thread",
+        summary: turnSummary(st, r.agentStepIndex != null ? prevUser[r.agentStepIndex] : null),
         events: evs,
       };
     });
+  }
+
+  /** The one argument that most distinguishes a tool call from its siblings. */
+  var TOOL_ARG_KEYS = [
+    "file_path", "path", "pattern", "command", "url", "query",
+    "prompt", "description", "notebook_path", "skill", "name",
+  ];
+
+  function toolArgHint(inputJson) {
+    var v = firstToolArg(inputJson);
+    return v ? " " + v : "";
+  }
+
+  function firstToolArg(inputJson) {
+    if (!inputJson) return "";
+    var o;
+    try {
+      o = JSON.parse(inputJson);
+    } catch (_) {
+      return oneLine(inputJson, 60);
+    }
+    if (!o || typeof o !== "object") return "";
+    for (var i = 0; i < TOOL_ARG_KEYS.length; i++) {
+      var v = o[TOOL_ARG_KEYS[i]];
+      if (typeof v === "string" && v) return oneLine(v, 60);
+    }
+    return "";
+  }
+
+  /** Collapse to a single line and clip, so a row can never grow a second line. */
+  function oneLine(s, max) {
+    var t = String(s || "")
+      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!max || t.length <= max) return t;
+    return t.slice(0, max - 1) + "…";
+  }
+
+  /** The indexer's placeholder for a step whose content it could not extract. */
+  var EMPTY_STEP_MESSAGE = "<block>no";
+
+  /**
+   * The readable text inside a transcript step's message.
+   *
+   * User-side steps are stored as a one-key JSON envelope whose key names the
+   * SOURCE — `{"user": "…"}` for something a human typed, `{"Bash": "…"}` for a
+   * tool result being fed back. Rendering the envelope raw put `{"user":"…` at
+   * the front of every row and pushed the actual words off the end, so unwrap it
+   * and keep the key as a prefix only when it is not the trivial "user" case.
+   *
+   * Slash-command chatter (`<command-name>`, `<local-command-stdout>`) is kept
+   * but unwrapped: "/model fable" is a real thing the user did and belongs on
+   * the spine, it just does not need its tags.
+   */
+  function stepText(st) {
+    if (!st) return "";
+    var raw = String(st.message || "");
+    if (!raw || raw.indexOf(EMPTY_STEP_MESSAGE) === 0) return "";
+    var o = null;
+    try {
+      o = JSON.parse(raw);
+    } catch (_) {
+      /* not an envelope — the raw text IS the message */
+    }
+    var label = "";
+    if (o && typeof o === "object" && !Array.isArray(o)) {
+      var keys = Object.keys(o);
+      if (keys.length === 1 && typeof o[keys[0]] === "string") {
+        if (keys[0] !== "user") label = keys[0] + " ";
+        raw = o[keys[0]];
+      }
+    }
+    raw = raw
+      .replace(/<command-name>\s*/g, "")
+      .replace(/<\/command-name>/g, "")
+      .replace(/<command-message>[\s\S]*?<\/command-message>/g, "")
+      .replace(/<command-args>\s*/g, " ")
+      .replace(/<\/command-args>/g, "")
+      .replace(/<\/?local-command-stdout>/g, "")
+      .replace(/<\/?transcript>/g, "");
+    return label + oneLine(raw, 200);
+  }
+
+  /**
+   * What the turn was ABOUT, in one line.
+   *
+   * The agent column read "main thread" on 258 consecutive rows. A column whose
+   * value never varies carries no information and still costs its width — what
+   * you actually scan a spine for is the WORK: the prompt that opened the turn,
+   * or the tools the assistant reached for. So the agent survives only as a
+   * badge on subagent rows, i.e. only in the case where it distinguishes.
+   */
+  function turnSummary(st, prompt) {
+    // What the assistant DID, when the indexer captured it.
+    var tools = st ? String(st.toolName || "").trim() : "";
+    if (tools) {
+      var names = tools.split(/\s+/);
+      var inputs = String(st.toolInput || "").split("\n");
+      return names
+        .map(function (n, k) {
+          var a = firstToolArg(inputs[k]);
+          return a ? n + " " + oneLine(a, 34) : n;
+        })
+        .join("  ·  ");
+    }
+    var own = stepText(st);
+    if (own) return own;
+    // Else what it was ASKED. Marked with "› " so a prompt is never mistaken for
+    // a response — the row is showing its neighbour, and should admit it.
+    var asked = stepText(prompt);
+    return asked ? "› " + asked : "";
   }
 
   /**
@@ -880,7 +1018,13 @@
       '<div class="ribbon" id="ribbon" data-t0="' + t0 + '" data-t1="' + t1 + '">' +
       '<div class="ribbon-lanes" style="height:' + laneCount * laneH + 'px">' +
       bars +
-      '<span class="ribbon-sel" hidden></span>' +
+      // The grips are children of the band so they travel with it for free, and
+      // they carry `data-grip` so the drag handler can tell "resize this edge"
+      // from "draw a new window" without a hit-test against pixel coordinates.
+      '<span class="ribbon-sel" hidden>' +
+      '<span class="ribbon-grip" data-grip="from"></span>' +
+      '<span class="ribbon-grip" data-grip="to"></span>' +
+      "</span>" +
       "</div></div>" +
       '<div class="ribbon-axis"><span>0s</span><span>' +
       esc(fmtDur(span / 2)) + "</span><span>" + esc(fmtDur(span)) + "</span></div>" +
@@ -936,6 +1080,46 @@
     );
   }
 
+  /**
+   * The context bar, split by where the context CAME FROM.
+   *
+   * One accent bar told you how big the context was; it could not tell you what
+   * it cost, and cost is the whole question. Cache-read tokens bill at a tenth
+   * of fresh input and cache-write at 1.25×, so two rows of identical width can
+   * differ ~12× in price. Segmenting the same bar by provenance turns the spine
+   * into the caching timeline without spending a second chart or a second row:
+   * a session that is caching well reads as one long dim band, and a wall of
+   * bright segments is money being re-sent.
+   *
+   * Widths are shares of `maxCtx` — the session's largest context — so segments
+   * are comparable ACROSS rows, not just within one.
+   */
+  function contextBarHtml(r, maxCtx) {
+    var parts = [
+      { cls: "seg-read", v: r.cacheRead || 0, name: "cache read" },
+      { cls: "seg-write", v: r.cacheCreation || 0, name: "cache write" },
+      { cls: "seg-fresh", v: r.promptTokens || 0, name: "fresh input" },
+    ];
+    var tip = parts
+      .map(function (p) {
+        return p.name + " " + fmtTok(p.v);
+      })
+      .join(" · ");
+    return (
+      '<span class="turn-bar" title="' + esc(tip) + '">' +
+      parts
+        .map(function (p) {
+          if (!p.v) return "";
+          return (
+            '<span class="' + p.cls + '" style="width:' +
+            ((p.v / maxCtx) * 100).toFixed(2) + '%"></span>'
+          );
+        })
+        .join("") +
+      "</span>"
+    );
+  }
+
   function turnSpineHtml(turns) {
     if (!turns.length) return '<div class="dim">No wire data for this session.</div>';
     var maxCtx = 1;
@@ -964,8 +1148,34 @@
       })
       .join("");
 
+    // Repeat suppression. A workflow fan-out is dozens of calls that genuinely
+    // share one prompt, and printing it on all of them is honest but hides the
+    // rows that DIFFER inside a wall of identical sentences. Ditto marks turn
+    // that wall into visible structure: a run reads as one block, and the row
+    // where the work changes is the only one carrying text.
+    //
+    // The full text stays in `title`, because a filter can hide the row a ditto
+    // refers back to and hovering must still answer "same as what?".
+    var prevSummary = null;
+    var distinct = {};
+    turns.forEach(function (t) {
+      if (t.summary) distinct[t.summary] = 1;
+    });
+    // A spine of nothing but ditto marks is a true statement about the index,
+    // not a rendering failure — some sessions (permission-hook fan-outs) record
+    // one shared instruction and an empty placeholder for every response. Say
+    // that in words once, rather than letting 257 repeat marks imply a bug.
+    var uniform =
+      turns.length > 3 && Object.keys(distinct).length <= 1
+        ? '<div class="ribbon-note dim">No per-call transcript content indexed for ' +
+          "this session — all " + turns.length +
+          " calls share one prompt and record no response text. Rows are still " +
+          "distinguished by context size, duration and events.</div>"
+        : "";
     var rows = turns
       .map(function (t) {
+        var repeat = t.summary !== "" && t.summary === prevSummary;
+        prevSummary = t.summary;
         var ctx = (t.req.promptTokens || 0) + (t.req.cacheRead || 0) + (t.req.cacheCreation || 0);
         var evHtml = t.events
           .map(function (e, j) {
@@ -990,10 +1200,15 @@
           (t.events.length ? "\u25b8" : "\u00b7") +
           "</span>" +
           '<span class="turn-seq">' + t.seq + "</span>" +
-          '<span class="turn-agent' + (t.req.isSubagent ? " sub" : "") + '">' +
-          esc(t.agent) + "</span>" +
-          '<span class="turn-bar"><span style="width:' +
-          ((ctx / maxCtx) * 100).toFixed(1) + '%"></span></span>' +
+          '<span class="turn-what">' +
+          (t.req.isSubagent
+            ? '<span class="turn-agent sub">' + esc(t.agent) + "</span>"
+            : "") +
+          '<span class="turn-sum' + (repeat ? " ditto" : "") + '" title="' +
+          esc(t.summary) + '">' +
+          (repeat ? "〃" : esc(t.summary || "—")) + "</span>" +
+          "</span>" +
+          contextBarHtml(t.req, maxCtx) +
           '<span class="turn-ctx">' + fmtTok(ctx) + "</span>" +
           '<span class="turn-dur">' + fmtDur(t.req.durationMs) + "</span>" +
           '<span class="turn-evn">' +
@@ -1009,8 +1224,19 @@
       '<h2 class="sec">Turns <small>(' + turns.length +
       " · \u2191\u2193 move · \u2192 expand · \u2190 collapse · click for detail)</small></h2>" +
       timeRibbonHtml(turns) +
-      '<div class="turn-filters">' + filters + "</div>" +
-      '<div class="turn-spine" id="turn-spine">' + rows + "</div>"
+      uniform +
+      '<div class="turn-filters">' + filters +
+      '<span class="turn-legend">' +
+      '<i class="seg-read"></i>cache read<i class="seg-write"></i>cache write' +
+      '<i class="seg-fresh"></i>fresh input</span>' +
+      "</div>" +
+      // The header is a `.turn-row` so it inherits the grid verbatim — a second
+      // template would drift out of alignment the first time a column changed.
+      '<div class="turn-spine" id="turn-spine">' +
+      '<div class="turn-row turn-head" aria-hidden="true">' +
+      "<span></span><span>#</span><span>what</span><span>context</span>" +
+      "<span>tok</span><span>dur</span><span>ev</span></div>" +
+      '<div class="turn-body">' + rows + "</div></div>"
     );
   }
 
@@ -1706,16 +1932,51 @@
      * One timeline bar. This is where the compaction cards went: the same
      * numbers, on the point they describe, in the panel every other pane uses.
      */
+    /**
+     * The point for a turn, from whichever source has it.
+     *
+     * The spine and the X-Ray draw from DIFFERENT fetches: rows come from
+     * `/api/session/<id>` (every request, always loaded) while points come from
+     * `/api/session/<id>/timeline`, which is only fetched when the X-Ray pane is
+     * opened. Resolving a row click against the points ALONE left every row in
+     * the spine inert until you happened to visit X-Ray first — the row kept its
+     * pointer cursor, kept its selected style, and did nothing.
+     *
+     * So the point is preferred (it alone carries the composition buckets and
+     * the char approximation) and the request is the fallback — never the other
+     * way round, and with no third branch that silently returns.
+     */
+    function timelinePointFor(seq) {
+      var pts = (timelineForPane && timelineForPane.points) || [];
+      for (var i = 0; i < pts.length; i++) {
+        if (pts[i].seq === seq) return pts[i];
+      }
+      for (var j = 0; j < turnsForPane.length; j++) {
+        var r = turnsForPane[j].req;
+        if (r.seq !== seq) continue;
+        return {
+          seq: r.seq,
+          ts: r.ts,
+          model: r.model,
+          promptTokens: r.promptTokens,
+          completionTokens: r.completionTokens,
+          cacheRead: r.cacheRead,
+          cacheCreation: r.cacheCreation,
+          contextTokens:
+            (r.promptTokens || 0) + (r.cacheRead || 0) + (r.cacheCreation || 0),
+          transcriptItems: r.transcriptItems,
+          // Both are timeline-only derivations. `null` says "not fetched", which
+          // the renderer prints as "—" rather than as a confident zero.
+          approxTokens: null,
+          buckets: null,
+        };
+      }
+      return null;
+    }
+
     function inspectTimelinePoint(id) {
       var seq = Number(id.slice(id.indexOf(":") + 1));
-      var pts = (timelineForPane && timelineForPane.points) || [];
-      var p = null;
-      for (var i = 0; i < pts.length; i++) {
-        if (pts[i].seq === seq) {
-          p = pts[i];
-          break;
-        }
-      }
+      var p = timelinePointFor(seq);
       if (!p) return;
       selectedSeq = p.seq;
       var lines = [
@@ -1725,7 +1986,8 @@
         "  fresh input  " + fmtTok(p.promptTokens),
         "output         " + fmtTok(p.completionTokens),
         "transcript     " + p.transcriptItems + " items",
-        "approx (chars) " + fmtTok(p.approxTokens) + " tokens",
+        "approx (chars) " +
+          (p.approxTokens == null ? "—" : fmtTok(p.approxTokens) + " tokens"),
         "model          " + (p.model || "—"),
         "at             " + new Date(p.ts * 1000).toLocaleTimeString(),
       ];
@@ -2551,8 +2813,18 @@
     var sel = rib.querySelector(".ribbon-sel");
     var t0 = +rib.getAttribute("data-t0");
     var span = +rib.getAttribute("data-t1") - t0 || 1;
+    // Grabbing a grip anchors the drag at the OPPOSITE edge of the existing
+    // window, so the same "min/max of anchor and cursor" arithmetic that draws
+    // a new window also resizes one — one code path, and crossing the far edge
+    // flips the window instead of inverting it.
+    var grip = e.target.closest && e.target.closest(".ribbon-grip");
     var startX = e.clientX;
     var moved = false;
+    if (grip && turnRange) {
+      var anchorMs = grip.getAttribute("data-grip") === "from" ? turnRange.to : turnRange.from;
+      startX = box.left + ((anchorMs - t0) / span) * box.width;
+      moved = true; // a grip drag is a resize from the first pixel, never a click
+    }
 
     function frac(clientX) {
       return Math.max(0, Math.min(1, (clientX - box.left) / (box.width || 1)));

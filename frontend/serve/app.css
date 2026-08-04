@@ -1916,6 +1916,12 @@ tr[data-inspect]:focus-visible {
 }
 .ribbon-lanes {
   position: relative;
+  /* A strictly sequential session packs into one lane, which made the whole
+     ribbon ~10px tall — the selection band was a hairline and the grips had
+     nothing to grab. Lane HEIGHT still encodes concurrency; this only floors
+     the drag surface, so a one-lane ribbon is short-but-usable rather than
+     accurate-but-unusable. */
+  min-height: 46px;
 }
 .ribbon-bar {
   position: absolute;
@@ -1940,11 +1946,37 @@ tr[data-inspect]:focus-visible {
   background: rgba(127, 143, 255, 0.16);
   border-left: 1px solid var(--accent);
   border-right: 1px solid var(--accent);
+  /* The band itself stays transparent to the mouse so a drag STARTED inside an
+     existing window draws a new one; only the grips take the pointer. */
   pointer-events: none;
 }
 .ribbon-sel[hidden] {
   display: none;
 }
+/* The two edges are the slider. They have to look grabbable at rest, not only
+   on hover — a handle you must discover by hovering is a handle you don't find.
+   They sit half outside the band so the grab target straddles the boundary. */
+.ribbon-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 11px;
+  cursor: ew-resize;
+  pointer-events: auto;
+  background: var(--accent);
+  opacity: 0.55;
+  border-radius: 2px;
+  /* Two hairlines down the middle: the universal "this is a grab handle" tell. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 3px, rgba(0, 0, 0, 0.55) 3px, rgba(0, 0, 0, 0.55) 4px,
+    transparent 4px, transparent 7px,
+    rgba(0, 0, 0, 0.55) 7px, rgba(0, 0, 0, 0.55) 8px, transparent 8px
+  );
+}
+.ribbon-grip[data-grip="from"] { left: -6px; }
+.ribbon-grip[data-grip="to"] { right: -6px; }
+.ribbon-grip:hover, .ribbon-grip:active { opacity: 1; }
 .ribbon-axis {
   display: flex;
   justify-content: space-between;
@@ -2000,10 +2032,18 @@ tr[data-inspect]:focus-visible {
   overflow: hidden;
   margin-bottom: 16px;
 }
+/* Cap the list and scroll it INSIDE the card, so the ribbon, the filter chips
+   and the column header stay on screen at 258 rows. Scrolling the page instead
+   loses the range selector exactly when you are deep enough to want it. */
+.turn-body {
+  max-height: 62vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .turn[hidden] { display: none; }
 .turn-row {
   display: grid;
-  grid-template-columns: 16px 34px minmax(90px, 1fr) 2fr 62px 58px 44px;
+  grid-template-columns: 16px 38px minmax(220px, 3fr) minmax(110px, 1fr) 62px 54px 42px;
   align-items: center;
   gap: 8px;
   padding: 3px 8px;
@@ -2011,6 +2051,22 @@ tr[data-inspect]:focus-visible {
   cursor: pointer;
   border-bottom: 1px solid rgba(255, 255, 255, 0.03);
 }
+/* Outside `.turn-body`, so it is permanently visible without needing `sticky`. */
+.turn-head {
+  cursor: default;
+  background: var(--bg, #0b0d12);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-chrome);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+}
+.turn-head > span:nth-child(2),
+.turn-head > span:nth-child(5),
+.turn-head > span:nth-child(6),
+.turn-head > span:nth-child(7) { text-align: right; }
+.turn-head:hover { background: var(--bg, #0b0d12); }
 .turn-row:hover { background: rgba(255, 255, 255, 0.03); }
 .turn-row.selected {
   outline: none;
@@ -2019,24 +2075,74 @@ tr[data-inspect]:focus-visible {
 }
 .turn-caret { color: var(--dim); cursor: pointer; }
 .turn-seq { color: var(--dim); text-align: right; }
+/* The "what" column: a subagent badge (only where it distinguishes) followed by
+   the turn's prompt or tool calls. One line, always — a spine you can scan is
+   one where every row occupies the same height. */
+.turn-what {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
 .turn-agent {
+  flex: 0 0 auto;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-chrome);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+.turn-agent.sub { color: var(--purple, #a78bfa); border-color: rgba(167, 139, 250, 0.4); }
+.turn-sum {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--bright);
 }
-.turn-agent.sub { color: var(--purple, #a78bfa); }
+.turn-sum.ditto { color: var(--dim); }
 .turn-bar {
-  display: block;
+  display: flex;
   height: 6px;
   background: rgba(255, 255, 255, 0.06);
   border-radius: 3px;
   overflow: hidden;
 }
-.turn-bar > span {
-  display: block;
-  height: 100%;
-  background: linear-gradient(90deg, rgba(127, 143, 255, 0.85), rgba(127, 143, 255, 0.35));
+/* One colour per provenance, ordered cheapest → dearest left to right, so the
+   eye reads a row's cost profile as a gradient rather than a lookup. */
+.turn-bar > span { display: block; height: 100%; }
+/* Three provenances, three hues — NOT three shades of one. Cache read and fresh
+   input differ ~10× in price, so telling them apart must not depend on reading
+   two opacities of the same blue side by side. */
+.seg-read { background: #3f4a7a; }
+.seg-write { background: var(--amber, #f0b429); }
+.seg-fresh { background: #5eead4; }
+.turn-legend {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  font-family: var(--font-chrome);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+}
+.turn-legend i + i,
+.turn-legend i { margin-left: 6px; }
+.turn-legend i:first-child { margin-left: 0; }
+.turn-legend i {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  margin-right: 1px;
 }
 .turn-ctx, .turn-dur, .turn-evn {
   text-align: right;
