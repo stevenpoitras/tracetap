@@ -212,11 +212,22 @@ h2.sec,
 /* Loud on purpose. Everything else in the status bar is ambient; this one says
    the numbers above it may be answers from a build you no longer have. */
 .sb-stale {
+  font: inherit;
   color: var(--amber, #d4a72c);
+  background: transparent;
   border: 1px solid currentColor;
   border-radius: 4px;
   padding: 0 6px;
-  cursor: help;
+  /* A pointer, not `help`: this one is actionable and has to look it. */
+  cursor: pointer;
+  appearance: none;
+}
+.sb-stale:hover:not(:disabled) {
+  background: rgba(212, 167, 44, 0.14);
+}
+.sb-stale:disabled {
+  cursor: progress;
+  opacity: 0.7;
 }
 .sb-stale[hidden] {
   display: none;

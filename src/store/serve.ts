@@ -1,6 +1,7 @@
 import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
+import { spawn } from "child_process";
 import { AddressInfo } from "net";
 import { Store, defaultDbPath } from "./index";
 import type { RequestRow, SearchFilters, SessionListFilters, ToolsetUsageRow } from "./index";
@@ -1159,6 +1160,91 @@ export async function handleRequest(
 }
 
 /** Entry point for `tracetap serve`. */
+/** True when the request came from this machine over the loopback interface. */
+export function isLoopbackAddress(addr: string | undefined): boolean {
+  if (!addr) return false;
+  return (
+    addr === "127.0.0.1" ||
+    addr === "::1" ||
+    addr === "::ffff:127.0.0.1" ||
+    addr.startsWith("127.")
+  );
+}
+
+/**
+ * Re-exec the server so it picks up a newer build.
+ *
+ * The page reloads its own assets from disk on every request, so a browser
+ * refresh always shows current HTML/CSS/JS — but compiled server code is frozen
+ * at process start and CANNOT be reloaded in place. That asymmetry is what the
+ * stale badge reports, and until now the badge was the end of the road: it told
+ * you to act and gave you nothing to act with, so the reasonable response
+ * ("refresh the page") could never work.
+ *
+ * Guards, in order:
+ *  - POST only. Restarting is state-changing, and a GET would let any page that
+ *    embeds an <img> pointed at this URL bounce the process.
+ *  - Loopback only. `--host 0.0.0.0` is supported, and a restart reachable from
+ *    the network is a denial-of-service primitive.
+ *  - Stale only. This is an UPGRADE button, not a general restart: with nothing
+ *    new on disk it answers 409 rather than pointlessly bouncing.
+ *
+ * The listener is closed before the replacement is spawned, so the child never
+ * races the parent for the port. Open connections are dropped explicitly —
+ * `server.close()` alone waits for them, and the SSE stream never ends.
+ */
+function handleRestart(
+  server: http.Server,
+  store: Store,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): void {
+  if (req.method !== "POST") {
+    res.setHeader("allow", "POST");
+    sendJson(res, 405, { error: "Restart requires POST." });
+    return;
+  }
+  if (!isLoopbackAddress(req.socket.remoteAddress ?? undefined)) {
+    sendJson(res, 403, { error: "Restart is available only from this machine." });
+    return;
+  }
+  const fresh = buildFreshness();
+  if (!fresh.stale) {
+    sendJson(res, 409, {
+      error: "Already running the newest build on disk.",
+      ...fresh,
+    });
+    return;
+  }
+
+  sendJson(res, 202, { restarting: true, ...fresh });
+
+  const relaunch = () => {
+    try {
+      store.close();
+    } catch {
+      /* closing a store we are abandoning anyway */
+    }
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      cwd: process.cwd(),
+      detached: true,
+      stdio: "inherit",
+    });
+    child.unref();
+    process.exit(0);
+  };
+
+  // Give the 202 a moment to flush, then stop accepting, drop what is open
+  // (the SSE stream would otherwise hold `close` forever), and hand over.
+  setTimeout(() => {
+    server.close(relaunch);
+    (server as any).closeAllConnections?.();
+    // Belt and braces: if `close` never fires, hand over anyway rather than
+    // leaving the user with a server that answered 202 and then did nothing.
+    setTimeout(relaunch, 1500).unref?.();
+  }, 100).unref?.();
+}
+
 export async function runServe(argv: string[]): Promise<void> {
   if (argv.includes("--help") || argv.includes("-h")) {
     console.log(SERVE_HELP);
@@ -1169,6 +1255,12 @@ export async function runServe(argv: string[]): Promise<void> {
   const store = new Store(opts.dbPath);
 
   const server = http.createServer((req, res) => {
+    // Handled here rather than in `handleRequest` because it needs the server
+    // and the process, which the pure request handler deliberately does not.
+    if ((req.url || "").split("?")[0] === "/api/restart") {
+      handleRestart(server, store, req, res);
+      return;
+    }
     void handleRequest(store, req, res);
   });
 
@@ -1186,11 +1278,26 @@ export async function runServe(argv: string[]): Promise<void> {
     });
   });
 
+  /**
+   * Stop accepting, drop what is open, exit.
+   *
+   * `server.close()` alone WAITS for in-flight connections, and `/api/events`
+   * is a Server-Sent Events stream that by design never ends — so a page left
+   * open in a browser made Ctrl+C and `kill` hang forever. The symptom is
+   * silent: the signal is delivered, the process ignores it, and you accumulate
+   * servers that survive every `pkill` and quietly hold their port. Eight of
+   * them piled up in one session before the cause was found.
+   *
+   * The exit is forced after a grace period so a stuck socket cannot outvote a
+   * shutdown request. Same reasoning as `handleRestart`, which hit this first.
+   */
   const shutdown = () => {
     server.close(() => {
       store.close();
       process.exit(0);
     });
+    (server as any).closeAllConnections?.();
+    setTimeout(() => process.exit(0), 2000).unref?.();
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

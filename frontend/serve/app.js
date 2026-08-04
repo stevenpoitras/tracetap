@@ -345,20 +345,94 @@
         var stale = document.getElementById("sb-stale");
         if (stale && m.build) {
           stale.hidden = !m.build.stale;
-          if (m.build.stale) {
-            stale.textContent = "⚠ restart required — newer build on disk";
+          if (m.build.stale && !restarting) {
+            // Say what it DOES, not what is wrong. The old wording ("restart
+            // required") named an action the reader had no way to take from
+            // here, so the obvious response — refresh — could only fail.
+            stale.textContent = "⚠ newer build on disk — click to upgrade";
             stale.title =
               "running build " +
               new Date(m.build.loadedAt).toLocaleString() +
               "\non disk       " +
               new Date(m.build.builtAt).toLocaleString() +
-              "\n\nThe frontend reloads from disk, but compiled server code is " +
-              "frozen at process start. Restart `tracetap serve`.";
+              "\n\nA page refresh cannot fix this: the frontend reloads from " +
+              "disk every request, but compiled server code is frozen at " +
+              "process start.\nClicking relaunches the server and reloads once " +
+              "it is back.";
           }
         }
       })
       .catch(function () {});
   }
+
+  /** Set while an upgrade is in flight, so the poller stops rewriting the badge. */
+  var restarting = false;
+
+  /**
+   * Relaunch the server on the newer build, then reload once it answers.
+   *
+   * The server re-execs, so the socket drops mid-flight — the POST is EXPECTED
+   * to fail at the transport level and a rejection here says nothing about
+   * whether the restart took. Only the poll below can tell, and what it waits
+   * for is a CHANGED `loadedAt`: "the server answers" is not enough, because
+   * the old process answers too right up until it exits.
+   */
+  function upgradeServer(btn) {
+    if (restarting) return;
+    restarting = true;
+    var before = null;
+    btn.textContent = "⟳ relaunching…";
+    btn.disabled = true;
+
+    fetchJSON("/api/meta")
+      .then(function (m) {
+        before = m.build ? m.build.loadedAt : null;
+        return fetch("/api/restart", { method: "POST" }).catch(function () {
+          return null; // the connection dying IS the restart happening
+        });
+      })
+      .then(function (res) {
+        // A live 403/409 means the server declined and is still running, so
+        // there is nothing to wait for.
+        if (res && !res.ok && res.status !== 202) {
+          return res.json().then(function (j) {
+            throw new Error(j.error || "restart refused");
+          });
+        }
+        var tries = 0;
+        return new Promise(function (resolve, reject) {
+          (function poll() {
+            if (++tries > 40) return reject(new Error("server did not come back"));
+            fetch("/api/meta")
+              .then(function (r) {
+                return r.json();
+              })
+              .then(function (m) {
+                var now = m.build ? m.build.loadedAt : null;
+                if (now && now !== before) resolve();
+                else setTimeout(poll, 250);
+              })
+              .catch(function () {
+                setTimeout(poll, 250);
+              });
+          })();
+        });
+      })
+      .then(function () {
+        location.reload();
+      })
+      .catch(function (err) {
+        restarting = false;
+        btn.disabled = false;
+        btn.textContent = "⚠ upgrade failed — restart tracetap serve";
+        btn.title = String((err && err.message) || err);
+      });
+  }
+
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest && e.target.closest("#sb-stale");
+    if (btn && !btn.hidden) upgradeServer(btn);
+  });
 
   // ------------------------------------------------------------- svg charts
   /** Vertical column chart. items: [{label, value, title?, warn?}] */

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, test } from "node:test";
 
-import { distBuildStamp } from "../dist/store/serve.js";
+import { distBuildStamp, isLoopbackAddress } from "../dist/store/serve.js";
 
 /**
  * Build-freshness detection.
@@ -69,4 +69,33 @@ test("the running server's own dist tree stamps non-zero", () => {
   // Guards the default argument: if `__dirname/..` ever stops pointing at the
   // compiled tree, freshness silently becomes "never stale".
   assert.ok(distBuildStamp() > 0, "default root must resolve to the dist tree");
+});
+
+// -- the upgrade button ------------------------------------------------------
+
+/**
+ * Detecting staleness was only half the job.
+ *
+ * The badge said "restart required" and was an inert <span>, so the reader's
+ * only available action — refresh the page — could never work: the frontend
+ * reloads from disk every request, but compiled server code is frozen at
+ * process start. `POST /api/restart` re-execs the process; these cover the
+ * guards on it, which are the security-relevant part.
+ */
+
+test("loopback detection accepts local callers and nothing else", () => {
+  for (const a of ["127.0.0.1", "::1", "::ffff:127.0.0.1", "127.0.0.53"]) {
+    assert.equal(isLoopbackAddress(a), true, a);
+  }
+  for (const a of ["10.0.0.4", "192.168.1.9", "::ffff:10.0.0.4", "1.2.3.4", "", undefined]) {
+    // `--host 0.0.0.0` is supported, and a restart reachable from the network
+    // is a denial-of-service primitive.
+    assert.equal(isLoopbackAddress(a), false, String(a));
+  }
+});
+
+test("a spoofed loopback prefix inside another address is not accepted", () => {
+  // "127." must anchor at the start; an address merely CONTAINING it is remote.
+  assert.equal(isLoopbackAddress("10.0.0.127"), false);
+  assert.equal(isLoopbackAddress("2127.0.0.1"), false);
 });
