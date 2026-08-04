@@ -253,10 +253,24 @@ h2.sec,
 }
 
 /* -- layout ------------------------------------------------------------ */
+/**
+ * The shell fills the window; only PROSE gets a reading measure.
+ *
+ * This was a flat `max-width: 1280px`, which had to be wrong for one of the two
+ * things it governed. The session table is eleven mostly-numeric columns and
+ * gets more scannable the wider it runs; transcript prose gets LESS readable
+ * past roughly ninety characters. One cap serving both meant the table was
+ * capped to protect the transcript — and on a 2000px display that left about
+ * 700px of dead margin beside a table that wanted every pixel of it.
+ *
+ * So the constraint moved down to the content that actually needs it; see
+ * `.step-body`. What remains here is a high backstop for ultrawide displays,
+ * where a genuinely edge-to-edge table stops reading as one object.
+ */
 .view {
-  max-width: 1280px;
+  max-width: 2200px;
   margin: 0 auto;
-  padding: 20px 20px 72px;
+  padding: 20px 24px 72px;
 }
 .meta-line {
   color: var(--dim);
@@ -855,10 +869,21 @@ h2.sec small {
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
+/* The reading measure the shell used to impose on everything. ~100 characters
+   at this size; past that the eye loses the line on the return sweep. Applied
+   here rather than to `.view` so a wide window still widens the TABLES. */
 .step-body {
   white-space: pre-wrap;
   word-break: break-word;
   font-size: 12.5px;
+  max-width: 100ch;
+}
+/* Code, diffs and JSON are not prose — they are pre-formatted and want the
+   room, so they opt back out of the measure. */
+.step-body pre,
+.step-body table,
+.step-body .diff {
+  max-width: none;
 }
 .step-body.reasoning {
   color: var(--dim);
