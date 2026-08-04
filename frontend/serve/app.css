@@ -7,9 +7,17 @@
   --bg: #0f0f11;
   --surface: #161618;
   --surface-2: #1c1c20;
-  --border: #252528;
+  --border: #33333a;
+  /* Split from --border: hairlines between rows can be quiet, but a control
+     EDGE (input, button, panel) is a UI component and WCAG 1.4.11 wants 3:1.
+     One token could not be both, so it was neither at 1.18:1. */
+  --border-strong: #4a4a52;
+  /* Borders and inactive tracks ONLY. At 1.69:1 it is not a text colour, and
+     it was being used as one on the keyboard-shortcut numerals. */
   --muted: #3a3a3f;
-  --dim: #6b6b72;
+  /* Was #6b6b72 = 3.64:1 on --bg, i.e. below AA on ~45 selectors, almost all
+     of them under 11px where no large-text exemption applies. */
+  --dim: #90909a;
   --mid: #9a9aa8;
   --text: #d4d4dc;
   --bright: #eeeef2;
@@ -26,6 +34,41 @@
   --err: var(--red);
   --purple: var(--accent2);
   --cache: rgba(45, 212, 191, 0.45);
+  /* Referenced by .xray-row-n / .xray-seg-n, never defined — an undefined
+     custom property with no fallback is invalid-at-computed-value-time, so the
+     X-Ray's primary number was inheriting through a <button> instead. */
+  --fg: var(--text);
+
+  /* Type scale. Six steps, all integers: the six half-pixel sizes previously in
+     use (8.5/9.5/10.5/11.5/12.5) round differently depending on an ancestor's
+     fractional offset, which is how a page nobody wrote 8.75px in came to
+     render 8.75px. In monospace a 1px step is a whole column of advance width,
+     so the dense end is near-linear and only the display end is geometric. */
+  --fs-100: 11px;   /* micro-chrome: labels, ticks, eyebrows   */
+  --fs-200: 12px;   /* secondary data, dense scan rows          */
+  --fs-300: 14px;   /* BASE                                    */
+  --fs-400: 16px;   /* section headings, pane switcher         */
+  --fs-500: 20px;   /* page title                              */
+  --fs-600: 28px;   /* the one display number on a card        */
+  --lh-tight: 1.35;
+  --lh-base: 1.55;
+  --lh-prose: 1.6;
+
+  /* Density. Two heights, because "a row of data" should look like the same
+     object in every pane; it previously spanned 19-53px across four fonts. */
+  --row-compact: 28px;  /* high-cardinality scan lists (258-row spines) */
+  --row-default: 36px;  /* anything you click INTO                      */
+
+  /* Spacing, 4px base. --sp-1 is the one admitted half-step, for inline chrome
+     insets (pill padding) where 4px is visibly wrong. */
+  --sp-1: 2px;
+  --sp-2: 4px;
+  --sp-3: 8px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 48px;
 
   --font-chrome: "Departure Mono", ui-monospace, "SF Mono", Menlo, monospace;
   --font-data:
@@ -42,9 +85,12 @@ body {
 }
 body {
   font-family: var(--font-data);
-  font-size: 13px;
-  font-weight: 300;
-  line-height: 1.55;
+  font-size: var(--fs-300);
+  /* Was 300. JetBrains Mono Light at this size has a ~1px stem that Chrome's
+     greyscale antialiasing smears on #0f0f11, so the weight was contributing
+     more to "too small" than the size was — and 400 costs zero density. */
+  font-weight: 400;
+  line-height: var(--lh-base);
   background: var(--bg);
   color: var(--text);
   font-variant-numeric: tabular-nums;
@@ -120,7 +166,7 @@ h2.sec,
   border-bottom: 1px solid var(--border);
 }
 .brand {
-  font-size: 13px;
+  font-size: var(--fs-300);
   letter-spacing: 0.06em;
   color: var(--bright);
   white-space: nowrap;
@@ -129,7 +175,7 @@ h2.sec,
 .brand-sub {
   color: var(--dim);
   margin-left: 8px;
-  font-size: 11px;
+  font-size: var(--fs-200);
   letter-spacing: 0.1em;
 }
 .tabs {
@@ -140,7 +186,7 @@ h2.sec,
 .tabs a {
   padding: 4px 11px 5px;
   color: var(--dim);
-  font-size: 10.5px;
+  font-size: var(--fs-100);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   border-bottom: 1px solid transparent;
@@ -158,13 +204,13 @@ h2.sec,
 .tab-n {
   color: var(--muted);
   margin-right: 6px;
-  font-size: 10px;
+  font-size: var(--fs-100);
 }
 .tabs a.active .tab-n {
   color: var(--accent);
 }
 .kbd-hint {
-  font-size: 10px;
+  font-size: var(--fs-100);
   letter-spacing: 0.08em;
   color: var(--dim);
   border: 1px solid var(--border);
@@ -194,7 +240,7 @@ h2.sec,
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border-top: 1px solid var(--border);
-  font-size: 10px;
+  font-size: var(--fs-100);
   letter-spacing: 0.06em;
   color: var(--dim);
   white-space: nowrap;
@@ -274,12 +320,12 @@ h2.sec,
 }
 .meta-line {
   color: var(--dim);
-  font-size: 12px;
+  font-size: var(--fs-300);
   margin: 10px 0 12px;
 }
 .note {
   color: var(--dim);
-  font-size: 11.5px;
+  font-size: var(--fs-200);
   margin-top: 10px;
 }
 .note code {
@@ -301,14 +347,14 @@ h2.sec,
   border: 1px dashed var(--muted);
   border-radius: 6px;
   margin-top: 16px;
-  font-size: 12.5px;
+  font-size: var(--fs-300);
 }
 .empty::before {
   content: "▚▞";
   display: block;
   margin-bottom: 12px;
   font-family: var(--font-chrome);
-  font-size: 16px;
+  font-size: var(--fs-400);
   color: var(--muted);
   letter-spacing: 0.3em;
 }
@@ -382,7 +428,7 @@ h2.sec,
   background: var(--surface);
   color: var(--text);
   font-family: var(--font-data);
-  font-size: 12px;
+  font-size: var(--fs-300);
   font-weight: 300;
 }
 .controls input:focus,
@@ -407,7 +453,7 @@ h2.sec,
   gap: 5px;
   color: var(--dim);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--fs-300);
 }
 .controls .spacer {
   flex: 1;
@@ -415,7 +461,7 @@ h2.sec,
 .controls .btn {
   padding: 6px 11px; border: 1px solid var(--border); border-radius: 5px;
   background: var(--surface-2); color: var(--mid);
-  font-family: var(--font-data); font-size: 12px; font-weight: 300; cursor: pointer;
+  font-family: var(--font-data); font-size: var(--fs-300); font-weight: 300; cursor: pointer;
 }
 .controls .btn:hover:not(:disabled) { color: var(--bright); border-color: var(--muted); }
 .controls .btn:disabled { opacity: 0.35; cursor: default; }
@@ -432,12 +478,12 @@ h2.sec,
 .controls.scope.on { border-left-color: var(--accent); }
 .controls .ctl-lbl {
   font-family: var(--font-chrome); color: var(--dim);
-  font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase;
+  font-size: var(--fs-100); letter-spacing: 0.12em; text-transform: uppercase;
 }
 .controls .ctl-sep { color: var(--muted); }
-.controls .ctl-hint { color: var(--muted); font-size: 11px; }
+.controls .ctl-hint { color: var(--muted); font-size: var(--fs-200); }
 .controls.sub { margin: 0 0 10px; }
-.scope-line { color: var(--dim); font-size: 11.5px; margin: 0 0 18px 2px; }
+.scope-line { color: var(--dim); font-size: var(--fs-200); margin: 0 0 18px 2px; }
 .scope-line b { color: var(--mid); font-weight: 400; }
 
 /* -- tables ------------------------------------------------------------- */
@@ -450,7 +496,7 @@ h2.sec,
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: var(--fs-300);
 }
 thead th {
   position: sticky;
@@ -459,7 +505,7 @@ thead th {
   text-align: left;
   padding: 8px 12px;
   white-space: nowrap;
-  font-size: 9.5px;
+  font-size: var(--fs-100);
   font-weight: 400;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -475,11 +521,13 @@ thead th.sortable:hover {
   color: var(--mid);
 }
 thead th .arrow {
-  font-size: 8px;
+  font-size: var(--fs-100);
   color: var(--accent);
 }
+/* --row-default: anything you click INTO. */
 tbody td {
-  padding: 7px 12px;
+  height: var(--row-default);
+  padding: var(--sp-2) var(--sp-4);
   border-bottom: 1px solid var(--border);
   vertical-align: top;
 }
@@ -519,12 +567,12 @@ td.dim {
   left: 0;
   top: 18%;
   height: 64%;
-  background: rgba(127, 143, 255, 0.16);
+  background: rgba(127, 143, 255, 0.45);
   border-radius: 2px;
 }
 /* Dead-tool rows: the bar shifts to the warn colour, the label dims. */
 .bar-cell .bar.warn {
-  background: rgba(251, 191, 36, 0.13);
+  background: rgba(251, 191, 36, 0.4);
 }
 tr.tt-dead .bar-cell span {
   color: var(--mid);
@@ -538,7 +586,7 @@ tr.tt-dead .bar-cell span {
   display: inline-block;
   padding: 1px 7px 2px;
   border-radius: 3px;
-  font-size: 9px;
+  font-size: var(--fs-100);
   letter-spacing: 0.07em;
   text-transform: uppercase;
   background: var(--surface-2);
@@ -579,7 +627,7 @@ tr.tt-dead .bar-cell span {
 }
 .hash {
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--fs-200);
 }
 
 /* -- stat cards ----------------------------------------------------------- */
@@ -597,18 +645,18 @@ tr.tt-dead .bar-cell span {
 }
 .card .k {
   color: var(--dim);
-  font-size: 9px;
+  font-size: var(--fs-100);
   text-transform: uppercase;
   letter-spacing: 0.12em;
 }
 .card .v {
-  font-size: 21px;
+  font-size: var(--fs-600);
   font-weight: 300;
   margin-top: 3px;
   color: var(--bright);
 }
 .card .v small {
-  font-size: 11px;
+  font-size: var(--fs-200);
   color: var(--dim);
   font-weight: 300;
 }
@@ -616,7 +664,7 @@ tr.tt-dead .bar-cell span {
    it qualifies the number rather than continuing it. */
 .card .card-sub {
   font-family: var(--font-chrome);
-  font-size: 9.5px;
+  font-size: var(--fs-100);
   color: var(--dim);
   margin-top: 3px;
   letter-spacing: 0.02em;
@@ -629,13 +677,19 @@ tr.tt-dead .bar-cell span {
 }
 
 /* -- section headers ----------------------------------------------------- */
+/* A section heading that renders below its own body text in BOTH size and
+   contrast is not a heading — it is a faint divider, and the page reads as one
+   undifferentiated field with nothing telling the eye where a section starts.
+   0.12em tracking at 16px reads as a banner, so it comes down as the size goes
+   up; the `// ` prefix carries the terminal voice through unchanged. */
 h2.sec {
-  font-size: 10.5px;
+  font-size: var(--fs-400);
   font-weight: 400;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
-  margin: 26px 0 10px;
-  color: var(--mid);
+  margin: var(--sp-7) 0 var(--sp-4);
+  color: var(--text);
+  line-height: var(--lh-tight);
 }
 h2.sec::before {
   content: "// ";
@@ -643,11 +697,11 @@ h2.sec::before {
   letter-spacing: 0;
 }
 h2.sec small {
-  color: var(--dim);
+  color: var(--mid);
   text-transform: none;
   letter-spacing: 0.04em;
   font-family: var(--font-data);
-  font-size: 11px;
+  font-size: var(--fs-200);
 }
 .split {
   display: grid;
@@ -685,7 +739,7 @@ h2.sec small {
 }
 .chart-title {
   color: var(--dim);
-  font-size: 9.5px;
+  font-size: var(--fs-100);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   margin-bottom: 8px;
@@ -699,7 +753,7 @@ h2.sec small {
   gap: 14px;
   flex-wrap: wrap;
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--fs-200);
   margin-top: 8px;
 }
 .legend .sw {
@@ -716,7 +770,7 @@ h2.sec small {
 .hm-day,
 .ts-axis {
   font-family: var(--font-chrome);
-  font-size: 8px;
+  font-size: var(--fs-100);
   fill: var(--dim);
   letter-spacing: 0.08em;
 }
@@ -729,13 +783,13 @@ h2.sec small {
 }
 .tm-label {
   font-family: var(--font-data);
-  font-size: 12px;
+  font-size: var(--fs-300);
   font-weight: 400;
   fill: var(--bright);
 }
 .tm-sub {
   font-family: var(--font-data);
-  font-size: 10px;
+  font-size: var(--fs-100);
   fill: var(--dim);
 }
 .tm-cell:hover rect {
@@ -743,12 +797,12 @@ h2.sec small {
 }
 .ts-label {
   font-family: var(--font-data);
-  font-size: 11px;
+  font-size: var(--fs-200);
   fill: var(--mid);
 }
 .ts-val {
   font-family: var(--font-data);
-  font-size: 10.5px;
+  font-size: var(--fs-100);
   fill: var(--dim);
 }
 .ts-row:hover .ts-label {
@@ -765,7 +819,7 @@ h2.sec small {
   background: rgba(22, 22, 24, 0.97);
   border: 1px solid var(--muted);
   border-radius: 5px;
-  font-size: 11px;
+  font-size: var(--fs-200);
   line-height: 1.5;
   color: var(--text);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
@@ -776,7 +830,7 @@ h2.sec small {
 }
 .tt .tt-title {
   font-family: var(--font-chrome);
-  font-size: 9px;
+  font-size: var(--fs-100);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--dim);
@@ -797,7 +851,7 @@ h2.sec small {
 /* -- session detail -------------------------------------------------------- */
 .crumb {
   color: var(--dim);
-  font-size: 10px;
+  font-size: var(--fs-100);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   margin-bottom: 12px;
@@ -816,15 +870,26 @@ h2.sec small {
   flex-wrap: wrap;
   margin-bottom: 6px;
 }
+/* `app.js` emits a bare <h1> on the dead-tool-tax page. With only the scoped
+   rule below, that one title inherited the UA default (2em bold) and rendered
+   ~1.7x every other title on the site. */
+h1 {
+  font-size: var(--fs-500);
+  font-weight: 500;
+  line-height: var(--lh-tight);
+  color: var(--bright);
+  margin: 0 0 var(--sp-4);
+}
 .detail-head h1 {
-  font-size: 15px;
+  font-size: var(--fs-500);
+  font-weight: 500;
   font-weight: 400;
   color: var(--bright);
   margin: 0;
 }
 .detail-head .actions {
   margin-left: auto;
-  font-size: 11px;
+  font-size: var(--fs-200);
 }
 
 
@@ -872,11 +937,11 @@ h2.sec small {
   gap: 8px;
   align-items: center;
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--fs-200);
   margin-bottom: 6px;
 }
 .step-head .role {
-  font-size: 9.5px;
+  font-size: var(--fs-100);
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
@@ -886,7 +951,7 @@ h2.sec small {
 .step-body {
   white-space: pre-wrap;
   word-break: break-word;
-  font-size: 12.5px;
+  font-size: var(--fs-300);
   max-width: 100ch;
 }
 /* Code, diffs and JSON are not prose — they are pre-formatted and want the
@@ -906,7 +971,7 @@ h2.sec small {
 .step summary {
   cursor: pointer;
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--fs-200);
   user-select: none;
 }
 .step summary:hover {
@@ -918,7 +983,7 @@ h2.sec small {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 5px;
-  font-size: 11.5px;
+  font-size: var(--fs-200);
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -933,7 +998,7 @@ h2.sec small {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 5px;
-  font-size: 11.5px;
+  font-size: var(--fs-200);
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -945,7 +1010,7 @@ h2.sec small {
   border: 1px solid var(--border);
   border-radius: 3px;
   padding: 0 4px;
-  font-size: 11.5px;
+  font-size: var(--fs-200);
   color: var(--mid);
 }
 .md-h {
@@ -981,7 +1046,7 @@ h2.sec small {
   cursor: pointer;
   user-select: none;
   list-style: none;
-  font-size: 11px;
+  font-size: var(--fs-200);
   color: var(--dim);
 }
 .tool-call summary.tc-head::-webkit-details-marker {
@@ -989,15 +1054,15 @@ h2.sec small {
 }
 .tool-call summary.tc-head::before {
   content: "▸";
-  color: var(--muted);
-  font-size: 9px;
+  color: var(--dim);
+  font-size: var(--fs-100);
 }
 .tool-call[open] summary.tc-head::before {
   content: "▾";
 }
 .tc-sum {
   color: var(--mid);
-  font-size: 11px;
+  font-size: var(--fs-200);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1066,14 +1131,14 @@ h2.sec small {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 14px 16px;
-  font-size: 12px;
+  font-size: var(--fs-300);
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 65vh;
   overflow-y: auto;
 }
 .diff {
-  font-size: 12px;
+  font-size: var(--fs-300);
   line-height: 1.5;
 }
 .diff .ln {
@@ -1098,7 +1163,7 @@ h2.sec small {
   padding: 2px 8px;
   user-select: none;
   font-family: var(--font-chrome);
-  font-size: 10px;
+  font-size: var(--fs-100);
 }
 
 /* -- command palette / overlays -------------------------------------------- */
@@ -1130,7 +1195,7 @@ h2.sec small {
   background: transparent;
   color: var(--bright);
   font-family: var(--font-data);
-  font-size: 14px;
+  font-size: var(--fs-400);
   font-weight: 300;
 }
 .pal input:focus {
@@ -1160,7 +1225,7 @@ h2.sec small {
 }
 .pal-kind {
   font-family: var(--font-chrome);
-  font-size: 8.5px;
+  font-size: var(--fs-100);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--dim);
@@ -1180,14 +1245,14 @@ h2.sec small {
   border-color: rgba(192, 132, 252, 0.4);
 }
 .pal-label {
-  font-size: 12.5px;
+  font-size: var(--fs-300);
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .pal-sub {
-  font-size: 10.5px;
+  font-size: var(--fs-100);
   color: var(--dim);
   margin-left: auto;
   flex: 0 0 auto;
@@ -1195,13 +1260,13 @@ h2.sec small {
 .pal-empty {
   padding: 18px 16px;
   color: var(--dim);
-  font-size: 12px;
+  font-size: var(--fs-300);
 }
 .pal-foot {
   padding: 7px 14px;
   border-top: 1px solid var(--border);
   font-family: var(--font-chrome);
-  font-size: 9px;
+  font-size: var(--fs-100);
   letter-spacing: 0.08em;
   color: var(--dim);
 }
@@ -1213,11 +1278,11 @@ h2.sec small {
   gap: 14px;
   align-items: center;
   padding: 4px 0;
-  font-size: 12px;
+  font-size: var(--fs-300);
 }
 .help-row kbd {
   font-family: var(--font-chrome);
-  font-size: 10px;
+  font-size: var(--fs-100);
   color: var(--mid);
   border: 1px solid var(--muted);
   border-bottom-width: 2px;
@@ -1234,14 +1299,17 @@ h2.sec small {
   margin: 18px 0 12px;
   border-bottom: 1px solid var(--border);
 }
+/* The pane switcher is the most consequential control on a session page and
+   rendered quieter than the table headers below it — five small words with a
+   1px underline. Size, contrast and the active rule all go up. */
 .session-subnav a {
   font-family: var(--font-chrome);
-  font-size: 10.5px;
-  letter-spacing: 0.1em;
+  font-size: var(--fs-300);
+  letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--dim);
-  padding: 6px 12px 8px;
-  border-bottom: 1px solid transparent;
+  color: var(--mid);
+  padding: var(--sp-3) var(--sp-4) var(--sp-3);
+  border-bottom: 2px solid transparent;
 }
 .session-subnav a:hover {
   color: var(--mid);
@@ -1252,8 +1320,9 @@ h2.sec small {
   border-bottom-color: var(--accent);
 }
 .session-subnav small {
-  color: var(--muted);
-  margin-left: 4px;
+  font-size: var(--fs-100);
+  color: var(--dim);
+  margin-left: var(--sp-2);
 }
 .session-pane {
   display: none;
@@ -1303,7 +1372,7 @@ h2.sec small {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
-  font-size: 12px;
+  font-size: var(--fs-300);
 }
 .inspector-empty {
   padding: 6px 2px;
@@ -1325,7 +1394,7 @@ h2.sec small {
   background: none;
   border: none;
   color: var(--dim);
-  font-size: 16px;
+  font-size: var(--fs-400);
   line-height: 1;
   cursor: pointer;
   padding: 0 2px;
@@ -1357,7 +1426,7 @@ h2.sec small {
   border: 0;
   color: var(--dim);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-400);
   padding: 0 6px 0 0;
 }
 .inspector-back:hover {
@@ -1405,12 +1474,18 @@ h2.sec small {
   max-height: 70vh;
   overflow: auto;
 }
+/* Was `flex-direction: column`, stacking a 9px kind label above a 12.5px node
+   label — the sole reason a Flow row was 53px against a 24px Wire row. Laid on
+   one line it becomes the same object as every other row in the app. The
+   `calc(var(--i,0) * 0px)` it carried always evaluated to 0; the lane classes
+   below do the indenting. */
 .flow-node {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 8px 10px;
-  margin-left: calc(var(--i, 0) * 0px);
+  display: grid;
+  grid-template-columns: 12ch minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: var(--row-default);
+  padding: 0 var(--sp-4);
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface-2);
@@ -1440,15 +1515,18 @@ h2.sec small {
 }
 .flow-kind {
   font-family: var(--font-chrome);
-  font-size: 9px;
+  font-size: var(--fs-100);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--dim);
 }
 .flow-label {
-  font-size: 12.5px;
+  font-size: var(--fs-300);
   color: var(--text);
-  word-break: break-word;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .flow-node.kind-user {
   border-left: 3px solid var(--accent);
@@ -1484,7 +1562,7 @@ h2.sec small {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
-  font-size: 11px;
+  font-size: var(--fs-200);
   overflow: auto;
   max-height: 40vh;
   white-space: pre-wrap;
@@ -1493,7 +1571,7 @@ h2.sec small {
 .btn-xray {
   margin-top: 10px;
   font-family: var(--font-chrome);
-  font-size: 10px;
+  font-size: var(--fs-100);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   background: var(--surface-2);
@@ -1533,7 +1611,7 @@ h2.sec small {
 }
 .hook-time {
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--fs-200);
   min-width: 120px;
 }
 .hook-body {
@@ -1553,7 +1631,7 @@ h2.sec small {
 }
 .hook-body h3 {
   font-family: var(--font-chrome);
-  font-size: 10px;
+  font-size: var(--fs-100);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--dim);
@@ -1585,7 +1663,7 @@ h2.sec small {
   border-radius: 4px;
   padding: 4px 8px;
   font-family: var(--font-data);
-  font-size: 12px;
+  font-size: var(--fs-300);
 }
 /* -- Context X-Ray rows ---------------------------------------------------
    One colour per bucket, declared ONCE as an RGB triple and consumed by the
@@ -1620,10 +1698,10 @@ h2.sec small {
    bar starts at the same x and the numbers form real columns. */
 .xray-row {
   display: grid;
-  grid-template-columns: 96px 1fr 60px 52px;
+  grid-template-columns: 13ch 1fr 8ch 7ch;
   align-items: center;
   gap: 10px;
-  min-height: 26px;
+  min-height: var(--row-compact);
   padding: 2px 4px;
   border-radius: 4px;
 }
@@ -1632,7 +1710,7 @@ h2.sec small {
 }
 .xray-row-label {
   font-family: var(--font-chrome);
-  font-size: 10px;
+  font-size: var(--fs-100);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: rgb(var(--bkt));
@@ -1654,13 +1732,13 @@ h2.sec small {
   background: linear-gradient(90deg, rgba(var(--bkt), 0.95), rgba(var(--bkt), 0.55));
 }
 .xray-row-n {
-  font-size: 11px;
+  font-size: var(--fs-200);
   color: var(--fg);
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 .xray-row-pct {
-  font-size: 11px;
+  font-size: var(--fs-200);
   color: var(--dim);
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -1678,15 +1756,16 @@ h2.sec small {
 .xray-seg,
 .xray-delta-item {
   display: grid;
-  grid-template-columns: 88px 58px 50px minmax(0, 1fr);
+  grid-template-columns: 12ch 8ch 7ch minmax(0, 1fr);
+  min-height: var(--row-compact);
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 5px 8px;
+  padding: 0 var(--sp-3);
   border: 1px solid var(--border);
   border-left: 3px solid rgb(var(--bkt));
   border-radius: 5px;
-  font-size: 12px;
+  font-size: var(--fs-300);
   text-align: left;
   background: var(--surface);
 }
@@ -1700,7 +1779,7 @@ h2.sec small {
    re-defeated at every call site is the duplication it was meant to remove. */
 .xray-seg {
   display: grid;
-  padding: 5px 8px;
+  padding: 0 var(--sp-3);
   border: 1px solid var(--border);
   border-left: 3px solid rgb(var(--bkt));
   background:
@@ -1716,12 +1795,12 @@ h2.sec small {
   border-left-color: rgb(var(--bkt));
 }
 .xray-delta-item {
-  grid-template-columns: 68px 88px 58px minmax(0, 1fr);
+  grid-template-columns: 9ch 12ch 8ch minmax(0, 1fr);
 }
 .xray-seg-bucket,
 .xray-delta-kind {
   font-family: var(--font-chrome);
-  font-size: 9.5px;
+  font-size: var(--fs-100);
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: rgb(var(--bkt));
@@ -1757,7 +1836,7 @@ h2.sec small {
 }
 .xray-head {
   margin-bottom: 10px;
-  font-size: 11px;
+  font-size: var(--fs-200);
 }
 
 /* extend chrome list */
@@ -1771,13 +1850,13 @@ h2.sec small {
 /* -- subnav buttons + payload previews + context timeline ----------------- */
 .session-subnav .subnav-btn {
   font-family: var(--font-chrome);
-  font-size: 10.5px;
-  letter-spacing: 0.1em;
+  font-size: var(--fs-300);
+  letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--dim);
-  padding: 6px 12px 8px;
+  color: var(--mid);
+  padding: var(--sp-3) var(--sp-4);
   border: 0;
-  border-bottom: 1px solid transparent;
+  border-bottom: 2px solid transparent;
   background: transparent;
   cursor: pointer;
 }
@@ -1792,7 +1871,7 @@ h2.sec small {
    fighting the layouts it was dropped into. */
 .inspect-chip {
   font-family: var(--font-chrome);
-  font-size: 10px;
+  font-size: var(--fs-100);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--dim);
@@ -1810,7 +1889,7 @@ h2.sec small {
   color: var(--teal);
   border-color: rgba(45, 212, 191, 0.4);
 }
-.hooks-hint { margin-bottom: 8px; font-size: 11px; }
+.hooks-hint { margin-bottom: 8px; font-size: var(--fs-200); }
 .hooks-filter { margin-left: 10px; cursor: pointer; user-select: none; white-space: nowrap; }
 .hooks-filter input { vertical-align: -1px; margin-right: 4px; cursor: pointer; }
 .hooks-filter:hover { color: var(--mid); }
@@ -1832,7 +1911,7 @@ h2.sec small {
   position: absolute;
   right: 0;
   transform: translateY(50%);
-  font-size: 9px;
+  font-size: var(--fs-100);
   color: var(--dim);
   font-family: var(--font-chrome);
 }
@@ -1893,7 +1972,7 @@ tr[data-inspect]:focus-visible {
   color: var(--accent);
   text-decoration: none;
   margin-left: 10px;
-  font-size: 11px;
+  font-size: var(--fs-200);
 }
 .head-link:hover {
   text-decoration: underline;
@@ -1962,7 +2041,7 @@ tr[data-inspect]:focus-visible {
   position: absolute;
   top: 0;
   bottom: 0;
-  background: rgba(127, 143, 255, 0.16);
+  background: rgba(127, 143, 255, 0.45);
   border-left: 1px solid var(--accent);
   border-right: 1px solid var(--accent);
   /* The band itself stays transparent to the mouse so a drag STARTED inside an
@@ -2003,7 +2082,7 @@ tr[data-inspect]:focus-visible {
   line-height: 0;
 }
 .ctx-strip svg { display: block; }
-.ctx-read { fill: #3f4a7a; }
+.ctx-read { fill: #5b6bb0; }
 .ctx-write { fill: var(--amber, #f0b429); fill-opacity: 0.85; }
 .ctx-fresh { fill: #5eead4; fill-opacity: 0.9; }
 .ctx-strip-note {
@@ -2016,7 +2095,7 @@ tr[data-inspect]:focus-visible {
   padding: 1px 5px;
   border-radius: 3px;
   font-family: var(--font-chrome);
-  font-size: 9px;
+  font-size: var(--fs-100);
   line-height: 1.4;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -2026,13 +2105,13 @@ tr[data-inspect]:focus-visible {
   display: flex;
   justify-content: space-between;
   font-family: var(--font-chrome);
-  font-size: 9px;
+  font-size: var(--fs-100);
   color: var(--dim);
   margin-bottom: 4px;
 }
 .ribbon-note {
   font-family: var(--font-chrome);
-  font-size: 10px;
+  font-size: var(--fs-100);
   color: var(--dim);
   margin-bottom: 8px;
 }
@@ -2055,7 +2134,7 @@ tr[data-inspect]:focus-visible {
 }
 .turn-filter {
   font-family: var(--font-chrome);
-  font-size: 10px;
+  font-size: var(--fs-100);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--dim);
@@ -2088,13 +2167,17 @@ tr[data-inspect]:focus-visible {
 .turn[hidden] { display: none; }
 .turn-row {
   display: grid;
-  grid-template-columns: 16px 38px minmax(220px, 3fr) minmax(110px, 1fr) 62px 54px 42px;
+  grid-template-columns: 2ch 5ch minmax(30ch, 3fr) minmax(14ch, 1fr) 8ch 7ch 6ch;
   align-items: center;
-  gap: 8px;
-  padding: 3px 8px;
-  font-size: 11px;
+  gap: var(--sp-3);
+  /* --row-compact: high-cardinality scan lists. Row separators were at
+     rgba(255,255,255,.03) = 1.07:1, which is why 258 rows did not read as
+     rows; --border is the same hairline every other list uses. */
+  min-height: var(--row-compact);
+  padding: 0 var(--sp-3);
+  font-size: var(--fs-200);
   cursor: pointer;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--border);
 }
 /* Outside `.turn-body`, so it is permanently visible without needing `sticky`. */
 .turn-head {
@@ -2102,7 +2185,7 @@ tr[data-inspect]:focus-visible {
   background: var(--bg, #0b0d12);
   border-bottom: 1px solid var(--border);
   font-family: var(--font-chrome);
-  font-size: 9px;
+  font-size: var(--fs-100);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--dim);
@@ -2112,7 +2195,7 @@ tr[data-inspect]:focus-visible {
 .turn-head > span:nth-child(6),
 .turn-head > span:nth-child(7) { text-align: right; }
 .turn-head:hover { background: var(--bg, #0b0d12); }
-.turn-row:hover { background: rgba(255, 255, 255, 0.03); }
+.turn-row:hover { background: rgba(255, 255, 255, 0.06); }
 .turn-row.selected {
   outline: none;
   background: rgba(127, 143, 255, 0.14);
@@ -2136,7 +2219,7 @@ tr[data-inspect]:focus-visible {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-chrome);
-  font-size: 9px;
+  font-size: var(--fs-100);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   padding: 1px 5px;
@@ -2165,7 +2248,10 @@ tr[data-inspect]:focus-visible {
 /* Three provenances, three hues — NOT three shades of one. Cache read and fresh
    input differ ~10× in price, so telling them apart must not depend on reading
    two opacities of the same blue side by side. */
-.seg-read { background: #3f4a7a; }
+/* Cache read is typically 80-90% of a turn's tokens; at #3f4a7a it sat
+   1.8:1 against its own track, so the segment that should dominate every bar
+   was indistinguishable from empty space. This misreported the data. */
+.seg-read { background: #5b6bb0; }
 .seg-write { background: var(--amber, #f0b429); }
 .seg-fresh { background: #5eead4; }
 .turn-legend {
@@ -2174,7 +2260,7 @@ tr[data-inspect]:focus-visible {
   gap: 5px;
   margin-left: auto;
   font-family: var(--font-chrome);
-  font-size: 9px;
+  font-size: var(--fs-100);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--dim);
@@ -2202,11 +2288,12 @@ tr[data-inspect]:focus-visible {
 .turn-events[hidden] { display: none; }
 .turn-ev {
   display: grid;
-  grid-template-columns: 76px 1fr 60px;
-  gap: 8px;
+  grid-template-columns: 10ch 1fr 8ch;
+  gap: var(--sp-3);
   align-items: center;
-  padding: 2px 10px;
-  font-size: 11px;
+  min-height: var(--row-compact);
+  padding: 0 var(--sp-4);
+  font-size: var(--fs-200);
   cursor: pointer;
   border-left: 2px solid transparent;
 }
@@ -2214,12 +2301,12 @@ tr[data-inspect]:focus-visible {
 .turn-ev:hover { background: rgba(255, 255, 255, 0.04); }
 .turn-ev.selected {
   outline: none;
-  background: rgba(127, 143, 255, 0.16);
+  background: rgba(127, 143, 255, 0.45);
   border-left-color: var(--accent);
 }
 .ev-kind {
   font-family: var(--font-chrome);
-  font-size: 9px;
+  font-size: var(--fs-100);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--dim);
@@ -2235,7 +2322,7 @@ tr[data-inspect]:focus-visible {
 }
 .ev-n { text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
 .rel-note {
-  font-size: 11px;
+  font-size: var(--fs-200);
   max-width: 78ch;
   margin-bottom: 10px;
 }
@@ -2272,14 +2359,14 @@ button.xray-row[aria-pressed="true"] .xray-row-label {
   color: var(--accent);
 }
 .ct-legend {
-  font-size: 10px;
+  font-size: var(--fs-100);
   margin: 0 0 14px 5.2ch;
 }
 /* Inline with the heading, not a banner — the caveat qualifies the number
    beside it rather than the whole pane. */
 .warn-note {
   color: var(--amber);
-  font-size: 11px;
+  font-size: var(--fs-200);
   cursor: help;
   margin-left: 8px;
 }
@@ -2293,7 +2380,7 @@ button.xray-row[aria-pressed="true"] .xray-row-label {
   cursor: pointer;
   position: relative;
   color: var(--dim);
-  font-size: 9px;
+  font-size: var(--fs-100);
   padding: 0;
 }
 .ct-bar:hover { outline: 1px solid var(--accent); }
@@ -2306,7 +2393,7 @@ button.xray-row[aria-pressed="true"] .xray-row-label {
   bottom: 2px;
   left: 50%;
   transform: translateX(-50%);
-  font-size: 8px;
+  font-size: var(--fs-100);
 }
 .ct-compact {
   position: absolute;
@@ -2340,13 +2427,13 @@ button.xray-seg:focus-visible {
   border-radius: 6px;
   background: var(--surface);
   color: var(--err);
-  font-size: 13px;
+  font-size: var(--fs-300);
   line-height: 1.6;
 }
 .section-errors b {
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  font-size: 11px;
+  font-size: var(--fs-200);
 }
 
 /* ---------------------------------------------------------------- journey
@@ -2378,8 +2465,8 @@ button.xray-seg:focus-visible {
 .jr-insight.sev-bad { border-left-color: var(--red, #f87171); }
 .jr-insight.sev-warn { border-left-color: var(--amber, #f0b429); }
 .jr-insight.sev-info { border-left-color: var(--accent, #7f8fff); }
-.jr-i-label { color: var(--bright); font-size: 13px; }
-.jr-i-detail { color: var(--dim); font-size: 11px; }
+.jr-i-label { color: var(--bright); font-size: var(--fs-300); }
+.jr-i-detail { color: var(--dim); font-size: var(--fs-200); }
 
 .jr-strip {
   display: flex;
@@ -2441,11 +2528,11 @@ button.xray-seg:focus-visible {
   gap: 14px;
   margin-bottom: 10px;
 }
-.jr-pos { color: var(--dim); font-size: 12px; }
+.jr-pos { color: var(--dim); font-size: var(--fs-300); }
 .jr-pos b { color: var(--bright); }
 .jr-step {
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-300);
   color: var(--accent);
   background: transparent;
   border: 1px solid var(--border);
@@ -2474,7 +2561,7 @@ button.xray-seg:focus-visible {
 .jr-out { border-left: 3px solid #5eead4; }
 .jr-head {
   font-family: var(--font-chrome);
-  font-size: 10px;
+  font-size: var(--fs-100);
   letter-spacing: 0.1em;
   color: var(--dim);
   margin-bottom: 10px;
@@ -2484,13 +2571,13 @@ button.xray-seg:focus-visible {
   align-items: center;
   justify-content: center;
   color: var(--dim);
-  font-size: 15px;
+  font-size: var(--fs-500);
 }
 .jr-kv {
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  font-size: 12px;
+  font-size: var(--fs-300);
   padding: 3px 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
@@ -2498,7 +2585,7 @@ button.xray-seg:focus-visible {
 .jr-kv b { color: var(--bright); font-weight: 400; }
 .jr-kv em {
   font-style: normal;
-  font-size: 10px;
+  font-size: var(--fs-100);
   margin-left: 6px;
   opacity: 0.85;
 }
@@ -2513,7 +2600,7 @@ button.xray-seg:focus-visible {
   border-radius: 5px;
   background: rgba(0, 0, 0, 0.28);
   color: var(--mid);
-  font-size: 12px;
+  font-size: var(--fs-300);
   line-height: 1.55;
   max-height: 190px;
   overflow-y: auto;
@@ -2525,7 +2612,7 @@ button.xray-seg:focus-visible {
   gap: 4px;
 }
 .jr-tool {
-  font-size: 12px;
+  font-size: var(--fs-300);
   color: var(--bright);
   background: rgba(94, 234, 212, 0.08);
   border-left: 2px solid #5eead4;
@@ -2538,7 +2625,7 @@ button.xray-seg:focus-visible {
 .jr-loop {
   margin-top: 12px;
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--fs-200);
 }
 @media (max-width: 1100px) {
   .jr-triad { grid-template-columns: 1fr; gap: 10px; }
