@@ -2596,6 +2596,16 @@
           "user prompt</button>"
         : "") +
       "</span></div>" +
+      // The cards, the tabs and the panes are ONE content column, so they share
+      // a right edge whether or not the inspector rail is open. Leaving them
+      // outside gave a 1942px card row above a 1528px ribbon — a block edge
+      // 414px past the block below it, which is what reads as broken.
+      //
+      // The title block above stays full-width on purpose: it is the page
+      // header, and narrowing it would re-wrap a 120-character title and push
+      // the row you just clicked down the page.
+      '<div class="session-body' + (pane === "journey" ? " no-inspector" : "") + '">' +
+      '<div class="session-main">' +
       '<div class="cards">' +
       cards +
       "</div>" +
@@ -2609,7 +2619,6 @@
       subnavBtn("wire", "Wire") +
       subnavBtn("related", "Related", siblings.length || null) +
       "</nav>" +
-      '<div class="session-body' + (pane === "journey" ? " no-inspector" : "") + '">' +
       '<div class="session-panes">' +
       '<section class="session-pane' +
       (pane === "journey" ? " active" : "") +
@@ -2666,7 +2675,8 @@
       renderConversations(reqs) +
       renderRelatedPane(siblings, s) +
       "</section>" +
-      "</div>" +
+      "</div>" + // .session-panes
+      "</div>" + // .session-main
       // One inspector for all five panes. It lives beside `.session-panes`
       // rather than inside any one of them, which is the whole point: a panel
       // owned by the Flow pane can only ever serve the Flow pane.

@@ -633,7 +633,12 @@ tr.tt-dead .bar-cell span {
 /* -- stat cards ----------------------------------------------------------- */
 .cards {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  /* auto-FIT, not auto-fill. `auto-fill` keeps the empty tracks it creates, so
+     nine cards in a 1942px row got a twelve-track grid and stopped at 1478 —
+     488px of empty tracks, and a card row that visibly ended short of every
+     block below it. `auto-fit` collapses the empties and the 1fr hands their
+     width back to the cards that exist. */
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
   margin-bottom: 18px;
 }
@@ -1409,6 +1414,14 @@ h1 {
   grid-template-columns: minmax(0, 1fr) minmax(300px, 400px);
   gap: 14px;
   align-items: start;
+}
+/* The content column: cards, tabs and panes, so all three narrow together when
+   the rail opens and never disagree about where the page ends. A wrapper rather
+   than `grid-column: 1` on each — the rail has to span every row beside them,
+   and `grid-row: 1 / -1` resolves against the EXPLICIT grid, which has no rows
+   here, so it would span nothing. */
+.session-main {
+  min-width: 0;
 }
 /* The journey has no rows to inspect — its detail panel IS the inspector, and
    it is laid out in three columns that want the width. Reserving 400px for a
