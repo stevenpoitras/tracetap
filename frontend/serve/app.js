@@ -769,7 +769,15 @@
   function fail(err) {
     setView('<div class="empty">Error: ' + esc(err.message || err) + "</div>");
   }
-  function card(k, v, alert) {
+  /**
+   * One stat card: label, headline number, optional qualifying sub-line.
+   *
+   * `sub` is a separate argument rather than markup smuggled into `v`, because
+   * a qualifier appended inline wraps INSIDE the headline — "309 in 21" then
+   * "sessions" on a third line — and a grid row is as tall as its tallest card,
+   * so one wrapping card added 40px to all seven.
+   */
+  function card(k, v, alert, sub) {
     return (
       '<div class="card' +
       (alert ? " alert" : "") +
@@ -777,7 +785,9 @@
       k +
       '</div><div class="v">' +
       v +
-      "</div></div>"
+      "</div>" +
+      (sub ? '<div class="card-sub">' + sub + "</div>" : "") +
+      "</div>"
     );
   }
 
@@ -4786,7 +4796,12 @@
       card("Total cost", fmtCost(t.costUsd, t.hasUnpriced)) +
       card("Cache hit rate", fmtPct(t.cacheHitRate)) +
       card("Output tokens", fmtTok(t.completionTokens)) +
-      card("Compactions", a.compactions.totalCompactions + ' <small>in ' + a.compactions.sessionsWithCompaction + " sessions</small>", a.compactions.totalCompactions > 0) +
+      card(
+        "Compactions",
+        a.compactions.totalCompactions,
+        a.compactions.totalCompactions > 0,
+        "in " + a.compactions.sessionsWithCompaction + " sessions",
+      ) +
       "</div>";
 
     document.getElementById("an-insights").innerHTML = fleetInsightsHtml(a);
@@ -4853,14 +4868,51 @@
       })
       .join("");
 
-    var agentRows = a.perAgent
+    // Per NAMED agent, not per harness family. The old table keyed on
+    // `sessions.agent` and so had exactly one row — "CLAUDE, 82 sessions,
+    // $398" — which is the total-cost card restated, and told you nothing
+    // about where the money went.
+    var allAgents = a.perNamedAgent || [];
+    // Capped so this column stays comparable in height to the two beside it —
+    // 44 rows would have made it twice the page. What is cut is SAID, with its
+    // combined cost, because a silent top-N reads as "that is all of them".
+    var AGENT_ROWS = 12;
+    var namedAgents = allAgents.slice(0, AGENT_ROWS);
+    var restAgents = allAgents.slice(AGENT_ROWS);
+    var restCost = restAgents.reduce(function (s, p) {
+      return s + (p.costUsd || 0);
+    }, 0);
+    var agentMaxCost = namedAgents.reduce(function (m, p) {
+      return Math.max(m, p.costUsd || 0);
+    }, 0);
+    // The agent TYPE is "general-purpose" on nearly every row, so printing it
+    // on each one lengthens every label to say nothing. Name the common type
+    // once in the heading and show the type inline only where it DIFFERS —
+    // the same rule that took the model out of the session titles.
+    var typeCounts = {};
+    allAgents.forEach(function (p) {
+      if (p.type) typeCounts[p.type] = (typeCounts[p.type] || 0) + 1;
+    });
+    var commonType = Object.keys(typeCounts).sort(function (x, y) {
+      return typeCounts[y] - typeCounts[x];
+    })[0];
+    var agentRows = namedAgents
       .map(function (p) {
         return (
-          "<tr><td>" +
-          agentPill(p.agent) +
-          "</td>" +
+          '<tr class="' +
+          (p.label === "main thread" ? "an-agent-main" : p.named ? "" : "an-agent-unnamed") +
+          '"><td class="bar-cell an-agent-name" title="' +
+          esc(p.label + (p.type ? " · " + p.type : "")) +
+          '"><div class="bar" style="width:' +
+          (agentMaxCost ? ((p.costUsd || 0) / agentMaxCost) * 100 : 0).toFixed(1) +
+          '%"></div><span>' +
+          esc(p.label) +
+          (p.type && p.type !== commonType
+            ? ' <small class="dim">' + esc(p.type) + "</small>"
+            : "") +
+          "</span></td>" +
           '<td class="num">' +
-          p.sessions +
+          p.calls +
           "</td>" +
           '<td class="num">' +
           fmtTok(p.promptTokens) +
@@ -4874,6 +4926,20 @@
         );
       })
       .join("");
+    if (restAgents.length) {
+      agentRows +=
+        '<tr class="an-agent-rest"><td class="dim">+ ' +
+        restAgents.length +
+        " more agent" +
+        (restAgents.length === 1 ? "" : "s") +
+        '</td><td class="num dim">' +
+        restAgents.reduce(function (s, p) {
+          return s + p.calls;
+        }, 0) +
+        '</td><td class="num"></td><td class="num"></td><td class="num dim">' +
+        fmtCost(restCost) +
+        "</td></tr>";
+    }
 
     var maxTool = a.topTools.length ? a.topTools[0].count : 1;
     var toolRows = a.topTools
@@ -4896,18 +4962,15 @@
         return (
           '<tr class="click" data-id="' +
           esc(s.sessionId) +
-          '"><td>' +
-          agentPill(s.agent) +
-          " " +
-          esc(s.model) +
-          "</td>" +
+          '"><td class="s-title"><span class="s-ask">' +
+          esc(s.title || "untitled session") +
+          '</span><span class="s-meta">' +
+          esc(s.model || "—") +
+          "</span></td>" +
           '<td class="dim" title="' +
           esc(s.projectCwd) +
           '">' +
           esc(basename(s.projectCwd)) +
-          "</td>" +
-          "<td>" +
-          fmtTime(s.startedAt) +
           "</td>" +
           '<td class="num">' +
           fmtDur(s.durationMs) +
@@ -4931,14 +4994,24 @@
       '<div><h2 class="sec">Per model <small>(wire latency &amp; reliability)</small></h2>' +
       '<div class="tbl-wrap"><table><thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Err</th><th class="num">TTFT p50</th><th class="num">TTFT p95</th><th class="num">Dur p50</th><th class="num">Out</th></tr></thead><tbody>' +
       (modelRows || '<tr><td colspan="7" class="dim">no wire data</td></tr>') + "</tbody></table></div>" +
-      '<h2 class="sec">Per agent</h2>' +
-      '<div class="tbl-wrap"><table><thead><tr><th>Agent</th><th class="num">Sessions</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th></tr></thead><tbody>' +
+      '<h2 class="sec">Where the spend went <small>(by agent, dearest first' +
+      (commonType ? " &middot; " + esc(commonType) + " unless noted" : "") +
+      ")</small></h2>" +
+      '<div class="tbl-wrap"><table><thead><tr><th>Agent</th><th class="num">Calls</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th></tr></thead><tbody>' +
       (agentRows || '<tr><td colspan="5" class="dim">no data</td></tr>') + "</tbody></table></div></div>" +
-      '<div><h2 class="sec">Top tools</h2>' +
+      '<div><h2 class="sec">Top tools' +
+      (a.toolsTotal && a.toolsTotal > a.topTools.length
+        ? " <small>(" + a.topTools.length + " of " + a.toolsTotal + ")</small>"
+        : "") +
+      "</h2>" +
       '<div class="tbl-wrap"><table><tbody>' + (toolRows || '<tr><td class="dim">no tool calls</td></tr>') + "</tbody></table></div></div>" +
       '<div><h2 class="sec">Top sessions by cost</h2>' +
-      '<div class="tbl-wrap"><table><thead><tr><th>Session</th><th>Project</th><th>Started</th><th class="num">Dur</th><th class="num">Turns</th><th class="num">Cost</th></tr></thead><tbody>' +
-      (topSessionRows || '<tr><td colspan="6" class="dim">no sessions</td></tr>') + "</tbody></table></div></div>" +
+      // No "started" column: this table ranks by COST, the recency list at the
+      // top of the page already answers "when", and six columns in a 637px
+      // grid cell left the one that identifies the row — its ask — clipped to
+      // 130px.
+      '<div class="tbl-wrap"><table><thead><tr><th>Session</th><th>Project</th><th class="num">Dur</th><th class="num">Turns</th><th class="num">Cost</th></tr></thead><tbody>' +
+      (topSessionRows || '<tr><td colspan="5" class="dim">no sessions</td></tr>') + "</tbody></table></div></div>" +
       "</div>";
     document.getElementById("an-note").innerHTML = "prices: " + esc(a.priceSource);
 

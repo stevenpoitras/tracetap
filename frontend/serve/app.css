@@ -2913,17 +2913,65 @@ button.xray-seg:focus-visible {
   align-items: start;
 }
 
-/* Chart and its own table, side by side — same numbers, two readings. */
+/* Chart and its own table, side by side — same numbers, two readings.
+   The chart column is CAPPED rather than given a share of the width: a column
+   chart is laid out at its natural size (bars are capped at 96px so they never
+   become slabs), so a 5-bucket chart is 480px wide however much room it is
+   handed. At a 2152px content width the old 5fr share gave it an 890px box for
+   a 480px chart — 410px of nothing, next to a table that could have used it. */
 .an-series-grid {
   display: grid;
-  grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+  grid-template-columns: minmax(0, 560px) minmax(0, 1fr);
   gap: var(--sp-5);
   align-items: start;
 }
 @media (max-width: 1200px) {
   .an-series-grid { grid-template-columns: minmax(0, 1fr); }
 }
+/* Two figures side by side are two cards, not one band: without this the
+   shorter one is stretched to its neighbour's height and shows 137px of empty
+   box below its last row. */
+#an-viz .split {
+  align-items: start;
+}
 /* A time axis reads left to right, so a chart narrower than its box starts at
    the left rather than floating in the middle. Centring is right for a
    calendar or a treemap, which have no reading direction; it is wrong here. */
 .an-series-chart .chart-box svg { margin-inline: 0; }
+
+/* The main thread is a baseline, not a competitor in a ranking — it is the one
+   row that was not delegated, so it is marked rather than left to look like the
+   dearest agent. Unnamed rows read as a gap in the same idiom as the cast
+   chips. */
+/* An agent's NAME is the wide thing in this table and five numbers are the
+   narrow ones, but the browser split a 448px table into 187px of label and 260
+   of digits — so 30-character names wrapped to three lines and a 13-row table
+   was 900px tall. The name takes the width and clips; the numbers need only
+   what they are. */
+.an-agent-name,
+/* Same rule for the cost ranking, which grew a title column: `.s-title`'s
+   62ch reading measure is right in the full-width sessions list and far too
+   greedy inside a 637px analytics column — it pushed started/dur/turns/cost
+   out of the table. */
+.an-tables-grid .s-title {
+  width: 100%;
+  max-width: 0;
+}
+/* A timestamp is one token even though it contains a space: allowed to wrap it
+   broke "2026-08-03 01:16" over three lines and doubled every row height. The
+   FIRST cell of each row is the label — the one elastic thing — and everything
+   after it takes the width it needs. Written as `td + td` rather than a list of
+   exemptions so a table added later inherits the rule instead of the bug. */
+.an-tables-grid tbody td + td {
+  white-space: nowrap;
+}
+.an-agent-name span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.an-agent-main td:first-child span { color: var(--bright); }
+.an-agent-unnamed td:first-child span,
+.an-agent-rest td { color: var(--dim); }
+.an-agent-rest td:first-child { font-style: italic; }

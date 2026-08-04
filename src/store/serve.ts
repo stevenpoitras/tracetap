@@ -429,6 +429,89 @@ function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilt
     })
     .sort((a, b) => b.requests - a.requests);
 
+  // Per-NAMED-agent spend, same scope.
+  //
+  // The `perAgent` map above keys on `sessions.agent`, which is the harness
+  // family and is "claude" on every row of a Claude Code install — so that
+  // table rendered exactly one row saying "CLAUDE, 82 sessions, $398", which is
+  // the totals card wearing a different hat. The names that actually divide the
+  // spend are the ones each parent gave the agents it spawned, and they live on
+  // `requests`, not on `usage_events`.
+  //
+  // Priced per row from the row's own model, with the same helpers the totals
+  // use, so this table and the cost card can never drift apart.
+  const agentRows = store.db
+    .prepare(
+      `SELECT COALESCE(NULLIF(r.agent_label, ''), '') AS label,
+              COALESCE(r.agent_type, '') AS type,
+              r.is_subagent AS sub, r.model AS model, r.session_id AS sessionId,
+              r.prompt_tokens AS inTok, r.completion_tokens AS outTok,
+              r.cache_read AS cr, r.cache_creation AS cc
+       FROM requests r
+       JOIN sessions s ON s.session_id = r.session_id
+       ${reqWhereSql}`,
+    )
+    .all(reqParams) as {
+    label: string;
+    type: string;
+    sub: number;
+    model: string;
+    sessionId: string;
+    inTok: number;
+    outTok: number;
+    cr: number;
+    cc: number;
+  }[];
+  const perNamedAgent = new Map<
+    string,
+    {
+      label: string;
+      type: string;
+      named: boolean;
+      calls: number;
+      sessions: Set<string>;
+      costUsd: number;
+      promptTokens: number;
+      completionTokens: number;
+    }
+  >();
+  for (const r of agentRows) {
+    // Three buckets, never merged: the main thread, each NAMED agent, and the
+    // marked-but-unnamed calls whose spawn was never captured.
+    const key = !r.sub ? " main" : r.label || "unnamed";
+    let pa = perNamedAgent.get(key);
+    if (!pa) {
+      pa = {
+        label: !r.sub ? "main thread" : r.label || "unnamed subagents",
+        type: r.sub ? r.type : "",
+        named: !!r.sub && !!r.label,
+        calls: 0,
+        sessions: new Set(),
+        costUsd: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+      };
+      perNamedAgent.set(key, pa);
+    }
+    const price = r.model ? priceFor(r.model, prices) : null;
+    const cost = price
+      ? costForMetrics(
+          {
+            promptTokens: r.inTok,
+            completionTokens: r.outTok,
+            cacheCreationTokens: r.cc,
+            cacheReadTokens: r.cr,
+          },
+          price,
+        )
+      : null;
+    pa.calls += 1;
+    pa.sessions.add(r.sessionId);
+    if (cost != null) pa.costUsd += cost;
+    pa.promptTokens += r.inTok + r.cr + r.cc;
+    pa.completionTokens += r.outTok;
+  }
+
   // Fleet-wide tool histogram from the per-session rollups.
   const toolCounts = new Map<string, number>();
   for (const s of sessions) {
@@ -440,6 +523,8 @@ function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilt
     .map(([name, count]) => ({ name, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 20);
+  /** How many distinct tools exist, so the pane can say what the top 20 omits. */
+  const toolsTotal = toolCounts.size;
 
   // Mid-task compactions, scoped to the filtered corpus.
   //
@@ -477,6 +562,9 @@ function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilt
     .map((s) => ({
       sessionId: s.sessionId,
       agent: s.agent,
+      // What it WAS, not just what ran it: a "top sessions by cost" table whose
+      // first column reads CLAUDE on all eight rows ranks anonymous things.
+      title: s.title,
       model: s.model,
       projectCwd: s.projectCwd,
       startedAt: s.startedAt,
@@ -511,6 +599,28 @@ function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilt
         completionTokens: pa.completionTokens,
       }))
       .sort((a, b) => b.costUsd - a.costUsd),
+    /**
+     * Spend per named agent, dearest first, with the main thread pinned to the
+     * top — it is the only row that is not a delegate, so it is a baseline
+     * rather than a competitor in the ranking.
+     */
+    perNamedAgent: [...perNamedAgent.values()]
+      .map((pa) => ({
+        label: pa.label,
+        type: pa.type,
+        named: pa.named,
+        calls: pa.calls,
+        sessions: pa.sessions.size,
+        costUsd: pa.costUsd,
+        promptTokens: pa.promptTokens,
+        completionTokens: pa.completionTokens,
+      }))
+      .sort((a, b) => {
+        const aMain = a.label === "main thread" ? 1 : 0;
+        const bMain = b.label === "main thread" ? 1 : 0;
+        if (aMain !== bMain) return bMain - aMain;
+        return b.costUsd - a.costUsd;
+      }),
     perModel,
     perProject: [...perProject.values()]
       .map((pp) => ({
@@ -522,6 +632,7 @@ function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilt
       }))
       .sort((a, b) => b.costUsd - a.costUsd),
     topTools,
+    toolsTotal,
     // 26 weeks of daily buckets — feeds the calendar heatmap.
     trend: [...trendByDay.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-182),
     compactions: { totalCompactions: compactionRow.total, sessionsWithCompaction: compactionRow.sessions },

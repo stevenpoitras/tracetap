@@ -99,6 +99,25 @@ test("harness envelopes measured on the live index are skipped", () => {
   );
 });
 
+test("hook stdout and mid-turn interjections are not the session's ask", () => {
+  assert.equal(isNoiseStep("UserPromptSubmit hook success: [01:14 CDT — sp]\nNote: …"), true);
+  // Matched on the `<Event> hook <outcome>` frame, so a variant nobody listed
+  // is caught too — three shapes appeared across one 86-session index.
+  assert.equal(isNoiseStep("UserPromptSubmit hook additional context: [02:36 CDT]"), true);
+  assert.equal(isNoiseStep("SessionStart hook additional context: you are in learning mode"), true);
+  assert.equal(isNoiseStep("PreToolUse hook failed: exit 2"), true);
+  // Twin: prose about hooks is still an ask.
+  assert.equal(isNoiseStep("the hook additional context is wrong, please fix"), false);
+  // The words after this frame ARE the user's, but they are an aside inside a
+  // running turn — one live session would have been titled "proud of you!".
+  assert.equal(
+    isNoiseStep("The user sent a new message while you were working:\nproud of you!"),
+    true,
+  );
+  // Twin: an ask that merely mentions the user sending messages survives.
+  assert.equal(isNoiseStep("The user sent a new message to the wrong channel — fix it"), false);
+});
+
 test("a <session> wrapper is OPENED, because its contents are the ask", () => {
   // Claude Code's own title-generation call hands the model the conversation it
   // is naming, wrapped, followed by instructions. The wrapper is scaffolding;
