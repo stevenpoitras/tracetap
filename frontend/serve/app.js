@@ -399,8 +399,16 @@
         });
       })
       .then(function (res) {
-        // A live 403/409 means the server declined and is still running, so
-        // there is nothing to wait for.
+        // 409 is "already running the newest build" — the goal state, reached
+        // without doing anything. Reporting it as a failure was wrong and
+        // alarming: it happens whenever the badge is a poll interval stale,
+        // which is exactly when a user is most likely to click.
+        if (res && res.status === 409) {
+          location.reload();
+          return null;
+        }
+        // A live 403 (or anything else) means the server declined and is still
+        // running, so there is nothing to wait for.
         if (res && !res.ok && res.status !== 202) {
           return res.json().then(function (j) {
             throw new Error(j.error || "restart refused");
