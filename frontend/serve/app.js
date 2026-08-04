@@ -1711,11 +1711,16 @@
       "</div>" +
       // The header is a `.turn-row` so it inherits the grid verbatim — a second
       // template would drift out of alignment the first time a column changed.
+      // The header lives INSIDE the scroll container and sticks. Outside it, the
+      // rows were narrower by the scrollbar width while the header was not, and
+      // since the shared grid is `ch`-and-fr the difference landed entirely on
+      // the elastic column — 10px of drift by the right-hand numerics.
       '<div class="turn-spine" id="turn-spine">' +
+      '<div class="turn-body">' +
       '<div class="turn-row turn-head" aria-hidden="true">' +
       "<span></span><span>#</span><span>what</span><span>context</span>" +
       "<span>tok</span><span>dur</span><span>ev</span></div>" +
-      '<div class="turn-body">' + rows + "</div></div>"
+      rows + "</div></div>"
     );
   }
 
@@ -3553,7 +3558,12 @@
         .join("") +
       '<div class="context-timeline" id="context-timeline">';
 
-    tl.points.forEach(function (p) {
+    // Label thinning, same rule columnChart uses for its date axis: a bar is
+    // 12-28px wide and a 3-digit sequence is ~17px, so past ~20 bars the labels
+    // collide. 44 of 145 overlapped before this. The seq is on every bar's
+    // `aria-label` and tooltip regardless, so nothing becomes unreachable.
+    var seqEvery = Math.max(1, Math.ceil(tl.points.length / 20));
+    tl.points.forEach(function (p, i) {
       var h = Math.max(1, Math.round((p.contextTokens / axisMax) * 100));
       var cls =
         "ct-bar" +
@@ -3573,9 +3583,7 @@
         ' context tokens" style="height:' +
         h +
         '%">' +
-        '<span class="ct-seq">' +
-        p.seq +
-        "</span>" +
+        (i % seqEvery === 0 ? '<span class="ct-seq">' + p.seq + "</span>" : "") +
         (p.compaction ? '<span class="ct-compact">⇣</span>' : "") +
         "</button>";
     });

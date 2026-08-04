@@ -201,7 +201,10 @@ var TracetapCharts = (function () {
         '<rect x="' + (r.x + 1).toFixed(1) + '" y="' + (r.y + 1).toFixed(1) +
         '" width="' + Math.max(0, r.w - 2).toFixed(1) + '" height="' + Math.max(0, r.h - 2).toFixed(1) +
         '" rx="3" fill="' + color + '" fill-opacity="0.16" stroke="' + color + '" stroke-opacity="0.55"></rect>';
-      if (r.w > 78 && r.h > 34) {
+      // Raised with the type scale: the label is 14px and the sub 11px now, and
+      // SVG <text> has no clipping and no ellipsis — a cell that cannot hold
+      // both must show neither rather than spill across its neighbour.
+      if (r.w > 96 && r.h > 40) {
         cell += '<text x="' + (r.x + 9).toFixed(1) + '" y="' + (r.y + 18).toFixed(1) + '" class="tm-label">' + esc(r.item.label) + "</text>" +
           '<text x="' + (r.x + 9).toFixed(1) + '" y="' + (r.y + 32).toFixed(1) + '" class="tm-sub">' + esc(r.item.sub || "") + "</text>";
       }

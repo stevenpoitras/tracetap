@@ -202,7 +202,7 @@ h2.sec,
   border-bottom-color: var(--accent);
 }
 .tab-n {
-  color: var(--muted);
+  color: var(--dim);
   margin-right: 6px;
   font-size: var(--fs-100);
 }
@@ -355,7 +355,7 @@ h2.sec,
   margin-bottom: 12px;
   font-family: var(--font-chrome);
   font-size: var(--fs-400);
-  color: var(--muted);
+  color: var(--dim);
   letter-spacing: 0.3em;
 }
 .empty code {
@@ -423,7 +423,7 @@ h2.sec,
 .controls input[type="date"],
 .controls select {
   padding: 6px 10px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 5px;
   background: var(--surface);
   color: var(--text);
@@ -459,7 +459,7 @@ h2.sec,
   flex: 1;
 }
 .controls .btn {
-  padding: 6px 11px; border: 1px solid var(--border); border-radius: 5px;
+  padding: 6px 11px; border: 1px solid var(--border-strong); border-radius: 5px;
   background: var(--surface-2); color: var(--mid);
   font-family: var(--font-data); font-size: var(--fs-300); font-weight: 300; cursor: pointer;
 }
@@ -480,8 +480,8 @@ h2.sec,
   font-family: var(--font-chrome); color: var(--dim);
   font-size: var(--fs-100); letter-spacing: 0.12em; text-transform: uppercase;
 }
-.controls .ctl-sep { color: var(--muted); }
-.controls .ctl-hint { color: var(--muted); font-size: var(--fs-200); }
+.controls .ctl-sep { color: var(--dim); }
+.controls .ctl-hint { color: var(--dim); font-size: var(--fs-200); }
 .controls.sub { margin: 0 0 10px; }
 .scope-line { color: var(--dim); font-size: var(--fs-200); margin: 0 0 18px 2px; }
 .scope-line b { color: var(--mid); font-weight: 400; }
@@ -489,7 +489,7 @@ h2.sec,
 /* -- tables ------------------------------------------------------------- */
 .tbl-wrap {
   overflow-x: auto;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
   background: var(--surface);
 }
@@ -521,7 +521,7 @@ thead th.sortable:hover {
   color: var(--mid);
 }
 thead th .arrow {
-  font-size: var(--fs-100);
+  font-size: 0.8em;
   color: var(--accent);
 }
 /* --row-default: anything you click INTO. */
@@ -693,7 +693,7 @@ h2.sec {
 }
 h2.sec::before {
   content: "// ";
-  color: var(--muted);
+  color: var(--dim);
   letter-spacing: 0;
 }
 h2.sec small {
@@ -1158,7 +1158,7 @@ h1 {
   color: var(--dim);
 }
 .diff .gap {
-  color: var(--muted);
+  color: var(--dim);
   text-align: center;
   padding: 2px 8px;
   user-select: none;
@@ -1370,7 +1370,7 @@ h1 {
   overflow: auto;
   padding: 10px 12px;
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 8px;
   font-size: var(--fs-300);
 }
@@ -1390,7 +1390,10 @@ h1 {
   word-break: break-word;
   flex: 1;
 }
+/* Was a ~20x16 target. 24x24 is the floor for a pointer target. */
 .inspector-close {
+  min-width: 28px;
+  min-height: 28px;
   background: none;
   border: none;
   color: var(--dim);
@@ -2031,8 +2034,10 @@ tr[data-inspect]:focus-visible {
 .ribbon-bar.sub {
   background: var(--accent2);
 }
+/* 0.14 put out-of-window bars at 1.23:1 — they vanished rather than dimmed,
+   which loses the context the window is being read against. */
 .ribbon-bar.out {
-  opacity: 0.14;
+  opacity: 0.3;
 }
 .ribbon-bar:hover {
   opacity: 1;
@@ -2179,13 +2184,23 @@ tr[data-inspect]:focus-visible {
   cursor: pointer;
   border-bottom: 1px solid var(--border);
 }
-/* Outside `.turn-body`, so it is permanently visible without needing `sticky`. */
+/* Inside `.turn-body` and sticky, so it scrolls with the same width as the
+   rows it labels. */
 .turn-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   cursor: default;
-  background: var(--bg, #0b0d12);
+  background: var(--bg);
   border-bottom: 1px solid var(--border);
-  font-family: var(--font-chrome);
-  font-size: var(--fs-100);
+  /* Font-family AND size must match `.turn-row`. The shared grid is declared in
+     `ch` — the width of the element's own "0" glyph — so a header in a
+     different face or size computes different tracks from the same
+     declaration. Departure Mono at --fs-100 drifted 22px by the right-hand
+     numerics; matching the size alone left 10px of face difference. Uppercase,
+     tracking and colour still carry the "this is chrome" signal. */
+  font-family: var(--font-data);
+  font-size: var(--fs-200);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--dim);
