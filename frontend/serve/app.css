@@ -1988,6 +1988,32 @@ tr[data-inspect]:focus-visible {
 .ribbon-grip[data-grip="from"] { left: -6px; }
 .ribbon-grip[data-grip="to"] { right: -6px; }
 .ribbon-grip:hover, .ribbon-grip:active { opacity: 1; }
+/* Context-over-time, on the ribbon's own x-axis. Same three hues as the row
+   bars, so a band here and a segment there mean the same thing. */
+.ctx-strip {
+  position: relative;
+  line-height: 0;
+}
+.ctx-strip svg { display: block; }
+.ctx-read { fill: #3f4a7a; }
+.ctx-write { fill: var(--amber, #f0b429); fill-opacity: 0.85; }
+.ctx-fresh { fill: #5eead4; fill-opacity: 0.9; }
+.ctx-strip-note {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  /* The caption sits over the plot, so it needs its own backdrop — unreadable
+     where it crossed the amber band otherwise. */
+  background: var(--bg, #0b0d12);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--font-chrome);
+  font-size: 9px;
+  line-height: 1.4;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
 .ribbon-axis {
   display: flex;
   justify-content: space-between;

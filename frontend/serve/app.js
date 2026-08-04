@@ -479,12 +479,14 @@
     fitChart(hostId);
   }
 
+  function fitCharts() {
+    Object.keys(chartFits).forEach(fitChart);
+  }
+
   var fitTimer = null;
   window.addEventListener("resize", function () {
     clearTimeout(fitTimer);
-    fitTimer = setTimeout(function () {
-      Object.keys(chartFits).forEach(fitChart);
-    }, 120);
+    fitTimer = setTimeout(fitCharts, 120);
   });
 
   function columnChart(items, opts) {
@@ -1070,6 +1072,10 @@
       '<span class="ribbon-grip" data-grip="to"></span>' +
       "</span>" +
       "</div></div>" +
+      // Shares the ribbon's t0/span, so it is the SAME x-axis — a context cliff
+      // sits directly under the call that caused it. Registered rather than
+      // inlined because it is laid out at its measured width (see `fitChart`).
+      '<div class="ctx-strip" id="ctx-strip"></div>' +
       '<div class="ribbon-axis"><span>0s</span><span>' +
       esc(fmtDur(span / 2)) + "</span><span>" + esc(fmtDur(span)) + "</span></div>" +
       // "first start → last finish", spelled out because it does NOT match the
@@ -1079,6 +1085,76 @@
       turns.length + (turns.length === 1 ? " call" : " calls") +
       " · first start → last finish " + esc(fmtDur(span)) + " · max " +
       laneCount + " in flight · drag to select a window</div>"
+    );
+  }
+
+  var CTX_STRIP_H = 54;
+
+  /**
+   * Context over wall-clock, stacked by where the context came from.
+   *
+   * Two questions the spine could not answer at a glance, both about the SHAPE
+   * of a session rather than any one call: how the context grew, and how much
+   * of it was being paid for fresh. Stacking cache read / cache write / fresh
+   * input answers them together, because the total height IS the context size
+   * and the bands are its cost breakdown — a compaction reads as a cliff, and a
+   * cache rebuild reads as an amber wedge immediately after it.
+   *
+   * It shares `t0`/`span` with the ribbon directly above, so the two are the
+   * same axis and a cliff sits under the call that caused it.
+   *
+   * Sampled at call START. Calls overlap, so no single instant has one true
+   * context size; the start is the value the request was actually sent with.
+   */
+  function contextStripHtml(turns, t0, span, W) {
+    var H = CTX_STRIP_H;
+    var pts = turns
+      .map(function (t) {
+        var r = t.req;
+        return {
+          x: ((r.ts * 1000 - t0) / span) * W,
+          read: r.cacheRead || 0,
+          write: r.cacheCreation || 0,
+          fresh: r.promptTokens || 0,
+        };
+      })
+      .sort(function (a, b) {
+        return a.x - b.x;
+      });
+    if (!pts.length) return "";
+    var max = 0;
+    pts.forEach(function (p) {
+      var tot = p.read + p.write + p.fresh;
+      if (tot > max) max = tot;
+    });
+    if (max <= 0) return "";
+
+    // Bands are cumulative, drawn back-to-front, so each polygon is the area
+    // under a running total rather than a floating ribbon that has to be closed
+    // along a second edge.
+    function band(keys, cls) {
+      var top = pts.map(function (p) {
+        var v = 0;
+        keys.forEach(function (k) {
+          v += p[k];
+        });
+        return p.x.toFixed(1) + "," + (H - (v / max) * (H - 2)).toFixed(1);
+      });
+      return (
+        '<polygon class="' + cls + '" points="' +
+        pts[0].x.toFixed(1) + "," + H + " " + top.join(" ") + " " +
+        pts[pts.length - 1].x.toFixed(1) + "," + H + '"></polygon>'
+      );
+    }
+
+    return (
+      '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '">' +
+      band(["read", "write", "fresh"], "ctx-fresh") +
+      band(["read", "write"], "ctx-write") +
+      band(["read"], "ctx-read") +
+      "</svg>" +
+      '<div class="ctx-strip-note dim">context over time · peak ' +
+      fmtTok(max) + " · stacked by provenance</div>"
     );
   }
 
@@ -1835,6 +1911,17 @@
       "</aside>" +
       "</div>";
     setView(html);
+    // After `setView`, because the strip is laid out at its measured width and
+    // reads t0/span back off the ribbon it must align with — one source for the
+    // axis, so the two can never drift apart.
+    var rib = document.getElementById("ribbon");
+    if (rib) {
+      var stripT0 = +rib.getAttribute("data-t0");
+      var stripSpan = +rib.getAttribute("data-t1") - stripT0 || 1;
+      registerChart("ctx-strip", function (w) {
+        return contextStripHtml(turnsForPane, stripT0, stripSpan, w);
+      });
+    }
     bindSessionInteractions(reqs, compactSeqs, steps);
     bindSessionPanes(s.sessionId, reqs);
     if (stepN != null) {
@@ -1903,6 +1990,10 @@
     // this call earlier, restoring pane B wrote B's row into A's cursor slot
     // and A could never be restored again.
     syncInspectorToPane(name);
+    // A hidden pane measures 0 wide, so a chart registered while it was down
+    // could never lay itself out. Re-fit on the way up; `fitChart` no-ops when
+    // the width is unchanged, so this costs nothing on repeat visits.
+    fitCharts();
   }
 
   function bindSessionPanes(sessionId, reqs) {
