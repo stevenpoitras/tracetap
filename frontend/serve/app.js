@@ -621,7 +621,7 @@
   var current = { name: null, arg: null };
 
   function route() {
-    var h = location.hash.replace(/^#/, "") || "sessions";
+    var h = location.hash.replace(/^#/, "") || "analytics";
     var m;
     // session/<id>[/<pane>][/step-N]
     //
@@ -3630,6 +3630,14 @@
     if (e.target.closest && e.target.closest(".ribbon-clear")) setTurnRange(null);
   });
 
+  // Insight chips and recent-session rows are <button>s, not links, because
+  // they carry structure a link cannot; this gives them link behaviour back.
+  document.addEventListener("click", function (e) {
+    var el = e.target.closest && e.target.closest("[data-goto]");
+    if (!el) return;
+    location.hash = el.getAttribute("data-goto");
+  });
+
   // ------------------------------------------------------------- journey
   /**
    * Focus index into `turnsForPane`, NOT a seq. The strip, the range input and
@@ -4509,6 +4517,8 @@
       "</div>" +
       '<div class="scope-line" id="an-scope-line">Loading&hellip;</div>' +
       '<div id="an-cards">' + skelCards(7) + "</div>" +
+      '<div id="an-insights"></div>' +
+      '<div id="an-recent"></div>' +
       '<div id="an-calendar"></div>' +
       '<h2 class="sec">Spend over time <small>(the same slice, bucketed &mdash; granularity and breakdown reshape this section only)</small></h2>' +
       '<div class="controls sub">' +
@@ -4626,6 +4636,7 @@
       if (sel) sel.innerHTML = anAgentOptions();
     }
     document.getElementById("an-scope-line").innerHTML = scopeLine(a);
+    anForInsights = a;
 
     document.getElementById("an-cards").innerHTML = '<div class="cards">' +
       card("Sessions", t.sessions) +
@@ -4640,6 +4651,9 @@
       card("Output tokens", fmtTok(t.completionTokens)) +
       card("Compactions", a.compactions.totalCompactions + ' <small>in ' + a.compactions.sessionsWithCompaction + " sessions</small>", a.compactions.totalCompactions > 0) +
       "</div>";
+
+    document.getElementById("an-insights").innerHTML = fleetInsightsHtml(a);
+    loadRecentSessions();
 
     document.getElementById("an-calendar").innerHTML = a.trend.length
       ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost calendar &mdash; last 26 weeks &middot; ' +
@@ -4846,6 +4860,171 @@
       });
     }
     renumberFigs();
+  }
+
+  var anForInsights = null;
+
+  /**
+   * Fleet-scale "worth looking at" — the analytics analogue of the journey's
+   * per-turn insights, and held to the same standard: every entry is a rule you
+   * can check against a number on this page, not a judgement.
+   *
+   * The landing page's job is to answer "what should I look at" before you have
+   * formed a query. A wall of totals does not do that; totals tell you what
+   * happened, not which of it is unusual.
+   */
+  function fleetInsightsHtml(a) {
+    var t = a.totals;
+    var out = [];
+    function push(label, detail, sev, href) {
+      out.push(
+        '<button type="button" class="jr-insight sev-' + sev + '"' +
+        (href ? ' data-goto="' + esc(href) + '"' : "") + ">" +
+        '<span class="jr-i-label">' + label + "</span>" +
+        '<span class="jr-i-detail">' + detail + "</span></button>",
+      );
+    }
+
+    // Unpriced models first: it invalidates every dollar figure above it, so
+    // burying it under "insights" would be the wrong order.
+    if (t.hasUnpriced) {
+      push(
+        "Cost is understated",
+        "some calls used models with no price in the catalogue",
+        "warn",
+      );
+    }
+
+    // Cache economics. Reads bill ~0.1x and writes ~1.25x, so the ratio between
+    // them is the single biggest lever on spend that is not "send less".
+    var cw = t.cacheCreation || 0;
+    var cr = t.cacheRead || 0;
+    if (cw + cr > 0) {
+      var writeShare = cw / (cw + cr);
+      push(
+        fmtPct(writeShare) + " of cached tokens were WRITES",
+        fmtTok(cw) + " written at 1.25x vs " + fmtTok(cr) +
+          " read at 0.1x — a write costs 12.5x a read",
+        writeShare > 0.25 ? "warn" : "info",
+      );
+    }
+
+    // Error-rate outlier by model, not the fleet average: one bad model hides
+    // inside a healthy aggregate.
+    var worst = null;
+    (a.perModel || []).forEach(function (m) {
+      if (m.requests >= 20 && (!worst || m.errorRate > worst.errorRate)) worst = m;
+    });
+    if (worst && worst.errorRate > 0.01) {
+      push(
+        esc(worst.model) + " failed " + fmtPct(worst.errorRate) + " of calls",
+        worst.errored + " of " + worst.requests + " requests",
+        "bad",
+      );
+    }
+
+    // Latency spread, which the p50 on the cards cannot show.
+    var slow = null;
+    (a.perModel || []).forEach(function (m) {
+      if (m.ttftN >= 20 && (!slow || m.ttftP95 > slow.ttftP95)) slow = m;
+    });
+    if (slow && slow.ttftP50 && slow.ttftP95 > slow.ttftP50 * 2.5) {
+      push(
+        esc(slow.model) + " p95 is " + esc(fmtDur(slow.ttftP95)),
+        Math.round(slow.ttftP95 / slow.ttftP50) + "x its own median (" +
+          esc(fmtDur(slow.ttftP50)) + ") — a long tail, not a slow model",
+        "info",
+      );
+    }
+
+    // Concentration: where the money actually went.
+    var top = (a.perProject || [])[0];
+    if (top && t.costUsd > 0) {
+      push(
+        esc(basename(top.project) || top.project) + " is " +
+          fmtPct(top.costUsd / t.costUsd) + " of spend",
+        fmtCost(top.costUsd) + " across " + top.sessions + " sessions",
+        "info",
+      );
+    }
+
+    if (a.compactions.totalCompactions > 0) {
+      push(
+        a.compactions.totalCompactions + " compactions",
+        "across " + a.compactions.sessionsWithCompaction + " of " + t.sessions +
+          " sessions — each one drops transcript the model can no longer see",
+        "warn",
+      );
+    }
+
+    var busiest = (a.topTools || [])[0];
+    if (busiest) {
+      push(
+        esc(busiest.name) + " ran " + busiest.count + " times",
+        "the most-invoked tool in scope",
+        "info",
+        "#tooltax",
+      );
+    }
+
+    if (!out.length) return "";
+    return (
+      '<h2 class="sec">Worth looking at <small>(' + out.length + ")</small></h2>" +
+      '<div class="jr-insights">' + out.join("") + "</div>"
+    );
+  }
+
+  /**
+   * "Jump back in" — the newest sessions, so making analytics the landing page
+   * does not cost the one thing the session list was good for.
+   *
+   * Deliberately short. The full list is one click away and is a LOOKUP tool;
+   * this is the recency shortcut, which is the only part of it you need before
+   * you have a query in mind.
+   */
+  function loadRecentSessions() {
+    var host = document.getElementById("an-recent");
+    if (!host) return;
+    fetchJSON("/api/sessions?limit=6")
+      .then(function (d) {
+        var rows = (d.sessions || [])
+          .map(function (s) {
+            return (
+              '<button type="button" class="an-recent-row" data-goto="#session/' +
+              esc(encodeURIComponent(s.sessionId)) + '">' +
+              '<span class="rc-when">' + esc(fmtWhen(s.startedAt)) + "</span>" +
+              '<span class="rc-proj">' + esc(basename(s.projectCwd) || "—") + "</span>" +
+              '<span class="rc-model">' + esc(s.model || "") + "</span>" +
+              '<span class="rc-n">' + (s.turns || 0) + " turns</span>" +
+              '<span class="rc-n">' + esc(fmtDur(s.durationMs)) + "</span>" +
+              '<span class="rc-n' + (s.errorCount ? " bad" : "") + '">' +
+              (s.errorCount ? s.errorCount + " err" : "") + "</span>" +
+              '<span class="rc-cost">' + esc(fmtCost(s.costUsd)) + "</span>" +
+              "</button>"
+            );
+          })
+          .join("");
+        host.innerHTML = rows
+          ? '<h2 class="sec">Jump back in <small>(newest first · ' +
+            '<a href="#sessions">all sessions</a>)</small></h2>' +
+            '<div class="an-recent">' + rows + "</div>"
+          : "";
+      })
+      .catch(function () {
+        host.innerHTML = "";
+      });
+  }
+
+  /** Relative-then-absolute, because "3h ago" is what you scan a recent list for. */
+  function fmtWhen(epochSeconds) {
+    if (!epochSeconds) return "—";
+    var d = new Date(epochSeconds * 1000);
+    var mins = Math.round((Date.now() - d.getTime()) / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return mins + "m ago";
+    if (mins < 60 * 24) return Math.round(mins / 60) + "h ago";
+    if (mins < 60 * 24 * 7) return Math.round(mins / (60 * 24)) + "d ago";
+    return d.toLocaleDateString();
   }
 
   /** The bucketed drill-down: cost per bucket + the full token/spend table. */
