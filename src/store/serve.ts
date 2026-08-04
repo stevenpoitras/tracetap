@@ -4,7 +4,13 @@ import * as path from "path";
 import { spawn } from "child_process";
 import { AddressInfo } from "net";
 import { Store, defaultDbPath } from "./index";
-import type { RequestRow, SearchFilters, SessionListFilters, ToolsetUsageRow } from "./index";
+import type {
+  RequestRow,
+  SearchFilters,
+  SessionListFilters,
+  ToolsetUsageRow,
+  UsageEventFilters,
+} from "./index";
 import { computeToolsetTax } from "../context/tooltax";
 import type { ToolsetTax } from "../context/tooltax";
 import { costForMetrics, priceFor } from "../analytics";
@@ -240,9 +246,60 @@ export function findCompactions(requests: RequestRow[]): { seq: number; from: nu
   return findCompactionPoints([...requests].sort((a, b) => a.ts - b.ts || a.seq - b.seq));
 }
 
-function fleetAnalytics(store: Store, prices: PriceTable) {
-  const sessions = store.listSessions();
-  const events = store.listUsageEvents();
+/**
+ * Scope filters for {@link fleetAnalytics}. Deliberately the same three the
+ * usage report accepts (`since`/`until`/`agent`) so ONE control set in the
+ * dashboard governs the whole analytics pane — the stat cards, the charts, the
+ * breakdown tables and the bucketed time-series all answer for the same slice.
+ */
+export interface AnalyticsFilters {
+  /** Inclusive unix-epoch-second lower bound. */
+  since?: number;
+  /** Inclusive unix-epoch-second upper bound. */
+  until?: number;
+  /** Exact (case-insensitive) agent name — matches `listUsageEvents` semantics. */
+  agent?: string;
+}
+
+function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilters = {}) {
+  const { since, until, agent } = filters;
+
+  // Sessions carry no event timestamps, so bound them by start time. The agent
+  // match is exact (not the substring `listSessions` does) so it lines up with
+  // the usage events, which are the source of every cost figure below — one
+  // filter must never mean two different things inside one pane.
+  const sessionFilters: SessionListFilters = {};
+  if (typeof since === "number") sessionFilters.since = since;
+  if (typeof until === "number") sessionFilters.until = until;
+  const scopedSessions = store.listSessions(sessionFilters);
+  const sessions = agent
+    ? scopedSessions.filter((s) => s.agent.toLowerCase() === agent.toLowerCase())
+    : scopedSessions;
+
+  const eventFilters: UsageEventFilters = {};
+  if (typeof since === "number") eventFilters.since = since;
+  if (typeof until === "number") eventFilters.until = until;
+  if (agent) eventFilters.agent = agent;
+  const events = store.listUsageEvents(eventFilters);
+
+  // Requests predate usage events on old logs and can carry ts = 0/NULL, so
+  // bound them by the owning session's start time rather than dropping them.
+  const reqWhere: string[] = [];
+  const reqParams: Record<string, unknown> = {};
+  const reqTs = "COALESCE(NULLIF(r.ts, 0), s.started_at)";
+  if (typeof since === "number") {
+    reqWhere.push(`${reqTs} >= @since`);
+    reqParams.since = since;
+  }
+  if (typeof until === "number") {
+    reqWhere.push(`${reqTs} <= @until`);
+    reqParams.until = until;
+  }
+  if (agent) {
+    reqWhere.push("lower(s.agent) = lower(@agent)");
+    reqParams.agent = agent;
+  }
+  const reqWhereSql = reqWhere.length ? `WHERE ${reqWhere.join(" AND ")}` : "";
 
   // Totals + per-agent + daily trend, re-priced from raw tokens.
   const totals = {
@@ -323,13 +380,16 @@ function fleetAnalytics(store: Store, prices: PriceTable) {
   const inputSide = totals.promptTokens + totals.cacheCreation + totals.cacheRead;
   totals.cacheHitRate = inputSide > 0 ? totals.cacheRead / inputSide : 0;
 
-  // Per-model wire metrics straight from the requests table.
+  // Per-model wire metrics straight from the requests table, same scope.
   const reqRows = store.db
     .prepare(
-      `SELECT model, errored, ttft_ms AS ttft, duration_ms AS dur, completion_tokens AS outTok
-       FROM requests`,
+      `SELECT r.model AS model, r.errored AS errored, r.ttft_ms AS ttft,
+              r.duration_ms AS dur, r.completion_tokens AS outTok
+       FROM requests r
+       JOIN sessions s ON s.session_id = r.session_id
+       ${reqWhereSql}`,
     )
-    .all() as { model: string; errored: number; ttft: number | null; dur: number | null; outTok: number }[];
+    .all(reqParams) as { model: string; errored: number; ttft: number | null; dur: number | null; outTok: number }[];
   const perModelMap = new Map<
     string,
     { model: string; requests: number; errored: number; ttfts: number[]; durs: number[]; completionTokens: number }
@@ -381,23 +441,35 @@ function fleetAnalytics(store: Store, prices: PriceTable) {
     .sort((a, b) => b.count - a.count)
     .slice(0, 20);
 
-  // Mid-task compactions: transcript shrank between consecutive calls.
-  // Both the transcript AND the context must shrink — see findCompactions.
-  // Counting item drops alone swept up every hop between interleaved subagent
-  // conversations, which on a fleet session is most adjacent pairs.
+  // Mid-task compactions, scoped to the filtered corpus.
+  //
+  // Two independent corrections meet here and BOTH are required. The context
+  // delta (item drops alone swept up every hop between interleaved subagent
+  // conversations, which on a fleet session is most adjacent pairs), and the
+  // scope join (an unfiltered count beside filtered cards is two corpora on one
+  // screen). The LAG runs over the scoped rows only, so a compaction straddling
+  // the window edge is not counted — its predecessor is outside the scope the
+  // user asked for.
+  //
+  // Ordered by ts then seq, not seq alone: seq is assignment order in the log
+  // and concurrent calls finish out of order, so the seq predecessor is
+  // routinely a LATER turn. Same defect `findCompactions` was fixed for; two
+  // orderings of one concept would drift exactly as two definitions did.
   const compactionRow = store.db
     .prepare(
       `SELECT COUNT(*) AS total, COUNT(DISTINCT session_id) AS sessions FROM (
-         SELECT session_id,
-                transcript_items - LAG(transcript_items)
-                  OVER (PARTITION BY session_id ORDER BY seq) AS item_delta,
-                (prompt_tokens + cache_read + cache_creation)
-                  - LAG(prompt_tokens + cache_read + cache_creation)
-                  OVER (PARTITION BY session_id ORDER BY seq) AS ctx_delta
-         FROM requests
+         SELECT r.session_id AS session_id,
+                r.transcript_items - LAG(r.transcript_items)
+                  OVER (PARTITION BY r.session_id ORDER BY r.ts, r.seq) AS item_delta,
+                (r.prompt_tokens + r.cache_read + r.cache_creation)
+                  - LAG(r.prompt_tokens + r.cache_read + r.cache_creation)
+                  OVER (PARTITION BY r.session_id ORDER BY r.ts, r.seq) AS ctx_delta
+         FROM requests r
+         JOIN sessions s ON s.session_id = r.session_id
+         ${reqWhereSql}
        ) WHERE item_delta < 0 AND ctx_delta < 0`,
     )
-    .get() as { total: number; sessions: number };
+    .get(reqParams) as { total: number; sessions: number };
 
   const topSessions = [...sessions]
     .sort((a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0))
@@ -414,7 +486,21 @@ function fleetAnalytics(store: Store, prices: PriceTable) {
       errorCount: s.errorCount,
     }));
 
+  // Every agent the index knows about, independent of the current scope — the
+  // dashboard's agent picker must not erase the option you just filtered away.
+  const agentOptions = (
+    store.db.prepare("SELECT DISTINCT agent FROM sessions WHERE agent <> '' ORDER BY agent").all() as {
+      agent: string;
+    }[]
+  ).map((r) => r.agent);
+
   return {
+    filters: {
+      since: since ?? null,
+      until: until ?? null,
+      agent: agent ?? "",
+    },
+    agentOptions,
     totals,
     perAgent: [...perAgent.values()]
       .map((pa) => ({
@@ -786,6 +872,28 @@ function firstParam(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
+/**
+ * Parse the `since` / `until` / `agent` scope shared by `/api/usage` and
+ * `/api/analytics`. One parser means the merged analytics pane can send one
+ * control set to both endpoints and get back two views of the SAME slice —
+ * anything else and the page's filters would silently govern only half of it.
+ * Returns `{ error }` (→ 400) instead of throwing on an unparseable date.
+ */
+function parseScope(q: URLSearchParams): { filters: AnalyticsFilters } | { error: string } {
+  const filters: AnalyticsFilters = {};
+  const since = firstParam(q.get("since") ?? undefined);
+  const until = firstParam(q.get("until") ?? undefined);
+  const agent = firstParam(q.get("agent") ?? undefined);
+  try {
+    if (since) filters.since = parseWhen(since);
+    if (until) filters.until = parseWhen(until, { endOfDay: true });
+  } catch (err) {
+    return { error: (err as Error).message };
+  }
+  if (agent) filters.agent = agent;
+  return { filters };
+}
+
 // SSE: notify connected dashboards when the index database changes on disk.
 // Polling the file mtimes (db + WAL) is the simplest reliable signal — fs.watch
 // misses WAL checkpoint writes on some platforms.
@@ -1047,15 +1155,16 @@ export async function handleRequest(
       const g = firstParam(q.get("granularity") ?? undefined) ?? "daily";
       const granularity: Granularity =
         g === "weekly" || g === "monthly" || g === "total" ? g : "daily";
-      const filters: { since?: number; until?: number; agent?: string; model?: string; project?: string } = {};
-      const since = firstParam(q.get("since") ?? undefined);
-      const until = firstParam(q.get("until") ?? undefined);
-      const agent = firstParam(q.get("agent") ?? undefined);
+      const scope = parseScope(q);
+      if ("error" in scope) {
+        sendJson(res, 400, { error: scope.error });
+        return;
+      }
+      const filters: { since?: number; until?: number; agent?: string; model?: string; project?: string } = {
+        ...scope.filters,
+      };
       const model = firstParam(q.get("model") ?? undefined);
       const project = firstParam(q.get("project") ?? undefined);
-      if (since) filters.since = parseWhen(since);
-      if (until) filters.until = parseWhen(until, { endOfDay: true });
-      if (agent) filters.agent = agent;
       if (model) filters.model = model;
       if (project) filters.project = project;
       const breakdown = q.get("breakdown") === "1" || q.get("breakdown") === "true";
@@ -1070,8 +1179,13 @@ export async function handleRequest(
     }
 
     if (pathname === "/api/analytics") {
+      const scope = parseScope(q);
+      if ("error" in scope) {
+        sendJson(res, 400, { error: scope.error });
+        return;
+      }
       const { prices, source } = await getPrices();
-      sendJson(res, 200, { ...fleetAnalytics(store, prices), priceSource: source });
+      sendJson(res, 200, { ...fleetAnalytics(store, prices, scope.filters), priceSource: source });
       return;
     }
 

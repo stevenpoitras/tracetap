@@ -560,14 +560,17 @@ Six views:
   **Flow** (agent-loop graph), **Hooks** (Claude Code hook timeline + payloads),
   **Context X-Ray** (window composition + new/carried/dropped vs prior call),
   **Tool Tax** (declared vs invoked tools for this session's toolset),
-  and **Wire** (context-growth / token-flow lanes, request waterfall, transcript).
-- **Usage** — the `tracetap usage` report in chart + table form (granularity,
-  per-model breakdown, date range).
-- **Analytics** — fleet rollups: total cost / cache-hit rate / call error rate
-  stat cards, a **26-week cost calendar heatmap**, a **spend-by-project
-  treemap**, **TTFT distribution strips per model** (p10–p95 bands measured
-  from your own traffic, not provider status pages), per-model and per-agent
-  tables, top tools, top sessions by cost, mid-task compaction counts.
+  and **Wire** (a turn spine — one row per turn, its tool calls / hooks /
+  compactions nested underneath — over a wall-clock time ribbon you can drag
+  to select a window, plus the transcript).
+- **Analytics** — one pane for "where is my time and money going", from the
+  snapshot down to the drill-down. A **scope bar** (since / until / agent) sits
+  at the top and governs *everything* below it — cards, charts, tables and the
+  time series all answer for the same slice. Stat cards, a **26-week cost
+  calendar heatmap**, a **spend-by-project treemap**, **TTFT distribution
+  strips per model** (p10–p95 bands measured from your own traffic, not
+  provider status pages), per-model and per-agent tables, top tools, top
+  sessions by cost, and mid-task compaction counts. `#usage` redirects here.
 - **Prompts** — the system-prompt registry: every distinct prompt version seen
   on the wire (content-addressed; volatile fragments normalized away), with
   usage counts and a **line diff between any two versions** — see exactly what
@@ -607,23 +610,19 @@ Claude's session UUID). Set `TRACETAP_HOOK_FULL=1` to store full stdin payloads.
 
 JSON API (everything the UI uses is scriptable):
 
-| Route                                         | Returns                                                                           |
-| --------------------------------------------- | --------------------------------------------------------------------------------- |
-| `GET /`                                       | The self-contained dashboard page (inline CSS/JS)                                 |
-| `GET /api/meta`                               | DB path, row counts, price source                                                 |
-| `GET /api/sessions`                           | Session list (`agent`/`model`/`project`/`tool`/`errored` filters, `sort`/`order`) |
-| `GET /api/search?q=…`                         | FTS5 search hits (`tool`/`agent`/`model`/`project`/`errored` filters)             |
-| `GET /api/session/<id>`                       | One session: summary + steps + requests + hooks + flow + compactions              |
-| `GET /api/session/<id>/context/<seq>`         | Context X-Ray for one API call (buckets, segments, delta)                         |
-| `GET /api/session/<id>/timeline`              | Per-call context composition timeline (precomputed at index time)                 |
-| `GET /api/session/<id>/tools`                 | Dead-tool tax for one session (declared toolsets × invoked histogram)             |
-| `GET /api/usage`                              | Bucketed usage report (`granularity`/`breakdown`/`since`/`until`/`timezone`…)     |
-| `GET /api/analytics`                          | Fleet rollups (per-model TTFT percentiles, error rates, tools, trend…)            |
-| `GET /api/prompts` / `GET /api/prompt/<hash>` | Prompt registry list / full content + sessions (prefix hash ok)                   |
-| `GET /api/audit?mode=standard\|strict`        | Egress secret findings over all indexed source logs                               |
-| `GET /api/tooltax`                            | Fleet dead-tool tax (per-tool + per-session dead ≈tokens, cache-read priced)      |
-| `GET /api/events`                             | SSE stream; `change` events fire when the index db changes                        |
-| `GET /report?session=<id>`                    | The session's HTML wire report, or `404` if it isn't on disk                      |
+| Route | Returns |
+| --- | --- |
+| `GET /` | The self-contained dashboard page (inline CSS/JS) |
+| `GET /api/meta` | DB path, row counts, price source |
+| `GET /api/sessions` | Session list (`agent`/`model`/`project`/`tool`/`errored` filters, `sort`/`order`) |
+| `GET /api/search?q=…` | FTS5 search hits (`tool`/`agent`/`model`/`project`/`errored` filters) |
+| `GET /api/session/<id>` | One session: summary + transcript steps + per-request wire rows + compactions |
+| `GET /api/usage` | Bucketed usage report (`granularity`/`breakdown`/`since`/`until`/`timezone`…) |
+| `GET /api/analytics` | Fleet rollups (per-model TTFT percentiles, error rates, tools, trend…), scoped by the same `since`/`until`/`agent` as `/api/usage` |
+| `GET /api/prompts` / `GET /api/prompt/<hash>` | Prompt registry list / full content + sessions (prefix hash ok) |
+| `GET /api/audit?mode=standard\|strict` | Egress secret findings over all indexed source logs |
+| `GET /api/events` | SSE stream; `change` events fire when the index db changes |
+| `GET /report?session=<id>` | The session's HTML wire report, or `404` if it isn't on disk |
 
 ## Egress secret audit (`tracetap audit`)
 
