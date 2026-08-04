@@ -451,18 +451,63 @@
 
   // ------------------------------------------------------------- svg charts
   /** Vertical column chart. items: [{label, value, title?, warn?}] */
+  /**
+   * Charts are laid out at their host's MEASURED width, which is only knowable
+   * once the host is in the document — so a view registers a render function
+   * per host id and this measures, then calls it. Re-render, never rescale: an
+   * SVG stretched to fit its box shears its own text (see charts.js `svgOpen`).
+   *
+   * `TT.bind` delegates from the host, which survives replacing its innerHTML,
+   * so re-fitting never costs a tooltip binding.
+   */
+  var chartFits = {};
+
+  function fitChart(hostId) {
+    var host = document.getElementById(hostId);
+    var render = chartFits[hostId];
+    if (!host || !render) return;
+    var w = Math.floor(host.clientWidth);
+    // Guard both the un-laid-out case and the no-op case: a resize that does
+    // not change the host width must not rebuild the DOM under the cursor.
+    if (w <= 0 || host.getAttribute("data-fit-w") === String(w)) return;
+    host.setAttribute("data-fit-w", String(w));
+    host.innerHTML = render(w);
+  }
+
+  function registerChart(hostId, render) {
+    chartFits[hostId] = render;
+    fitChart(hostId);
+  }
+
+  var fitTimer = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(function () {
+      Object.keys(chartFits).forEach(fitChart);
+    }, 120);
+  });
+
   function columnChart(items, opts) {
     opts = opts || {};
     var H = opts.height || 120,
       PAD = 4,
       LABEL_H = opts.labels ? 16 : 0;
-    var W = Math.max(80, items.length * (opts.colWidth || 18));
+    // Columns grow into the space available, bounded on BOTH sides: below the
+    // floor they stop being readable, above the ceiling four daily buckets turn
+    // into four 500px slabs. The chart is then exactly `cw * items` wide and is
+    // rendered at that size — never stretched to reach it.
+    var MIN_COL = 6, MAX_COL = 96;
+    var natural = opts.colWidth || 18;
+    var cw = opts.width
+      ? Math.max(MIN_COL, Math.min(MAX_COL, Math.floor(opts.width / items.length)))
+      : natural;
+    if (cw < natural && !opts.width) cw = natural;
+    var W = Math.max(80, Math.round(items.length * cw));
     var max = 0;
     items.forEach(function (it) {
       if (it.value > max) max = it.value;
     });
     if (max <= 0) max = 1;
-    var cw = W / items.length;
     var bars = items.map(function (it, i) {
       var h = Math.max(
         it.value > 0 ? 2 : 0,
@@ -500,14 +545,13 @@
       }
       return rect + label;
     });
+    // No `preserveAspectRatio="none"`: with the height pinned and the width
+    // free, it stretched a 136-wide viewBox across 1942px and sheared the date
+    // labels 14× horizontally. Explicit px width/height, one-to-one with the
+    // viewBox, is the whole fix.
     return (
-      '<svg viewBox="0 0 ' +
-      W +
-      " " +
-      H +
-      '" preserveAspectRatio="none" height="' +
-      H +
-      '">' +
+      '<svg width="' + W + '" height="' + H +
+      '" viewBox="0 0 ' + W + " " + H + '">' +
       bars.join("") +
       "</svg>"
     );
@@ -3783,7 +3827,7 @@
     document.getElementById("an-calendar").innerHTML = a.trend.length
       ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost calendar &mdash; last 26 weeks &middot; ' +
         a.trend.length + " active days in scope</div>" +
-        '<div id="hm">' + TracetapCharts.calendarHeatmap(a.trend) + "</div></div>"
+        '<div id="hm"></div></div>'
       : '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Cost calendar</div>' +
         '<div class="dim">No priced activity in scope.</div></div>';
 
@@ -3803,12 +3847,10 @@
     document.getElementById("an-viz").innerHTML = (tmItems.length || strips)
       ? '<div class="split">' +
         (tmItems.length
-          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.3</span>Spend by project</div><div id="tm">' +
-            TracetapCharts.treemap(tmItems, { width: 620, height: 200 }) + "</div></div>"
+          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.3</span>Spend by project</div><div id="tm"></div></div>'
           : "") +
         (strips
-          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.4</span>TTFT distribution by model &middot; box p25&ndash;p75 &middot; tick p50 &middot; amber p95</div><div id="ts">' +
-            strips + "</div></div>"
+          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.4</span>TTFT distribution by model &middot; box p25&ndash;p75 &middot; tick p50 &middot; amber p95</div><div id="ts"></div></div>'
           : "") +
         "</div>"
       : "";
@@ -3936,6 +3978,18 @@
       });
     });
 
+    // Registered AFTER the hosts are in the document, because the whole point
+    // is to measure them. Each closure keeps the data; only the width varies.
+    registerChart("hm", function (w) {
+      return TracetapCharts.calendarHeatmap(a.trend, { width: w });
+    });
+    registerChart("tm", function (w) {
+      return TracetapCharts.treemap(tmItems, { width: w, height: 260 });
+    });
+    registerChart("ts", function (w) {
+      return TracetapCharts.ttftStrips(a.perModel, { width: w });
+    });
+
     var hm = document.getElementById("hm");
     if (hm) {
       TT.bind(hm, ".hm-cell", function (cell) {
@@ -3997,7 +4051,7 @@
     var chart = report.granularity !== "total" && items.length > 1
       ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.2</span>Cost per ' +
         ({ daily: "day", weekly: "week", monthly: "month" }[report.granularity] || report.granularity) + "</div>" +
-        columnChart(items, { height: 130, labels: true, colWidth: 34 }) + "</div>"
+        '<div id="an-fig2"></div></div>'
       : "";
 
     // The grouping column holds models when broken down and otherwise the
@@ -4039,6 +4093,11 @@
     host.innerHTML = chart +
       '<div class="tbl-wrap"><table><thead><tr>' + head + "</tr></thead><tbody>" +
       rowsHtml.join("") + "</tbody></table></div>" + note;
+    if (chart) {
+      registerChart("an-fig2", function (w) {
+        return columnChart(items, { height: 130, labels: true, colWidth: 34, width: w });
+      });
+    }
     renumberFigs();
   }
 

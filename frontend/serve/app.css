@@ -670,7 +670,18 @@ h2.sec small {
 }
 .chart-box svg {
   display: block;
-  width: 100%;
+  /* The chart is laid out at its host's measured width (see `fitChart`), so the
+     `width` attribute it emits is already the right answer. `width: 100%`
+     overrode that attribute and re-introduced exactly the scaling the layout
+     pass exists to avoid — it magnified the treemap 1.5× and, on the column
+     chart, sheared its date labels. `max-width` keeps the narrow-viewport
+     safety net without ever stretching. */
+  max-width: 100%;
+  height: auto;
+  /* A chart that is bounded below its host (few buckets, or a heatmap whose
+     week count is fixed) sits centred rather than pinned left, so the leftover
+     space reads as deliberate margin instead of a truncated figure. */
+  margin-inline: auto;
 }
 .chart-title {
   color: var(--dim);
