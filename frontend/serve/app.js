@@ -816,13 +816,37 @@
           });
         });
       }
+      // The LAST turn used to have no upper bound, so every hook that fired
+      // after the session's final API call piled onto it: on one session that
+      // was 155 of 211 hooks, and the "densest turn" insight was really
+      // reporting "the last turn is a bucket". Bound it by its own end instead;
+      // what falls outside is genuinely unattributed and is reported as such
+      // rather than assigned to whoever happens to be last.
+      var upper = next ? next.ts : reqSpanMs(r).to / 1000;
       (hooks || []).forEach(function (h) {
         if (h.ts < r.ts) return;
-        if (next && h.ts >= next.ts) return;
+        if (h.ts >= upper) return;
         evs.push({
           kind: "hook",
           label: (h.event || "hook") + " · " + (h.hookName || ""),
-          detail: JSON.stringify(h.stdoutPreview || {}, null, 2),
+          // What it SAW and what it DID, not just what it printed. A hook that
+          // blocks a tool call is the most consequential thing on a turn and
+          // `stdoutPreview` alone does not show the decision.
+          detail: JSON.stringify(
+            {
+              decision: h.decision,
+              outcome: h.outcome,
+              exitCode: h.exitCode,
+              stdin: h.stdinPreview,
+              stdout: h.stdoutPreview,
+              payload: h.payload,
+            },
+            null,
+            2,
+          ),
+          // Carried so the journey can render decision/outcome without
+          // re-deriving them out of the serialised blob.
+          hook: h,
           n: h.durationMs,
         });
       });
@@ -1241,6 +1265,27 @@
       );
     }
 
+    // Hooks that fired outside every turn's span. Previously these were silently
+    // swept onto the last turn; a hook we cannot place is a fact about the
+    // capture, and hiding it inside a turn makes that turn a lie.
+    var attributed = 0;
+    turns.forEach(function (t) {
+      t.events.forEach(function (e) {
+        if (e.kind === "hook") attributed++;
+      });
+    });
+    var totalHooks = (hooksForPane || []).length;
+    if (totalHooks && totalHooks - attributed > 0) {
+      var orphan = totalHooks - attributed;
+      push(
+        "hooks",
+        orphan + " of " + totalHooks + " hooks fired outside any call",
+        "before the first request or after the last — not attributable to a turn",
+        turns[turns.length - 1].seq,
+        "info",
+      );
+    }
+
     // Peak context, always — it is the ceiling the session ran against.
     var peak = turns.reduce(function (a, b) {
       return ctxOf(b.req) > ctxOf(a.req) ? b : a;
@@ -1538,12 +1583,31 @@
       return '<div class="jr-kv"><span>' + esc(k) + "</span><b>" + v + "</b></div>";
     }
 
-    var inText = stepText(t.prompt);
+    // What triggered THIS call. For every turn after the first tool call that
+    // is the previous turn's tool RESULTS — which is the loop the panel draws —
+    // and only at the start of a run is it a user prompt. Showing the nearest
+    // preceding user prompt unconditionally is why this panel looked frozen
+    // while scrubbing: one prompt is shared by a whole run of turns.
+    var prevTurn = idx > 0 ? turnsForPane[idx - 1] : null;
+    var fedBack = prevTurn && prevTurn.step
+      ? String(prevTurn.step.observation || "")
+      : "";
+    var inKind, inText;
+    if (fedBack.trim()) {
+      inKind = "tool results from turn " + prevTurn.seq;
+      inText = fedBack;
+    } else {
+      inKind = t.prompt ? "prompt · transcript step " + t.prompt.stepIndex : "";
+      inText = stepText(t.prompt);
+    }
     var inBody =
       kv("transcript", r.transcriptItems + " items") +
       kv("context", fmtTok(c)) +
+      (inKind ? '<div class="jr-src">' + esc(inKind) + "</div>" : "") +
       '<div class="jr-quote">' +
-      (inText ? esc(oneLine(inText, 700)) : '<span class="dim">no prompt text indexed for this turn</span>') +
+      (inText
+        ? esc(clip(inText, 4000))
+        : '<span class="dim">no input text indexed for this turn</span>') +
       "</div>";
 
     var hooks = t.events.filter(function (e) {
@@ -1561,9 +1625,11 @@
     var tools = t.events.filter(function (e) {
       return e.kind === "tool";
     });
+    var said = t.step ? stepText(t.step) : "";
     var outBody =
       kv("output", fmtTok(r.completionTokens) + " tokens") +
       kv("stop reason", esc(r.stopReason || "—")) +
+      kv("tool calls", tools.length) +
       (tools.length
         ? '<div class="jr-tools">' +
           tools
@@ -1572,7 +1638,15 @@
             })
             .join("") +
           "</div>"
-        : '<div class="jr-quote"><span class="dim">no tool calls — this turn answered in text</span></div>');
+        : "") +
+      (said
+        ? '<div class="jr-src">assistant text</div><div class="jr-quote">' +
+          esc(clip(said, 2000)) + "</div>"
+        : tools.length
+          ? ""
+          : '<div class="jr-quote"><span class="dim">no assistant text indexed — ' +
+            "extended thinking is returned encrypted and never reaches the wire" +
+            "</span></div>");
 
     return (
       '<div class="jr-nav">' +
@@ -1595,7 +1669,180 @@
       (tools.length
         ? "↳ these results become the next turn's input"
         : "↳ the conversation continues with the user's next message") +
+      "</div>" +
+      '<div class="jr-below">' +
+      journeyStepsHtml(t) +
+      journeyContextHtml(t, prevTurn) +
       "</div>"
+    );
+  }
+
+  /** Clip without collapsing whitespace — these panels want the line breaks. */
+  function clip(s, max) {
+    var t = String(s || "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+    return t.length <= max ? t : t.slice(0, max) + "\n… (" + fmtTok(t.length - max) + " more chars)";
+  }
+
+  /**
+   * The turn's steps: every tool call with its FULL arguments, and every hook
+   * that fired, with what it decided.
+   *
+   * The triad summarises; this is the record. A tool call whose argument is
+   * elided to 34 characters cannot answer "what did it actually run", and a
+   * hook shown as the number 3 cannot answer "what did they do" — which is the
+   * whole reason 211 of them are captured per session.
+   */
+  function journeyStepsHtml(t) {
+    var inputs = t.step ? String(t.step.toolInput || "").split("\n") : [];
+    var tools = t.events.filter(function (e) {
+      return e.kind === "tool";
+    });
+    var hooks = t.events.filter(function (e) {
+      return e.kind === "hook";
+    });
+
+    var toolHtml = tools.length
+      ? tools
+          .map(function (e, i) {
+            var arg = inputs[i] || e.detail || "";
+            var pretty = arg;
+            try {
+              pretty = JSON.stringify(JSON.parse(arg), null, 2);
+            } catch (_) {
+              /* not JSON — show it raw */
+            }
+            return (
+              '<details class="jr-step-row"' + (tools.length === 1 ? " open" : "") + ">" +
+              "<summary><span class=\"jr-badge tool\">tool</span>" +
+              '<span class="jr-step-name">' + esc(e.label) + "</span></summary>" +
+              '<pre class="jr-pre">' + esc(clip(pretty, 6000)) + "</pre>" +
+              "</details>"
+            );
+          })
+          .join("")
+      : "";
+
+    var obs = t.step ? String(t.step.observation || "") : "";
+    var obsHtml = obs.trim()
+      ? '<details class="jr-step-row"><summary><span class="jr-badge result">result</span>' +
+        '<span class="jr-step-name">tool output · ' + fmtTok(obs.length) +
+        " chars</span></summary>" +
+        '<pre class="jr-pre">' + esc(clip(obs, 6000)) + "</pre></details>"
+      : "";
+
+    var hookHtml = hooks
+      .map(function (e) {
+        var h = e.hook || null;
+        var meta = [];
+        if (h) {
+          if (h.decision) meta.push("decision " + h.decision);
+          if (h.outcome) meta.push(h.outcome);
+          if (h.exitCode != null) meta.push("exit " + h.exitCode);
+        }
+        if (e.n != null) meta.push(fmtDur(e.n));
+        return (
+          '<details class="jr-step-row"><summary>' +
+          '<span class="jr-badge hook">hook</span>' +
+          '<span class="jr-step-name">' + esc(e.label) + "</span>" +
+          '<span class="jr-step-meta">' + esc(meta.join(" · ")) + "</span></summary>" +
+          '<pre class="jr-pre">' + esc(clip(e.detail || "{}", 4000)) + "</pre></details>"
+        );
+      })
+      .join("");
+
+    var body = toolHtml + obsHtml + hookHtml;
+    return (
+      '<div class="jr-panel">' +
+      '<div class="jr-head">STEPS &mdash; ' + tools.length + " tool call" +
+      (tools.length === 1 ? "" : "s") + " · " + hooks.length + " hook" +
+      (hooks.length === 1 ? "" : "s") + "</div>" +
+      (body || '<div class="dim">This turn recorded no tool calls and no hooks.</div>') +
+      "</div>"
+    );
+  }
+
+  var BUCKET_ORDER = ["system", "tools", "skills", "user", "assistant", "tool_result"];
+
+  /**
+   * What the context is MADE OF at this turn, and what changed since the last.
+   *
+   * "Context: 206K" is a number you cannot act on. The composition is: 87K of
+   * it is tool schemas resent on every call, 16K is the user's own words. The
+   * delta column is the one that answers "what got added, and when" — scrub and
+   * the rows that move are the thing that grew.
+   *
+   * Sourced from the timeline endpoint's char-approximation, which is why the
+   * total will not equal the billed context exactly; that is stated rather than
+   * silently reconciled.
+   */
+  function journeyContextHtml(t, prevTurn) {
+    var pts = (timelineForPane && timelineForPane.points) || [];
+    function bucketsFor(seq) {
+      for (var i = 0; i < pts.length; i++) if (pts[i].seq === seq) return pts[i].buckets || null;
+      return null;
+    }
+    var cur = bucketsFor(t.seq);
+    if (!cur) {
+      return (
+        '<div class="jr-panel"><div class="jr-head">CONTEXT &mdash; composition</div>' +
+        '<div class="dim">Composition is derived by the context timeline, which has ' +
+        "not loaded for this session.</div></div>"
+      );
+    }
+    var prev = prevTurn ? bucketsFor(prevTurn.seq) : null;
+    // The session's opening composition, so the panel answers BOTH questions:
+    // "what changed on this turn" (Δ prev) and "what has this session
+    // accumulated since it started" (Δ start). The second is the one that
+    // explains a 200K context; the first is the one that says who did it.
+    var start = turnsForPane.length ? bucketsFor(turnsForPane[0].seq) : null;
+    var isFirst = !prevTurn;
+    var keys = BUCKET_ORDER.filter(function (k) {
+      return cur[k];
+    }).concat(
+      Object.keys(cur).filter(function (k) {
+        return BUCKET_ORDER.indexOf(k) < 0 && cur[k];
+      }),
+    );
+    var total = 0;
+    keys.forEach(function (k) {
+      total += cur[k];
+    });
+    function delta(d) {
+      if (d == null) return '<span class="jr-bk-d"></span>';
+      var cls = d > 0 ? " up" : d < 0 ? " down" : "";
+      return (
+        '<span class="jr-bk-d' + cls + '">' +
+        (d === 0 ? "·" : (d > 0 ? "+" : "−") + fmtTok(Math.abs(d))) +
+        "</span>"
+      );
+    }
+    var rows = keys
+      .map(function (k) {
+        var v = cur[k];
+        var pct = total ? (v / total) * 100 : 0;
+        return (
+          '<div class="jr-bk">' +
+          '<span class="jr-bk-name">' + esc(k) + "</span>" +
+          '<span class="jr-bk-bar"><i class="bk-' + esc(k) +
+          '" style="width:' + pct.toFixed(1) + '%"></i></span>' +
+          '<span class="jr-bk-n">' + fmtTok(v) + "</span>" +
+          delta(prev ? v - (prev[k] || 0) : null) +
+          delta(start && !isFirst ? v - (start[k] || 0) : null) +
+          "</div>"
+        );
+      })
+      .join("");
+    return (
+      '<div class="jr-panel">' +
+      '<div class="jr-head">CONTEXT &mdash; what it is made of</div>' +
+      '<div class="jr-bk jr-bk-head">' +
+      "<span></span><span></span><span>now</span>" +
+      "<span>" + (prevTurn ? "Δ turn " + prevTurn.seq : "Δ prev") + "</span>" +
+      "<span>" + (isFirst ? "start" : "Δ start") + "</span></div>" +
+      rows +
+      '<div class="jr-note dim">Approximated from transcript characters, so the ' +
+      "total (" + fmtTok(total) + ") will not match the billed context exactly." +
+      "</div></div>"
     );
   }
 

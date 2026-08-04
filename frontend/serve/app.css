@@ -2646,3 +2646,129 @@ button.xray-seg:focus-visible {
   .jr-triad { grid-template-columns: 1fr; gap: 10px; }
   .jr-arrow { transform: rotate(90deg); height: 20px; }
 }
+
+/* -- journey detail: the record under the summary ------------------------- */
+.jr-below {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr);
+  gap: var(--sp-5);
+  margin-top: var(--sp-5);
+}
+@media (max-width: 1300px) {
+  .jr-below { grid-template-columns: minmax(0, 1fr); }
+}
+.jr-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: var(--sp-4) var(--sp-5);
+  min-width: 0;
+}
+.jr-src {
+  margin-top: var(--sp-3);
+  font-family: var(--font-chrome);
+  font-size: var(--fs-100);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+/* Steps are collapsed by default because a turn can carry six of them and each
+   can be 6K of JSON; the summary line is the index, the body is the record. */
+.jr-step-row {
+  border-top: 1px solid var(--border);
+  padding: var(--sp-2) 0;
+}
+.jr-step-row:first-of-type { border-top: 0; }
+.jr-step-row > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  cursor: pointer;
+  list-style: none;
+  padding: var(--sp-1) 0;
+}
+.jr-step-row > summary::-webkit-details-marker { display: none; }
+.jr-step-row > summary::before {
+  content: "▸";
+  color: var(--dim);
+  flex: 0 0 auto;
+}
+.jr-step-row[open] > summary::before { content: "▾"; }
+.jr-badge {
+  flex: 0 0 auto;
+  font-family: var(--font-chrome);
+  font-size: var(--fs-100);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+}
+.jr-badge.tool { color: #5eead4; border-color: rgba(94, 234, 212, 0.4); }
+.jr-badge.result { color: var(--mid); }
+.jr-badge.hook { color: var(--amber); border-color: rgba(251, 191, 36, 0.4); }
+.jr-step-name {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--bright);
+}
+.jr-step-meta { flex: 0 0 auto; color: var(--dim); font-size: var(--fs-200); }
+.jr-pre {
+  margin: var(--sp-2) 0 var(--sp-3);
+  padding: var(--sp-3);
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.32);
+  color: var(--text);
+  font-size: var(--fs-200);
+  line-height: var(--lh-base);
+  max-height: 340px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Context composition. The delta column is the point — scrub, and the rows
+   that move are the thing that grew. */
+.jr-bk {
+  display: grid;
+  grid-template-columns: 12ch minmax(0, 1fr) 7ch 8ch 8ch;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: var(--row-compact);
+  font-size: var(--fs-200);
+}
+.jr-bk-name { color: var(--mid); }
+.jr-bk-head {
+  min-height: 0;
+  font-family: var(--font-chrome);
+  font-size: var(--fs-100);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+.jr-bk-head > span:nth-child(n + 3) { text-align: right; }
+.jr-bk-bar {
+  display: block;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.jr-bk-bar > i { display: block; height: 100%; background: var(--accent); }
+.bk-tools { background: var(--amber); }
+.bk-skills { background: var(--accent2); }
+.bk-user { background: #5eead4; }
+.bk-assistant { background: var(--accent); }
+.bk-tool_result { background: #5b6bb0; }
+.bk-system { background: var(--mid); }
+.jr-bk-n { text-align: right; color: var(--bright); }
+.jr-bk-d { text-align: right; color: var(--dim); }
+.jr-bk-d.up { color: var(--amber); }
+.jr-bk-d.down { color: var(--green); }
+.jr-note { margin-top: var(--sp-3); font-size: var(--fs-100); line-height: var(--lh-base); }
