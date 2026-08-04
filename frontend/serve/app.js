@@ -1338,6 +1338,33 @@
    * system-prompt group, so the card says so. It is suppressed on subagent-only
    * groups: a subagent's context is not what got compacted.
    */
+  /**
+   * One sentence about compactions, from whichever provenance is authoritative.
+   *
+   * The card and the X-Ray heading were computing this independently — the card
+   * from Claude Code's recorded `compact_boundary` entries, the heading from
+   * our wire-side detector — so a session with one recorded auto-compaction
+   * displayed "1 · 1 auto" and "0 compaction(s)" on the same screen. Two
+   * numbers on one screen both labelled "compaction" and disagreeing is a bug
+   * whether or not either is right.
+   *
+   * The recorded set wins where it exists, and says out loud that it is scoped
+   * to the whole Claude Code session rather than to these calls — that is WHY
+   * it can disagree with a per-call count, and hiding the reason would just
+   * move the confusion rather than remove it. `records: []` means UNKNOWN, not
+   * zero, so it falls through to the inferred count labelled as inferred.
+   */
+  function compactionPhrase(inferredCount, recorded) {
+    var recs = (recorded && recorded.records) || [];
+    if (!recs.length || (recorded && recorded.subagentOnly)) {
+      return inferredCount + " compaction(s) inferred here";
+    }
+    return (
+      recs.length + " compaction" + (recs.length === 1 ? "" : "s") +
+      " recorded session-wide (not attributable to a single call)"
+    );
+  }
+
   function compactionCard(inferred, recorded) {
     var recs = (recorded && recorded.records) || [];
     if (!recs.length || (recorded && recorded.subagentOnly)) {
@@ -2120,6 +2147,7 @@
             : ""),
       ) +
       compactionCard(compactionList, data.recordedCompactions);
+    recordedForPane = data.recordedCompactions || null;
 
     var pane = initialPane || "journey";
     function subnavBtn(name, label, count) {
@@ -3495,8 +3523,8 @@
       '<h2 class="sec">Context size timeline <small>' +
       tl.points.length +
       " calls · " +
-      tl.compactionCount +
-      " compaction(s) · peak " +
+      compactionPhrase(tl.compactionCount, recordedForPane) +
+      " · peak " +
       fmtTok(peak) +
       " context tokens</small>" +
       caveat +
@@ -3701,6 +3729,15 @@
   // by index instead of every row carrying its full text in a DOM attribute.
   var xrayForPane = null;
   var timelineForPane = null;
+  /**
+   * Claude Code's own `compact_boundary` records for this session.
+   *
+   * Held at module scope for the same reason `timelineForPane` is: the header
+   * card and the X-Ray timeline render from different call sites and were
+   * quoting different provenances, so one screen could read "1 · 1 auto" in the
+   * card and "0 compaction(s)" in the timeline heading at the same time.
+   */
+  var recordedForPane = null;
   var toolTaxForPane = null;
   var stepsForPane = [];
   var turnsForPane = [];
