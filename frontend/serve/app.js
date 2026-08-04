@@ -3392,31 +3392,6 @@
   }
 
   /**
-   * Sessions captured in the same trace log.
-   *
-   * One `.claude-trace` log is one proxied CLI process, so everything in it
-   * shares a terminal, a directory and a stretch of wall-clock time. A live
-   * capture put 24 sessions in a single log — a main thread and the fleet it
-   * spawned — which the session list rendered as 24 unrelated rows.
-   *
-   * Presented flat, not as a tree. Which session SPAWNED which needs per-agent
-   * identity the rows do not carry yet, and a tree would assert a parentage
-   * that has not been established.
-   */
-  /**
-   * The conversations inside ONE session.
-   *
-   * A session that spawns a fleet is not one conversation — the live capture
-   * behind this pane is 308 main-thread calls plus 430 subagent calls across
-   * 11 named agents, all under one session id. Grouping by agent is the only
-   * way the session view stops reading as one impossibly long thread.
-   *
-   * Unnamed subagents are kept as their own row rather than folded into the
-   * main thread or hidden: they were never spawned through the Agent tool
-   * (workflow-orchestrated agents are marked but have no parent record), so
-   * the honest presentation is "subagent, unnamed", not silence.
-   */
-  /**
    * The first genuinely user-authored step.
    *
    * Claude Code prepends `<system-reminder>` steps carrying CLAUDE.md, the
@@ -3435,6 +3410,28 @@
     return null;
   }
 
+  /**
+   * The conversations inside ONE session.
+   *
+   * TWO ids are in play and conflating them is the whole confusion. Claude
+   * Code's own session id is inherited by every agent it spawns: one live
+   * `x-claude-code-session-id` covers 512 main-thread calls plus 521 subagent
+   * calls across 26 named agents. A tracetap session is narrower — grouped by
+   * SYSTEM PROMPT — so that one Claude session arrives here as 23 tracetap
+   * sessions, and none of them mixes main-thread and subagent traffic
+   * (measured across an 86-session index: 32 all-subagent, 54 all-main, 0
+   * mixed).
+   *
+   * So what this pane separates is usually several AGENTS that shared one
+   * system prompt, not an agent from its parent. Grouping by name is the only
+   * thing that stops a six-critic fan-out reading as one impossibly long
+   * thread.
+   *
+   * Unnamed subagents are kept as their own row rather than folded into the
+   * main thread or hidden: they were never spawned through the Agent tool
+   * (workflow-orchestrated agents are marked but have no parent record), so
+   * the honest presentation is "subagent, unnamed", not silence.
+   */
   function renderConversations(reqs) {
     var groups = {};
     var order = [];
@@ -3504,6 +3501,19 @@
     );
   }
 
+  /**
+   * Sessions captured in the same trace log.
+   *
+   * One `.claude-trace` log is one proxied CLI process, so everything in it
+   * shares a terminal, a directory and a stretch of wall-clock time. A live
+   * capture put 24 sessions in a single log — a main thread and the fleet it
+   * spawned — which the session list rendered as 24 unrelated rows.
+   *
+   * Presented flat, not as a tree. Which session SPAWNED which needs a link
+   * these rows do not carry: the cast names each agent, but not which of these
+   * siblings hosted the parent that named it, and a tree would assert a
+   * parentage that has not been established.
+   */
   function renderRelatedPane(siblings, s) {
     if (!siblings.length) {
       return (
