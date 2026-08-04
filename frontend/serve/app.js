@@ -1823,8 +1823,20 @@
    */
   function journeyStepsHtml(t) {
     var inputs = t.step ? String(t.step.toolInput || "").split("\n") : [];
-    var tools = t.events.filter(function (e) {
-      return e.kind === "tool";
+    // Carry the ORIGINAL position with each event. `inputs` is indexed by
+    // position in the UNFILTERED tool list, so filtering the array without
+    // keeping the index would pair every surviving call with another call's
+    // arguments — wrong, and wrong in a way that reads as correct.
+    var allTools = [];
+    t.events.forEach(function (e, i) {
+      if (e.kind === "tool") allTools.push({ e: e, i: allTools.length });
+    });
+    var lane = journeyLaneFilter;
+    var laneKind = lane ? LANE_STEPS[lane] : null;
+    var tools = allTools.filter(function (x) {
+      if (!laneKind) return true;
+      if (laneKind === "skill") return /skill/i.test(x.e.label || "");
+      return true;
     });
     var hooks = t.events.filter(function (e) {
       return e.kind === "hook";
@@ -1832,8 +1844,9 @@
 
     var toolHtml = tools.length
       ? tools
-          .map(function (e, i) {
-            var arg = inputs[i] || e.detail || "";
+          .map(function (x) {
+            var e = x.e;
+            var arg = inputs[x.i] || e.detail || "";
             var pretty = arg;
             try {
               pretty = JSON.stringify(JSON.parse(arg), null, 2);
@@ -1883,14 +1896,29 @@
     return (
       '<div class="jr-panel">' +
       '<div class="jr-head">STEPS &mdash; ' + tools.length + " tool call" +
-      (tools.length === 1 ? "" : "s") + " · " + hooks.length + " hook" +
+      (tools.length === 1 ? "" : "s") +
+      (lane && tools.length !== allTools.length ? " of " + allTools.length : "") +
+      " · " + hooks.length + " hook" +
       (hooks.length === 1 ? "" : "s") + "</div>" +
+      (lane
+        ? '<div class="jr-filter"><span class="jr-filter-lab">filtered to</span>' +
+          '<button type="button" class="jr-filter-chip" data-lane-clear="1">' +
+          esc(lane) + ' <span aria-hidden="true">✕</span></button>' +
+          '<span class="dim">hooks stay listed — they are what triggered these calls</span>' +
+          "</div>"
+        : "") +
       (body || '<div class="dim">This turn recorded no tool calls and no hooks.</div>') +
       "</div>"
     );
   }
 
   var BUCKET_ORDER = ["system", "tools", "skills", "user", "assistant", "tool_result"];
+
+  // Which lanes are BACKED BY STEPS this pane can show. Only these are
+  // clickable; the rest render inert rather than fake-clickable, because a
+  // control that looks live and does nothing is worse than no control at all.
+  var LANE_STEPS = { tools: "tool", tool_result: "tool", skills: "skill" };
+  var journeyLaneFilter = null;
 
   /**
    * What the context is MADE OF at this turn, and what changed since the last.
@@ -1919,11 +1947,11 @@
       );
     }
     var prev = prevTurn ? bucketsFor(prevTurn.seq) : null;
-    // The session's opening composition, so the panel answers BOTH questions:
-    // "what changed on this turn" (Δ prev) and "what has this session
-    // accumulated since it started" (Δ start). The second is the one that
-    // explains a 200K context; the first is the one that says who did it.
-    var start = turnsForPane.length ? bucketsFor(turnsForPane[0].seq) : null;
+    // PRE / NET / POST is a TURN-LOCAL story on purpose. The timeline already
+    // carries the session-since-start view, and turn-local deltas keep meaning
+    // across a COMPACTION, where a since-start delta becomes nonsense: the
+    // context drops by 100K and every start-relative number inverts sign at
+    // once. Pre and post still read correctly through that.
     var isFirst = !prevTurn;
     var keys = BUCKET_ORDER.filter(function (k) {
       return cur[k];
@@ -1932,12 +1960,18 @@
         return BUCKET_ORDER.indexOf(k) < 0 && cur[k];
       }),
     );
-    var total = 0;
+    var totPost = 0;
+    var totPre = 0;
     keys.forEach(function (k) {
-      total += cur[k];
+      totPost += cur[k] || 0;
+      if (prev) totPre += prev[k] || 0;
     });
-    function delta(d) {
-      if (d == null) return '<span class="jr-bk-d"></span>';
+    // ONE denominator for both bars. Scaling each to its own total would make a
+    // lane that grew 5K look identical to one that shrank, because both would
+    // redraw to the same share of their own row.
+    var scale = Math.max(totPost, totPre) || 1;
+    function net(d) {
+      if (d == null) return '<span class="jr-bk-d">—</span>';
       var cls = d > 0 ? " up" : d < 0 ? " down" : "";
       return (
         '<span class="jr-bk-d' + cls + '">' +
@@ -1945,32 +1979,63 @@
         "</span>"
       );
     }
+    function barFor(k, pre, post) {
+      var prePct = (pre / scale) * 100;
+      var postPct = (post / scale) * 100;
+      return (
+        '<span class="jr-bk-bar">' +
+        '<i class="bk-pre" style="width:' + prePct.toFixed(1) + '%"></i>' +
+        '<i class="bk-' + esc(k) + '" style="width:' + postPct.toFixed(1) + '%"></i>' +
+        (pre ? '<u class="bk-tick" style="left:' + prePct.toFixed(1) + '%"></u>' : "") +
+        "</span>"
+      );
+    }
     var rows = keys
       .map(function (k) {
-        var v = cur[k];
-        var pct = total ? (v / total) * 100 : 0;
+        var post = cur[k] || 0;
+        var pre = prev ? prev[k] || 0 : 0;
+        var lane = LANE_STEPS[k];
+        var on = journeyLaneFilter === k;
         return (
-          '<div class="jr-bk">' +
+          "<button type=\"button\" class=\"jr-bk jr-bk-row" +
+          (lane ? " is-lane" : "") + (on ? " on" : "") + "\"" +
+          (lane ? ' data-lane="' + esc(k) + '"' : " disabled") +
+          (lane ? ' aria-pressed="' + (on ? "true" : "false") + '"' : "") +
+          (lane ? ' title="show only the ' + esc(k) + ' steps in this turn"' : "") +
+          ">" +
           '<span class="jr-bk-name">' + esc(k) + "</span>" +
-          '<span class="jr-bk-bar"><i class="bk-' + esc(k) +
-          '" style="width:' + pct.toFixed(1) + '%"></i></span>' +
-          '<span class="jr-bk-n">' + fmtTok(v) + "</span>" +
-          delta(prev ? v - (prev[k] || 0) : null) +
-          delta(start && !isFirst ? v - (start[k] || 0) : null) +
-          "</div>"
+          barFor(k, pre, post) +
+          '<span class="jr-bk-n pre">' + (prev ? fmtTok(pre) : "—") + "</span>" +
+          net(prev ? post - pre : null) +
+          '<span class="jr-bk-n">' + fmtTok(post) + "</span>" +
+          "</button>"
         );
       })
       .join("");
+    var totals =
+      '<div class="jr-bk jr-bk-total">' +
+      '<span class="jr-bk-name">total</span>' +
+      barFor("total", prev ? totPre : 0, totPost) +
+      '<span class="jr-bk-n pre">' + (prev ? fmtTok(totPre) : "—") + "</span>" +
+      net(prev ? totPost - totPre : null) +
+      '<span class="jr-bk-n">' + fmtTok(totPost) + "</span>" +
+      "</div>";
     return (
       '<div class="jr-panel">' +
       '<div class="jr-head">CONTEXT &mdash; what it is made of</div>' +
       '<div class="jr-bk jr-bk-head">' +
-      "<span></span><span></span><span>now</span>" +
-      "<span>" + (prevTurn ? "Δ turn " + prevTurn.seq : "Δ prev") + "</span>" +
-      "<span>" + (isFirst ? "start" : "Δ start") + "</span></div>" +
+      "<span></span><span></span>" +
+      "<span>" + (isFirst ? "pre" : "pre &middot; turn " + prevTurn.seq) + "</span>" +
+      "<span>net</span><span>post</span></div>" +
       rows +
-      '<div class="jr-note dim">Approximated from transcript characters, so the ' +
-      "total (" + fmtTok(total) + ") will not match the billed context exactly." +
+      totals +
+      '<div class="jr-note dim">' +
+      (isFirst
+        ? "This is the first turn in view, so there is no prior composition to compare against. "
+        : "Pre is the composition entering this turn, post is what left it. ") +
+      "Approximated from transcript characters, so the total (" +
+      fmtTok(totPost) +
+      ") will not match the billed context exactly." +
       "</div></div>"
     );
   }
@@ -3851,14 +3916,43 @@
     }
   }
 
-  /** Scrub by pointer: mousedown anywhere on the strip, then drag across it. */
+  /**
+   * Scrub by pointer: mousedown anywhere on the strip, then drag across it.
+   *
+   * Hit-tests on X ALONE, and that is the fix. The first version probed
+   * `elementFromPoint(clientX, strip.top + 8)` — a fixed y, 8px below the
+   * strip's top edge. But `.jr-strip` carries `padding: 10px 8px 0` with
+   * `align-items: flex-end`, so no column is ever painted above y=10: the probe
+   * always landed in the top padding, `elementFromPoint` returned the strip
+   * itself, and `.closest(".jr-col")` was null on EVERY press. 4b69dc6 added the
+   * padding and the probe in one commit, so the pointer path never worked once
+   * — the range input did, which is why it went unreported.
+   *
+   * A scrub surface has one axis. Every x maps to a turn, including an x above a
+   * short column (most of them are short) and an x in the gutter, which snaps to
+   * the nearest column instead of doing nothing.
+   */
   function journeyFromPoint(clientX) {
     var strip = document.getElementById("jr-strip");
     if (!strip) return;
-    var el = document.elementFromPoint(clientX, strip.getBoundingClientRect().top + 8);
-    var col = el && el.closest && el.closest(".jr-col");
-    if (!col) return;
-    var seq = +col.getAttribute("data-jr");
+    var cols = strip.querySelectorAll(".jr-col");
+    if (!cols.length) return;
+    var hit = null;
+    var bestGap = Infinity;
+    for (var c = 0; c < cols.length; c++) {
+      var r = cols[c].getBoundingClientRect();
+      if (clientX >= r.left && clientX <= r.right) {
+        hit = cols[c];
+        break;
+      }
+      var gap = clientX < r.left ? r.left - clientX : clientX - r.right;
+      if (gap < bestGap) {
+        bestGap = gap;
+        hit = cols[c];
+      }
+    }
+    if (!hit) return;
+    var seq = +hit.getAttribute("data-jr");
     for (var i = 0; i < turnsForPane.length; i++) {
       if (turnsForPane[i].seq === seq) {
         setJourney(i);
@@ -3889,6 +3983,21 @@
 
   document.addEventListener("click", function (e) {
     if (!e.target.closest) return;
+    // Lane -> steps filter. Toggling re-renders the detail through the same
+    // path a scrub takes, so there is one render and no second code path to
+    // drift.
+    var laneBtn = e.target.closest("[data-lane]");
+    if (laneBtn) {
+      var k = laneBtn.getAttribute("data-lane");
+      journeyLaneFilter = journeyLaneFilter === k ? null : k;
+      setJourney(journeyIdx);
+      return;
+    }
+    if (e.target.closest("[data-lane-clear]")) {
+      journeyLaneFilter = null;
+      setJourney(journeyIdx);
+      return;
+    }
     var step = e.target.closest("[data-jr-step]");
     if (step) {
       setJourney(journeyIdx + +step.getAttribute("data-jr-step"));
@@ -4189,8 +4298,28 @@
     var viewEl = document.getElementById("xray-view");
     var sel = document.getElementById("xray-seq");
     if (sel && String(sel.value) !== String(seq)) sel.value = String(seq);
-    if (status) status.textContent = "loading…";
-    if (viewEl) viewEl.innerHTML = skeleton({ rows: 4 });
+    if (status) status.textContent = "loading #" + seq + "…";
+    // Building one x-ray re-parses the request bodies of BOTH this call and its
+    // predecessor, which is ~2.5s on a 150K-token call. Replacing the table
+    // with a skeleton for that long reads as "the click did nothing, then the
+    // page reloaded". The previous numbers stay on screen, dimmed and inert,
+    // so the click has an immediate effect and the comparison you were reading
+    // is still there while its replacement is fetched. First load has nothing
+    // to keep, so that one still gets the skeleton.
+    if (viewEl) {
+      if (!viewEl.querySelector(".xray-stack")) viewEl.innerHTML = skeleton({ rows: 4 });
+      else viewEl.classList.add("is-stale");
+    }
+    // Mark the clicked bar immediately rather than waiting for the fetch — the
+    // feedback belongs at the point of the click.
+    var tl = document.getElementById("context-timeline");
+    if (tl) {
+      tl.querySelectorAll(".ct-bar.current").forEach(function (b) {
+        b.classList.remove("current");
+      });
+      var hit = tl.querySelector('[data-seq="' + seq + '"]');
+      if (hit) hit.classList.add("current");
+    }
     fetchJSON(
       "/api/session/" + encodeURIComponent(sessionId) + "/context/" + seq,
     )
@@ -4208,6 +4337,7 @@
         }
         xrayForPane = x;
         if (viewEl) {
+          viewEl.classList.remove("is-stale");
           viewEl.innerHTML = drawXray(x);
           viewEl
             .querySelectorAll(".btn-xray[data-seq]")
@@ -4287,51 +4417,113 @@
     applyBucketFilter(pane);
   });
 
+  /**
+   * One row per bucket, in a stable order, carrying BOTH sides of the turn.
+   *
+   * Merged on the bucket id rather than zipped by position: a bucket can exist
+   * on one side only — a compaction that empties TOOL RESULT to zero is a
+   * result, and a row that vanishes cannot show the −96K that produced it.
+   */
+  function mergeXrayBuckets(buckets, prevBuckets) {
+    var byId = {};
+    var order = [];
+    function slot(b) {
+      if (!byId[b.bucket]) {
+        byId[b.bucket] = { bucket: b.bucket, label: b.label, pre: 0, post: 0, segments: 0 };
+        order.push(b.bucket);
+      }
+      return byId[b.bucket];
+    }
+    (prevBuckets || []).forEach(function (b) {
+      slot(b).pre = b.approxTokens;
+    });
+    (buckets || []).forEach(function (b) {
+      var r = slot(b);
+      r.post = b.approxTokens;
+      r.segments = b.segments;
+    });
+    return order.map(function (k) {
+      return byId[k];
+    });
+  }
+
   function drawXray(x) {
     var total = 0;
     x.buckets.forEach(function (b) {
       total += b.approxTokens;
     });
+    var prevBuckets = x.delta ? x.delta.prevBuckets || [] : [];
+    var preTotal = prevBuckets.reduce(function (a, b) {
+      return a + b.approxTokens;
+    }, 0);
+    var rows = mergeXrayBuckets(x.buckets, prevBuckets);
+    var hasPre = prevBuckets.length > 0;
+    // Both sides share ONE scale — the larger total — or a 74.9K "pre" bar and a
+    // 185K "post" bar would be drawn the same length and the 2.5x jump this
+    // pane exists to show would be invisible.
+    var scale = Math.max(total, preTotal) || 1;
 
     // Bars are share of the WHOLE context, not of the largest bucket. Scaling to
     // the max made the biggest bucket 100% wide whether it was 90% or 30% of the
     // context, which is exactly the question this pane exists to answer.
+    function deltaCell(pre, post) {
+      var d = post - pre;
+      if (!hasPre) return '<span class="xray-row-d dim">—</span>';
+      if (d === 0) return '<span class="xray-row-d dim">·</span>';
+      return (
+        '<span class="xray-row-d ' + (d > 0 ? "up" : "down") + '">' +
+        (d > 0 ? "+" : "−") + fmtTok(Math.abs(d)) + "</span>"
+      );
+    }
+    function bucketRow(r, isTotal) {
+      var prePct = Math.max(r.pre > 0 ? 0.6 : 0, sharePct(r.pre, scale));
+      var postPct = Math.max(r.post > 0 ? 0.6 : 0, sharePct(r.post, scale));
+      var tag = isTotal ? "div" : "button";
+      return (
+        "<" + tag + (isTotal ? ' class="xray-row xray-total"' :
+          ' type="button" class="xray-row bucket-' + esc(r.bucket) +
+          '" data-bucket-filter="' + esc(r.bucket) + '" aria-pressed="false"') +
+        ' title="' + esc(r.label) + " · " + fmtTok(r.pre) + " → " + fmtTok(r.post) +
+        (isTotal ? "" : " approx tokens · " + r.segments +
+          " segment(s) · click to filter the segments below") + '">' +
+        '<span class="xray-row-label">' + esc(r.label) + "</span>" +
+        '<span class="xray-row-pre">' + (hasPre ? fmtTok(r.pre) : "—") + "</span>" +
+        deltaCell(r.pre, r.post) +
+        // Post drawn over pre in the SAME track, so the two are read as one
+        // length and its change rather than two rows to subtract by eye.
+        '<span class="xray-track">' +
+        (hasPre
+          ? '<span class="xray-fill pre" style="width:' + prePct.toFixed(2) + '%"></span>'
+          : "") +
+        '<span class="xray-fill" style="width:' + postPct.toFixed(2) + '%"></span>' +
+        "</span>" +
+        '<span class="xray-row-n">' + fmtTok(r.post) + "</span>" +
+        '<span class="xray-row-pct">' + fmtShare(sharePct(r.post, total)) + "</span>" +
+        "</" + tag + ">"
+      );
+    }
+
     var stack =
-      '<div class="xray-stack">' +
-      x.buckets
-        .map(function (b) {
-          var pct = sharePct(b.approxTokens, total);
-          return (
-            '<button type="button" class="xray-row bucket-' +
-            esc(b.bucket) +
-            '" data-bucket-filter="' +
-            esc(b.bucket) +
-            '" aria-pressed="false" title="' +
-            esc(b.label) +
-            " · " +
-            fmtTok(b.approxTokens) +
-            " approx tokens · " +
-            b.segments +
-            ' segment(s) · click to filter the segments below">' +
-            '<span class="xray-row-label">' +
-            esc(b.label) +
-            "</span>" +
-            '<span class="xray-track">' +
-            // Floor the fill so a sub-percent bucket is still a visible sliver
-            // rather than nothing at all.
-            '<span class="xray-fill" style="width:' +
-            Math.max(0.6, pct).toFixed(2) +
-            '%"></span></span>' +
-            '<span class="xray-row-n">' +
-            fmtTok(b.approxTokens) +
-            "</span>" +
-            '<span class="xray-row-pct">' +
-            fmtShare(pct) +
-            "</span></button>"
-          );
-        })
-        .join("") +
-      "</div>";
+      '<div class="xray-stack' + (hasPre ? " has-pre" : "") + '">' +
+      // The bar column's header is BLANK on purpose: right-aligned "net" sat
+      // flush against a left-aligned "pre → post" and the two read as one
+      // phrase, "NET PRE → POST". What the bars mean is said once below the
+      // table instead, where it does not have to survive being adjacent.
+      '<div class="xray-row xray-head" aria-hidden="true">' +
+      "<span></span><span>pre</span><span>net</span>" +
+      "<span></span><span>post</span><span>share</span>" +
+      "</div>" +
+      rows.map(function (r) { return bucketRow(r, false); }).join("") +
+      // Totals last, because the question they answer — "did this turn grow the
+      // window or shrink it" — is the sum of the rows above, not a preface.
+      bucketRow({ label: "total", pre: preTotal, post: total, segments: 0 }, true) +
+      "</div>" +
+      (hasPre
+        ? '<div class="dim xray-bar-legend">outline = entering this call · fill = leaving it' +
+          " · both on one scale, so a bar that grows past its outline grew the window" +
+          " · click a row to filter the segments below</div>"
+        : '<div class="dim xray-bar-legend">First call in view — nothing to compare against,' +
+          " so there is no pre side. Click a row to filter the segments below.</div>");
 
     var delta = "";
     if (x.delta) {

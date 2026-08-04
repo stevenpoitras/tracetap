@@ -1770,6 +1770,21 @@ h1 {
 .bucket-thinking    { --bkt: 167, 139, 250; }
 .bucket-tool_result { --bkt: 56, 189, 248; }
 
+/* The previous comparison, held on screen while its replacement is fetched.
+   Dimmed and inert so it reads as "being replaced" rather than as current. */
+.is-stale {
+  opacity: 0.42;
+  pointer-events: none;
+  transition: opacity 120ms ease-out;
+}
+/* The call the composition below is describing. The bar already had a
+   `.selected` state for the inspector; this is a separate question — which
+   call the TABLE is showing — and they are not always the same bar. */
+.ct-bar.current {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  z-index: 2;
+}
 .xray-stack {
   display: flex;
   flex-direction: column;
@@ -1777,17 +1792,53 @@ h1 {
   margin-bottom: 20px;
 }
 
-/* Label | proportional track | tokens | share. Fixed columns so every row's
-   bar starts at the same x and the numbers form real columns. */
+/* Label | pre | net | overlaid track | post | share. Fixed columns so every
+   row's bar starts at the same x and the numbers form real columns.
+   Reading order matches the arithmetic: what it was, what changed, what it
+   became — so the eye never has to subtract two columns to find the answer. */
 .xray-row {
   display: grid;
-  grid-template-columns: 13ch 1fr 8ch 7ch;
+  grid-template-columns: 13ch 8ch 8ch 1fr 8ch 7ch;
   align-items: center;
   gap: 10px;
   min-height: var(--row-compact);
   padding: 2px 4px;
   border-radius: 4px;
 }
+.xray-row-pre,
+.xray-row-d {
+  font-size: var(--fs-200);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.xray-row-pre { color: var(--dim); }
+/* Growth and shrink are the two answers this column exists to give, so they are
+   the only two things here that carry colour. */
+.xray-row-d.up { color: var(--amber); }
+.xray-row-d.down { color: var(--green); }
+.xray-head {
+  font-family: var(--font-chrome);
+  font-size: var(--fs-100);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  min-height: 0;
+  padding-bottom: 2px;
+}
+.xray-head span { text-align: right; }
+.xray-bar-legend {
+  font-size: var(--fs-100);
+  margin: 6px 0 20px;
+}
+/* The sum of the rows above it, and read as a sum: a rule above, not a colour. */
+.xray-total {
+  border-top: 1px solid var(--border-strong);
+  border-radius: 0;
+  margin-top: 4px;
+  padding-top: 6px;
+}
+.xray-total .xray-row-label { color: var(--dim); }
+.xray-total .xray-row-n { color: var(--bright); }
 .xray-row:hover {
   background: var(--surface);
 }
@@ -1813,6 +1864,23 @@ h1 {
   height: 100%;
   border-radius: 3px;
   background: linear-gradient(90deg, rgba(var(--bkt), 0.95), rgba(var(--bkt), 0.55));
+}
+/* PRE sits UNDER post in the same track, as an outline rather than a second
+   solid bar: overlaid, the pair reads as one length and its change. Which of
+   the two is longer is the whole message — growth leaves a filled bar running
+   past the outline, shrink leaves the outline sticking out past the fill. */
+.xray-track .xray-fill.pre {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: none;
+  border: 1px solid rgba(var(--bkt), 0.85);
+  border-radius: 3px;
+  z-index: 1;
+}
+.xray-track .xray-fill:not(.pre) {
+  position: relative;
+  z-index: 0;
+  opacity: 0.9;
 }
 .xray-row-n {
   font-size: var(--fs-200);
@@ -2849,13 +2917,94 @@ button.xray-seg:focus-visible {
 }
 .jr-bk-head > span:nth-child(n + 3) { text-align: right; }
 .jr-bk-bar {
+  position: relative;
   display: block;
   height: 8px;
   background: rgba(255, 255, 255, 0.06);
   border-radius: 4px;
   overflow: hidden;
 }
-.jr-bk-bar > i { display: block; height: 100%; background: var(--accent); }
+/* PRE and POST are LAYERED, not stacked: both start at the left edge on one
+   shared scale, so the eye reads the difference directly. Growth shows as the
+   lane colour running past the ghost; a shrink shows as ghost left uncovered,
+   which is the only way a removal is visible at all. */
+.jr-bk-bar > i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: var(--accent);
+}
+.jr-bk-bar > i.bk-pre { background: rgba(255, 255, 255, 0.17); z-index: 0; }
+.jr-bk-bar > i:not(.bk-pre) { z-index: 1; }
+/* The boundary PRE ended at — without it, a small change is a colour edge the
+   eye has nothing to measure against. */
+.jr-bk-bar > u.bk-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--bright);
+  opacity: 0.5;
+  z-index: 2;
+}
+
+/* A lane row is a button so it is keyboard-reachable, but the strip-of-rows
+   look must survive: reset every button default and re-assert the grid. */
+button.jr-bk {
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  -webkit-appearance: none;
+  appearance: none;
+}
+button.jr-bk[disabled] { cursor: default; opacity: 0.75; }
+button.jr-bk.is-lane { cursor: pointer; }
+button.jr-bk.is-lane:hover .jr-bk-name,
+button.jr-bk.is-lane:focus-visible .jr-bk-name { color: var(--bright); }
+/* The affordance has to be findable BEFORE the click, so the clickable lanes
+   carry a persistent mark rather than revealing one on hover. */
+button.jr-bk.is-lane .jr-bk-name::after {
+  content: " ▸";
+  color: var(--dim);
+  font-size: 0.85em;
+}
+button.jr-bk.is-lane.on .jr-bk-name::after { content: " ▾"; color: var(--bright); }
+button.jr-bk.is-lane.on .jr-bk-name { color: var(--bright); }
+button.jr-bk:focus-visible { outline: 1px solid var(--bright); outline-offset: 2px; }
+
+.jr-bk-total {
+  border-top: 1px solid var(--border);
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-2);
+}
+.jr-bk-total .jr-bk-name { color: var(--bright); text-transform: uppercase; font-size: var(--fs-100); letter-spacing: 0.06em; }
+.jr-bk-total .jr-bk-bar { opacity: 0.55; }
+
+/* Active filter: say what is on, and give it one obvious way off. */
+.jr-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-100);
+}
+.jr-filter-lab { color: var(--dim); text-transform: uppercase; letter-spacing: 0.06em; }
+.jr-filter-chip {
+  font: inherit;
+  cursor: pointer;
+  color: var(--bright);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.jr-filter-chip:hover { background: rgba(255, 255, 255, 0.14); }
 .bk-tools { background: var(--amber); }
 .bk-skills { background: var(--accent2); }
 .bk-user { background: #5eead4; }
@@ -2863,6 +3012,7 @@ button.xray-seg:focus-visible {
 .bk-tool_result { background: #5b6bb0; }
 .bk-system { background: var(--mid); }
 .jr-bk-n { text-align: right; color: var(--bright); }
+.jr-bk-n.pre { color: var(--mid); }
 .jr-bk-d { text-align: right; color: var(--dim); }
 .jr-bk-d.up { color: var(--amber); }
 .jr-bk-d.down { color: var(--green); }
