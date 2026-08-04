@@ -642,7 +642,7 @@
       renderSession(
         decodeURIComponent(m[1]),
         m[3] ? Number(m[3]) : null,
-        m[2] || "flow",
+        m[2] || "journey",
       );
     } else if ((m = h.match(/^prompt\/(.+)$/)))
       renderPrompt(decodeURIComponent(m[1]));
@@ -835,11 +835,16 @@
           n: c.from - c.to,
         });
       }
+      var prompt = r.agentStepIndex != null ? prevUser[r.agentStepIndex] : null;
       return {
         seq: r.seq,
         req: r,
         agent: r.isSubagent ? r.agentLabel || "subagent (unnamed)" : "main thread",
-        summary: turnSummary(st, r.agentStepIndex != null ? prevUser[r.agentStepIndex] : null),
+        summary: turnSummary(st, prompt),
+        // Kept whole (not just summarised) because the journey view shows the
+        // turn's anatomy: what came IN, what the model did, what went OUT.
+        step: st || null,
+        prompt: prompt || null,
         events: evs,
       };
     });
@@ -1088,6 +1093,169 @@
     );
   }
 
+  function ctxOf(r) {
+    return (r.promptTokens || 0) + (r.cacheRead || 0) + (r.cacheCreation || 0);
+  }
+
+  /**
+   * What is worth LOOKING at in this session.
+   *
+   * A 258-row spine is a haystack with no needle marked. These are the needles:
+   * each one names a specific turn, says what is unusual about it in the units
+   * that matter (tokens, seconds, dollars-by-proxy), and is clickable, so
+   * "something is wrong here" turns into "go look at turn 47".
+   *
+   * Deliberately a small fixed set of RULES rather than a model: every entry
+   * has to be defensible from the numbers on the row, because an insight you
+   * cannot check is worse than no insight.
+   */
+  function sessionInsights(turns) {
+    var out = [];
+    if (!turns.length) return out;
+
+    function push(kind, label, detail, seq, sev) {
+      out.push({ kind: kind, label: label, detail: detail, seq: seq, sev: sev || "info" });
+    }
+
+    // Compactions — the single most consequential thing that happens to a
+    // session, and the one you cannot see from any single row. Collapsed into
+    // ONE entry: a session with 13 of them emitted 13 near-identical chips and
+    // pushed every other kind of insight off the first row, which is the exact
+    // failure this strip exists to prevent.
+    var comps = [];
+    turns.forEach(function (t) {
+      t.events.forEach(function (e) {
+        if (e.kind === "compaction") comps.push({ t: t, e: e });
+      });
+    });
+    if (comps.length) {
+      var dropped = 0;
+      comps.forEach(function (c) {
+        dropped += c.e.n || 0;
+      });
+      push(
+        "compaction",
+        comps.length + (comps.length === 1 ? " compaction" : " compactions"),
+        dropped + " transcript items dropped · first at turn " + comps[0].t.seq +
+          (comps.length > 1 ? ", last at turn " + comps[comps.length - 1].t.seq : ""),
+        comps[0].t.seq,
+        "warn",
+      );
+    }
+
+    // Errors, which are cheap to miss in a wall of rows.
+    var errs = turns.filter(function (t) {
+      return t.req.errored;
+    });
+    if (errs.length) {
+      push(
+        "error",
+        errs.length + (errs.length === 1 ? " failed call" : " failed calls"),
+        "first at turn " + errs[0].seq +
+          (errs[0].req.status ? " · HTTP " + errs[0].req.status : " · no response"),
+        errs[0].seq,
+        "bad",
+      );
+    }
+
+    // Cache rebuilds. Cache WRITE bills 1.25x fresh input and cache READ ~0.1x,
+    // so a turn that re-writes most of its context costs roughly 12x the same
+    // context served from cache. This is the most expensive recurring mistake a
+    // session can make and it is invisible in a "context tokens" column.
+    var rebuilds = turns.filter(function (t) {
+      var c = ctxOf(t.req);
+      return c > 20000 && (t.req.cacheCreation || 0) / c > 0.5;
+    });
+    if (rebuilds.length) {
+      var wasted = 0;
+      rebuilds.forEach(function (t) {
+        wasted += t.req.cacheCreation || 0;
+      });
+      push(
+        "cache",
+        rebuilds.length + " cache rebuild" + (rebuilds.length === 1 ? "" : "s"),
+        fmtTok(wasted) + " tokens written at 1.25x instead of read at 0.1x · first at turn " +
+          rebuilds[0].seq,
+        rebuilds[0].seq,
+        "warn",
+      );
+    }
+
+    // Slowest call, but only when it is an OUTLIER — "the slowest of 145" is
+    // trivially true of some turn and is not information. 3x the median is.
+    var durs = turns
+      .map(function (t) {
+        return t.req.durationMs || 0;
+      })
+      .filter(function (d) {
+        return d > 0;
+      })
+      .sort(function (a, b) {
+        return a - b;
+      });
+    if (durs.length > 4) {
+      var med = durs[Math.floor(durs.length / 2)];
+      var slowest = turns.reduce(function (a, b) {
+        return (b.req.durationMs || 0) > (a.req.durationMs || 0) ? b : a;
+      });
+      if (med > 0 && (slowest.req.durationMs || 0) > med * 3) {
+        push(
+          "slow",
+          "Turn " + slowest.seq + " took " + fmtDur(slowest.req.durationMs),
+          Math.round((slowest.req.durationMs || 0) / med) + "x the median call (" +
+            fmtDur(med) + ")",
+          slowest.seq,
+          "warn",
+        );
+      }
+    }
+
+    // Largest single jump in context. Where a session got expensive, there is
+    // usually one turn where something big was pasted in.
+    var jump = null;
+    for (var i = 1; i < turns.length; i++) {
+      var d = ctxOf(turns[i].req) - ctxOf(turns[i - 1].req);
+      if (!jump || d > jump.d) jump = { d: d, t: turns[i] };
+    }
+    if (jump && jump.d > 20000) {
+      push(
+        "growth",
+        "Context jumped " + fmtTok(jump.d) + " at turn " + jump.t.seq,
+        "to " + fmtTok(ctxOf(jump.t.req)) + " · every later call pays for this",
+        jump.t.seq,
+        "warn",
+      );
+    }
+
+    // Busiest turn, as a place to look rather than as a problem.
+    var busiest = turns.reduce(function (a, b) {
+      return b.events.length > a.events.length ? b : a;
+    });
+    if (busiest.events.length >= 5) {
+      push(
+        "busy",
+        "Turn " + busiest.seq + " fired " + busiest.events.length + " events",
+        "the densest turn in the session",
+        busiest.seq,
+        "info",
+      );
+    }
+
+    // Peak context, always — it is the ceiling the session ran against.
+    var peak = turns.reduce(function (a, b) {
+      return ctxOf(b.req) > ctxOf(a.req) ? b : a;
+    });
+    push(
+      "peak",
+      "Peak context " + fmtTok(ctxOf(peak.req)) + " at turn " + peak.seq,
+      peak.req.model || "",
+      peak.seq,
+      "info",
+    );
+
+    return out;
+  }
+
   var CTX_STRIP_H = 54;
 
   /**
@@ -1237,6 +1405,170 @@
         })
         .join("") +
       "</span>"
+    );
+  }
+
+  /**
+   * The journey: one session as a scrubbable strip, one turn as an anatomy.
+   *
+   * The spine answers "what happened, in order". It does not answer "what
+   * SHAPE was this session" or "what actually happened inside turn 47", and
+   * scrolling a 258-row table answers neither. So the journey splits those two
+   * questions onto two axes:
+   *
+   *   ACROSS — a wide strip, one column per turn, left to right. Column height
+   *   is context size and its fill is the cache-read / cache-write / fresh
+   *   split, so the session's cost profile is a silhouette you read in one look
+   *   rather than a column you scan.
+   *
+   *   DOWN — the focused turn, opened up as what an LLM turn actually IS:
+   *   something came IN (a prompt, or the results of the last turn's tools),
+   *   the model did something with it, and something went OUT (text, or the
+   *   next tool calls, which become the next turn's input). The loop is drawn
+   *   because the loop is the point — output feeds the next turn's input.
+   */
+  var JOURNEY_H = 132;
+
+  function journeyHtml(turns) {
+    if (!turns.length) return '<div class="dim">No wire data for this session.</div>';
+    var maxCtx = 1;
+    turns.forEach(function (t) {
+      var c = ctxOf(t.req);
+      if (c > maxCtx) maxCtx = c;
+    });
+    var maxDur = 1;
+    turns.forEach(function (t) {
+      if ((t.req.durationMs || 0) > maxDur) maxDur = t.req.durationMs || 0;
+    });
+
+    var insights = sessionInsights(turns);
+    var flagged = {};
+    insights.forEach(function (n) {
+      if (n.sev !== "info") flagged[n.seq] = n.kind;
+    });
+
+    var cols = turns
+      .map(function (t) {
+        var r = t.req;
+        var c = ctxOf(r);
+        var h = Math.max(3, (c / maxCtx) * (JOURNEY_H - 22));
+        function seg(v, cls) {
+          return v ? '<i class="' + cls + '" style="height:' + ((v / c) * 100).toFixed(2) + '%"></i>' : "";
+        }
+        return (
+          '<button type="button" class="jr-col' +
+          (flagged[t.seq] ? " flag flag-" + flagged[t.seq] : "") +
+          (r.errored ? " err" : "") +
+          '" data-jr="' + t.seq + '" title="turn ' + t.seq + " · " +
+          esc(fmtTok(c)) + " ctx · " + esc(fmtDur(r.durationMs)) + '">' +
+          '<span class="jr-stack" style="height:' + h.toFixed(1) + 'px">' +
+          seg(r.cacheRead || 0, "seg-read") +
+          seg(r.cacheCreation || 0, "seg-write") +
+          seg(r.promptTokens || 0, "seg-fresh") +
+          "</span>" +
+          '<span class="jr-dur" style="height:' +
+          Math.max(1, ((r.durationMs || 0) / maxDur) * 12).toFixed(1) + 'px"></span>' +
+          "</button>"
+        );
+      })
+      .join("");
+
+    var chips = insights
+      .map(function (n) {
+        return (
+          '<button type="button" class="jr-insight sev-' + n.sev +
+          '" data-jr="' + n.seq + '">' +
+          '<span class="jr-i-label">' + esc(n.label) + "</span>" +
+          '<span class="jr-i-detail">' + esc(n.detail) + "</span>" +
+          "</button>"
+        );
+      })
+      .join("");
+
+    return (
+      '<h2 class="sec">Worth looking at <small>(' + insights.length +
+      " · click to jump)</small></h2>" +
+      '<div class="jr-insights">' + chips + "</div>" +
+      '<h2 class="sec">Journey <small>(' + turns.length +
+      " turns · drag or ←→ to scrub · height is context, fill is cache split)</small></h2>" +
+      '<div class="jr-strip" id="jr-strip" style="height:' + JOURNEY_H + 'px">' +
+      cols + "</div>" +
+      '<input class="jr-range" id="jr-range" type="range" min="0" max="' +
+      (turns.length - 1) + '" value="0" step="1" aria-label="Scrub turns">' +
+      '<div class="jr-detail" id="jr-detail"></div>'
+    );
+  }
+
+  /** The focused turn, opened up: what came in, what ran, what went out. */
+  function journeyDetailHtml(t, idx, total) {
+    var r = t.req;
+    var c = ctxOf(r);
+    function col(cls, head, body) {
+      return '<div class="jr-cell ' + cls + '"><div class="jr-head">' + head +
+        "</div>" + body + "</div>";
+    }
+    function kv(k, v) {
+      return '<div class="jr-kv"><span>' + esc(k) + "</span><b>" + v + "</b></div>";
+    }
+
+    var inText = stepText(t.prompt);
+    var inBody =
+      kv("transcript", r.transcriptItems + " items") +
+      kv("context", fmtTok(c)) +
+      '<div class="jr-quote">' +
+      (inText ? esc(oneLine(inText, 700)) : '<span class="dim">no prompt text indexed for this turn</span>') +
+      "</div>";
+
+    var hooks = t.events.filter(function (e) {
+      return e.kind === "hook";
+    });
+    var midBody =
+      kv("model", esc(r.model || "—")) +
+      kv("duration", esc(fmtDur(r.durationMs))) +
+      kv("first token", esc(r.ttftMs == null ? "—" : fmtDur(r.ttftMs))) +
+      kv("cache read", fmtTok(r.cacheRead) + ' <em class="seg-read-t">0.1x</em>') +
+      kv("cache write", fmtTok(r.cacheCreation) + ' <em class="seg-write-t">1.25x</em>') +
+      kv("fresh input", fmtTok(r.promptTokens) + ' <em class="seg-fresh-t">1x</em>') +
+      (hooks.length ? kv("hooks fired", hooks.length) : "");
+
+    var tools = t.events.filter(function (e) {
+      return e.kind === "tool";
+    });
+    var outBody =
+      kv("output", fmtTok(r.completionTokens) + " tokens") +
+      kv("stop reason", esc(r.stopReason || "—")) +
+      (tools.length
+        ? '<div class="jr-tools">' +
+          tools
+            .map(function (e) {
+              return '<div class="jr-tool">' + esc(e.label) + "</div>";
+            })
+            .join("") +
+          "</div>"
+        : '<div class="jr-quote"><span class="dim">no tool calls — this turn answered in text</span></div>');
+
+    return (
+      '<div class="jr-nav">' +
+      '<button type="button" class="jr-step" data-jr-step="-1" ' +
+      (idx <= 0 ? "disabled" : "") + ">← prev</button>" +
+      '<span class="jr-pos">turn <b>' + t.seq + "</b> · " + (idx + 1) + " of " + total +
+      (r.isSubagent ? ' · <span class="turn-agent sub">' + esc(t.agent) + "</span>" : "") +
+      "</span>" +
+      '<button type="button" class="jr-step" data-jr-step="1" ' +
+      (idx >= total - 1 ? "disabled" : "") + ">next →</button>" +
+      "</div>" +
+      '<div class="jr-triad">' +
+      col("jr-in", "IN &mdash; what triggered it", inBody) +
+      '<div class="jr-arrow">&rarr;</div>' +
+      col("jr-mid", "MODEL &mdash; what it cost", midBody) +
+      '<div class="jr-arrow">&rarr;</div>' +
+      col("jr-out", "OUT &mdash; what it produced", outBody) +
+      "</div>" +
+      '<div class="jr-loop">' +
+      (tools.length
+        ? "↳ these results become the next turn's input"
+        : "↳ the conversation continues with the user's next message") +
+      "</div>"
     );
   }
 
@@ -1673,12 +2005,12 @@
       }
       return;
     }
-    current = { name: "session", arg: id, pane: pane || "flow" };
+    current = { name: "session", arg: id, pane: pane || "journey" };
     setView(skeleton({ cards: 8, rows: 6 }));
     fetchJSON("/api/session/" + encodeURIComponent(id))
       .then(function (data) {
         if (current.name !== "session" || current.arg !== id) return;
-        drawSession(data, stepN, current.pane || "flow");
+        drawSession(data, stepN, current.pane || "journey");
       })
       .catch(fail);
   }
@@ -1789,7 +2121,7 @@
       ) +
       compactionCard(compactionList, data.recordedCompactions);
 
-    var pane = initialPane || "flow";
+    var pane = initialPane || "journey";
     function subnavBtn(name, label, count) {
       return (
         '<button type="button" class="subnav-btn' +
@@ -1843,6 +2175,7 @@
       "</div>" +
       sectionErrorBanner(data.sectionErrors) +
       '<nav class="session-subnav" id="session-subnav">' +
+      subnavBtn("journey", "Journey") +
       subnavBtn("flow", "Flow") +
       subnavBtn("hooks", "Hooks", signalHooks(hooks).length) +
       subnavBtn("xray", "Context X-Ray") +
@@ -1850,8 +2183,13 @@
       subnavBtn("wire", "Wire") +
       subnavBtn("related", "Related", siblings.length || null) +
       "</nav>" +
-      '<div class="session-body">' +
+      '<div class="session-body' + (pane === "journey" ? " no-inspector" : "") + '">' +
       '<div class="session-panes">' +
+      '<section class="session-pane' +
+      (pane === "journey" ? " active" : "") +
+      '" id="pane-journey">' +
+      journeyHtml(turnsForPane) +
+      "</section>" +
       '<section class="session-pane' +
       (pane === "flow" ? " active" : "") +
       '" id="pane-flow">' +
@@ -1922,6 +2260,9 @@
         return contextStripHtml(turnsForPane, stripT0, stripSpan, w);
       });
     }
+    // The journey opens on turn 0 rather than on an empty detail panel: the
+    // pane should show a worked example of what it is before you touch it.
+    setJourney(0);
     bindSessionInteractions(reqs, compactSeqs, steps);
     bindSessionPanes(s.sessionId, reqs);
     if (stepN != null) {
@@ -1990,6 +2331,8 @@
     // this call earlier, restoring pane B wrote B's row into A's cursor slot
     // and A could never be restored again.
     syncInspectorToPane(name);
+    var body = document.querySelector(".session-body");
+    if (body) body.classList.toggle("no-inspector", name === "journey");
     // A hidden pane measures 0 wide, so a chart registered while it was down
     // could never lay itself out. Re-fit on the way up; `fitChart` no-ops when
     // the width is unchanged, so this costs nothing on repeat visits.
@@ -3005,6 +3348,97 @@
 
   document.addEventListener("click", function (e) {
     if (e.target.closest && e.target.closest(".ribbon-clear")) setTurnRange(null);
+  });
+
+  // ------------------------------------------------------------- journey
+  /**
+   * Focus index into `turnsForPane`, NOT a seq. The strip, the range input and
+   * the arrow keys are three ways to move one cursor, so they all go through
+   * here — the class of bug where a slider and a keyboard disagree about where
+   * you are exists only when there are two cursors.
+   */
+  var journeyIdx = 0;
+
+  function setJourney(idx) {
+    var turns = turnsForPane;
+    if (!turns.length) return;
+    journeyIdx = Math.max(0, Math.min(turns.length - 1, idx));
+    var t = turns[journeyIdx];
+    var detail = document.getElementById("jr-detail");
+    if (detail) detail.innerHTML = journeyDetailHtml(t, journeyIdx, turns.length);
+    var range = document.getElementById("jr-range");
+    if (range && +range.value !== journeyIdx) range.value = String(journeyIdx);
+    var strip = document.getElementById("jr-strip");
+    if (!strip) return;
+    strip.querySelectorAll(".jr-col.on").forEach(function (c) {
+      c.classList.remove("on");
+    });
+    var col = strip.querySelector('.jr-col[data-jr="' + t.seq + '"]');
+    if (!col) return;
+    col.classList.add("on");
+    // Keep the focused column in view when scrubbing by keyboard past the edge,
+    // but never yank the strip while the pointer is dragging it.
+    var sb = strip.getBoundingClientRect();
+    var cb = col.getBoundingClientRect();
+    if (cb.left < sb.left + 8 || cb.right > sb.right - 8) {
+      strip.scrollLeft += cb.left - sb.left - sb.width / 2;
+    }
+  }
+
+  /** Scrub by pointer: mousedown anywhere on the strip, then drag across it. */
+  function journeyFromPoint(clientX) {
+    var strip = document.getElementById("jr-strip");
+    if (!strip) return;
+    var el = document.elementFromPoint(clientX, strip.getBoundingClientRect().top + 8);
+    var col = el && el.closest && el.closest(".jr-col");
+    if (!col) return;
+    var seq = +col.getAttribute("data-jr");
+    for (var i = 0; i < turnsForPane.length; i++) {
+      if (turnsForPane[i].seq === seq) {
+        setJourney(i);
+        return;
+      }
+    }
+  }
+
+  document.addEventListener("mousedown", function (e) {
+    var strip = e.target.closest && e.target.closest("#jr-strip");
+    if (!strip) return;
+    e.preventDefault();
+    journeyFromPoint(e.clientX);
+    function onMove(ev) {
+      journeyFromPoint(ev.clientX);
+    }
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+
+  document.addEventListener("input", function (e) {
+    if (e.target && e.target.id === "jr-range") setJourney(+e.target.value);
+  });
+
+  document.addEventListener("click", function (e) {
+    if (!e.target.closest) return;
+    var step = e.target.closest("[data-jr-step]");
+    if (step) {
+      setJourney(journeyIdx + +step.getAttribute("data-jr-step"));
+      return;
+    }
+    // An insight chip is a jump, so it also has to SWITCH panes when clicked
+    // from anywhere else — the whole point is that it takes you to the turn.
+    var chip = e.target.closest(".jr-insight");
+    if (!chip) return;
+    var seq = +chip.getAttribute("data-jr");
+    for (var i = 0; i < turnsForPane.length; i++) {
+      if (turnsForPane[i].seq === seq) {
+        setJourney(i);
+        break;
+      }
+    }
   });
 
   // Escape clearing the window is a rung on the existing unwind ladder, not a
@@ -5006,7 +5440,7 @@
   // A turn stays selected as you cross panes, so "what did the context look
   // like on this call" and "what did the wire do on this call" are one
   // keystroke apart instead of a click, a scroll and a hunt.
-  var SESSION_PANES = ["flow", "hooks", "xray", "tools", "wire", "related"];
+  var SESSION_PANES = ["journey", "flow", "hooks", "xray", "tools", "wire", "related"];
   var selectedSeq = null;
   // Where you were in each pane. Returning a pane to its first row every time
   // makes LEFT/RIGHT feel like it discards your place, which defeats the point
@@ -5067,6 +5501,15 @@
     if (!vertical && !horizontal) return false;
 
     if (horizontal) {
+      // On the journey, LEFT/RIGHT scrubs. It is the pane's ONLY axis, so
+      // taking the arrows here costs nothing and reading a session by holding
+      // → is the interaction the view exists for. The pane switch keeps its
+      // other spelling (the subnav) and every other pane is unaffected.
+      if (current.pane === "journey" && turnsForPane.length) {
+        e.preventDefault();
+        setJourney(journeyIdx + (k === "ArrowRight" ? 1 : -1));
+        return true;
+      }
       // On a turn row, LEFT/RIGHT means expand/collapse rather than change
       // pane — drilling into the thing you have selected is the nearer
       // meaning, and the pane switch is still there once it is collapsed.
@@ -5078,7 +5521,7 @@
           return true;
         }
       }
-      var cur = SESSION_PANES.indexOf(current.pane || "flow");
+      var cur = SESSION_PANES.indexOf(current.pane || "journey");
       if (cur < 0) cur = 0;
       var step = k === "ArrowRight" ? 1 : SESSION_PANES.length - 1;
       e.preventDefault();

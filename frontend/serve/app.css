@@ -1286,6 +1286,14 @@ h2.sec small {
   gap: 14px;
   align-items: start;
 }
+/* The journey has no rows to inspect — its detail panel IS the inspector, and
+   it is laid out in three columns that want the width. Reserving 400px for a
+   panel that can only ever say "select a row" is 20% of the viewport spent on
+   an instruction that does not apply. */
+.session-body.no-inspector {
+  grid-template-columns: minmax(0, 1fr);
+}
+.session-body.no-inspector .inspector { display: none; }
 .inspector {
   position: sticky;
   top: 64px;
@@ -2339,4 +2347,200 @@ button.xray-seg:focus-visible {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   font-size: 11px;
+}
+
+/* ---------------------------------------------------------------- journey
+   Two axes for two questions. ACROSS the strip is the session's shape; DOWN
+   into the triad is one turn's anatomy. Nothing here introduces a new colour:
+   the three cache hues are the same ones the spine rows use, so a silhouette
+   up here and a bar down there mean the same thing. */
+.jr-insights {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.jr-insight {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-start;
+  text-align: left;
+  font: inherit;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-left-width: 3px;
+  cursor: pointer;
+}
+.jr-insight:hover { background: var(--surface-2, rgba(255, 255, 255, 0.04)); }
+.jr-insight.sev-bad { border-left-color: var(--red, #f87171); }
+.jr-insight.sev-warn { border-left-color: var(--amber, #f0b429); }
+.jr-insight.sev-info { border-left-color: var(--accent, #7f8fff); }
+.jr-i-label { color: var(--bright); font-size: 13px; }
+.jr-i-detail { color: var(--dim); font-size: 11px; }
+
+.jr-strip {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  padding: 10px 8px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px 8px 0 0;
+  background: var(--surface);
+  overflow-x: auto;
+  overflow-y: hidden;
+  cursor: ew-resize;
+  user-select: none;
+}
+/* A column is a button so it is reachable by tab and by screen reader, but it
+   must not look or behave like one — the strip is a single scrub surface. */
+.jr-col {
+  flex: 1 0 6px;
+  min-width: 4px;
+  max-width: 26px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: stretch;
+  gap: 2px;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: inherit;
+  opacity: 0.72;
+}
+.jr-col:hover { opacity: 1; }
+.jr-col.on { opacity: 1; outline: 1px solid var(--bright); outline-offset: 1px; }
+.jr-stack {
+  display: flex;
+  flex-direction: column-reverse;
+  border-radius: 1px 1px 0 0;
+  overflow: hidden;
+}
+.jr-stack > i { display: block; width: 100%; }
+/* Duration as a foot under each column: a second dimension that cannot be
+   confused with the first, because it grows from the opposite edge. */
+.jr-dur { display: block; background: var(--mid); opacity: 0.5; }
+.jr-col.err .jr-stack { outline: 1px solid var(--red, #f87171); }
+.jr-col.flag .jr-dur { background: var(--amber, #f0b429); opacity: 1; }
+.jr-col.flag-error .jr-dur { background: var(--red, #f87171); }
+
+.jr-range {
+  display: block;
+  width: 100%;
+  margin: 0 0 18px;
+  accent-color: var(--accent, #7f8fff);
+  cursor: ew-resize;
+}
+
+.jr-nav {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+.jr-pos { color: var(--dim); font-size: 12px; }
+.jr-pos b { color: var(--bright); }
+.jr-step {
+  font: inherit;
+  font-size: 12px;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.jr-step:disabled { opacity: 0.3; cursor: default; }
+.jr-step:hover:not(:disabled) { border-color: var(--accent); }
+
+.jr-triad {
+  display: grid;
+  grid-template-columns: 1fr 22px minmax(240px, 0.7fr) 22px 1fr;
+  align-items: stretch;
+  gap: 0;
+}
+.jr-cell {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+  min-width: 0;
+}
+.jr-in { border-left: 3px solid var(--accent, #7f8fff); }
+.jr-mid { border-left: 3px solid var(--amber, #f0b429); }
+.jr-out { border-left: 3px solid #5eead4; }
+.jr-head {
+  font-family: var(--font-chrome);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--dim);
+  margin-bottom: 10px;
+}
+.jr-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim);
+  font-size: 15px;
+}
+.jr-kv {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.jr-kv span { color: var(--dim); }
+.jr-kv b { color: var(--bright); font-weight: 400; }
+.jr-kv em {
+  font-style: normal;
+  font-size: 10px;
+  margin-left: 6px;
+  opacity: 0.85;
+}
+/* The billing multipliers are the reason the three-way split is worth showing
+   at all, so they are labelled in the colour of the band they belong to. */
+.seg-read-t { color: #7f8fff; }
+.seg-write-t { color: var(--amber, #f0b429); }
+.seg-fresh-t { color: #5eead4; }
+.jr-quote {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.28);
+  color: var(--mid);
+  font-size: 12px;
+  line-height: 1.55;
+  max-height: 190px;
+  overflow-y: auto;
+}
+.jr-tools {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.jr-tool {
+  font-size: 12px;
+  color: var(--bright);
+  background: rgba(94, 234, 212, 0.08);
+  border-left: 2px solid #5eead4;
+  border-radius: 0 4px 4px 0;
+  padding: 4px 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.jr-loop {
+  margin-top: 12px;
+  color: var(--dim);
+  font-size: 11px;
+}
+@media (max-width: 1100px) {
+  .jr-triad { grid-template-columns: 1fr; gap: 10px; }
+  .jr-arrow { transform: rotate(90deg); height: 20px; }
 }
