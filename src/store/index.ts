@@ -127,7 +127,12 @@ export interface IndexResult {
 }
 
 export interface SessionListFilters {
-  /** Substring (case-insensitive) the session agent name must contain. */
+  /** Exactly this session id. Used by {@link Store.getSession}. */
+  sessionId?: string;
+  /**
+   * Substring (case-insensitive) matched against the harness family ("claude")
+   * OR the name/type of any subagent that ran in the session.
+   */
   agent?: string;
   /** Substring (case-insensitive) the session model id must contain. */
   model?: string;
@@ -151,6 +156,23 @@ export interface SessionListFilters {
   order?: "asc" | "desc";
   /** Max rows to return (default: unbounded). */
   limit?: number;
+}
+
+/**
+ * One named subagent that ran inside a session, with how much of it it was.
+ *
+ * The name is the `description` the parent passed to the `Agent`/`Task` tool
+ * ("Survey open PRs"), recovered by {@link identifyRequest}. It is the only
+ * human-authored name any agent in a capture ever has: `sessions.agent` is the
+ * harness family ("claude") and is constant across a whole install.
+ */
+export interface AgentCastEntry {
+  /** The parent's label for this agent, e.g. "Critique PR 366". */
+  label: string;
+  /** The registered agent type, e.g. "general-purpose", "Explore". */
+  type: string | null;
+  /** API calls this agent made. */
+  calls: number;
 }
 
 export interface SessionSummary {
@@ -181,6 +203,26 @@ export interface SessionSummary {
    * a missing value; see {@link sessionTitle}.
    */
   title: string;
+  /**
+   * The named subagents whose traffic is in this session, busiest first.
+   *
+   * Sessions are grouped by system prompt, and a subagent's differs from its
+   * parent's, so a fan-out does NOT appear inside the parent's row: it lands in
+   * its own session, and every agent that shared one system prompt lands
+   * together. Measured on an 86-session index: 32 sessions are entirely
+   * subagent traffic, 54 are entirely main thread, and none are mixed — one of
+   * those 32 holds six differently-named agents across 100 calls, which is
+   * exactly the case a single `agent` column of "claude" cannot describe.
+   */
+  agentCast: AgentCastEntry[];
+  /**
+   * Subagent calls marked by the billing header but never joined to a spawn.
+   *
+   * Reported separately rather than folded into the cast: an agent started by a
+   * workflow has no `Agent` tool_use to take a name from, and counting it as
+   * nameless is honest where inventing a name would not be.
+   */
+  unnamedAgentCalls: number;
 }
 
 /**
@@ -1233,12 +1275,70 @@ export class Store {
     return out;
   }
 
+  /**
+   * The named subagents in each of `sessionIds`, plus its unnamed-call count.
+   *
+   * One query for the whole page rather than one per row: a fan-out session
+   * holds hundreds of subagent calls and the list renders 86 rows.
+   *
+   * Grouped in SQL, not in JS, because the interesting number is calls per
+   * AGENT and a session can run the same agent type a dozen times over — the
+   * label is what separates them, which is exactly what `GROUP BY` is for.
+   */
+  private agentCastFor(
+    sessionIds: string[],
+  ): Map<string, { cast: AgentCastEntry[]; unnamed: number }> {
+    const out = new Map<string, { cast: AgentCastEntry[]; unnamed: number }>();
+    if (!sessionIds.length) return out;
+    const placeholders = sessionIds.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT session_id AS sessionId, agent_label AS label, agent_type AS type,
+                COUNT(*) AS calls
+           FROM requests
+          WHERE session_id IN (${placeholders}) AND is_subagent = 1
+          GROUP BY session_id, agent_label, agent_type
+          ORDER BY calls DESC`,
+      )
+      .all(...sessionIds) as any[];
+    for (const r of rows) {
+      const id = String(r.sessionId);
+      const entry = out.get(id) ?? { cast: [], unnamed: 0 };
+      const label = r.label == null ? "" : String(r.label).trim();
+      if (label) {
+        entry.cast.push({
+          label,
+          type: r.type == null ? null : String(r.type),
+          calls: Number(r.calls ?? 0),
+        });
+      } else {
+        entry.unnamed += Number(r.calls ?? 0);
+      }
+      out.set(id, entry);
+    }
+    return out;
+  }
+
   listSessions(filters: SessionListFilters = {}): SessionSummary[] {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
 
+    if (filters.sessionId) {
+      where.push("s.session_id = @sessionId");
+      params.sessionId = filters.sessionId;
+    }
     if (filters.agent) {
-      where.push("lower(s.agent) LIKE '%' || lower(@agent) || '%'");
+      // Matches the harness family OR a subagent's name. Family alone made this
+      // filter inert: `sessions.agent` is "claude" on every row of a Claude
+      // Code install, so the only agent text worth searching for — "Critique
+      // PR 366", "Explore" — could not be typed into the box that asks for it.
+      where.push(
+        `(lower(s.agent) LIKE '%' || lower(@agent) || '%'
+          OR EXISTS (SELECT 1 FROM requests r
+                      WHERE r.session_id = s.session_id
+                        AND (lower(COALESCE(r.agent_label, '')) LIKE '%' || lower(@agent) || '%'
+                             OR lower(COALESCE(r.agent_type, '')) LIKE '%' || lower(@agent) || '%')))`,
+      );
       params.agent = filters.agent;
     }
     if (filters.model) {
@@ -1318,7 +1418,9 @@ export class Store {
     `;
 
     const rows = this.db.prepare(sql).all(params) as any[];
-    const titles = this.titlesFor(rows.map((r) => String(r.sessionId)));
+    const ids = rows.map((r) => String(r.sessionId));
+    const titles = this.titlesFor(ids);
+    const casts = this.agentCastFor(ids);
     return rows.map((r): SessionSummary => {
       let toolHistogram: Record<string, number> = {};
       try {
@@ -1342,6 +1444,8 @@ export class Store {
         costUsd: r.costUsd == null ? null : Number(r.costUsd),
         toolHistogram,
         title: titles.get(String(r.sessionId)) ?? "",
+        agentCast: casts.get(String(r.sessionId))?.cast ?? [],
+        unnamedAgentCalls: casts.get(String(r.sessionId))?.unnamed ?? 0,
         sourcePath: String(r.sourcePath ?? ""),
         turns: Number(r.turns ?? 0),
         errorCount: Number(r.errorCount ?? 0),
@@ -1349,10 +1453,15 @@ export class Store {
     });
   }
 
-  /** Look up a single indexed session by id, or null when absent. */
+  /**
+   * Look up a single indexed session by id, or null when absent.
+   *
+   * Filtered in SQL rather than listing everything and finding the row: each
+   * summary now costs a title scan and a cast rollup, so the discarded 85 rows
+   * of an 86-session index were 85 wasted scans on every detail page load.
+   */
   getSession(sessionId: string): SessionSummary | null {
-    const rows = this.listSessions();
-    return rows.find((s) => s.sessionId === sessionId) ?? null;
+    return this.listSessions({ sessionId })[0] ?? null;
   }
 
   // -- transcript ------------------------------------------------------------

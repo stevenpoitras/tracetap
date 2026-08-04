@@ -278,6 +278,102 @@
     var a = esc(agent || "?");
     return '<span class="pill agent-' + a + '">' + a + "</span>";
   }
+
+  /**
+   * Every agent that ran inside a session, as one plain-text roster.
+   *
+   * Used for `title=` attributes, where markup is not an option and the whole
+   * cast has to fit one tooltip. Names are the parent's `description` for the
+   * spawn; unnamed calls are counted, never invented.
+   */
+  function castRoster(s) {
+    var cast = (s && s.agentCast) || [];
+    var lines = cast.map(function (a) {
+      return a.label + (a.type ? " (" + a.type + ")" : "") + " — " + a.calls + " calls";
+    });
+    if (s && s.unnamedAgentCalls) {
+      lines.push(s.unnamedAgentCalls + " calls by unnamed agents (spawned by a workflow)");
+    }
+    return lines.join("\n");
+  }
+
+  /**
+   * The cast, spelled out under the session header — one chip per named agent.
+   *
+   * Chips rather than a count, because the names ARE the information: "Critique
+   * PR 366" and "Research overnight loop mechanisms" tell you what the session
+   * delegated, which is the part a single number destroys. Capped at six so a
+   * 20-agent fan-out cannot push the stat cards off the first screen; the rest
+   * are reachable through the chip that says how many were dropped.
+   */
+  function castLineHtml(s) {
+    var cast = (s && s.agentCast) || [];
+    var unnamed = (s && s.unnamedAgentCalls) || 0;
+    if (!cast.length && !unnamed) return "";
+    var SHOWN = 6;
+    var chips = cast.slice(0, SHOWN).map(function (a) {
+      return (
+        '<button type="button" class="cast-chip" data-pane="related" title="' +
+        esc(a.label + (a.type ? " · " + a.type : "") + " — " + a.calls + " API calls") +
+        '">' +
+        esc(a.label) +
+        ' <small>' + a.calls + "</small></button>"
+      );
+    });
+    if (cast.length > SHOWN) {
+      chips.push(
+        '<button type="button" class="cast-chip more" data-pane="related" title="' +
+          esc(castRoster(s)) +
+          '">+' +
+          (cast.length - SHOWN) +
+          " more</button>",
+      );
+    }
+    if (unnamed) {
+      // Never merged into a named chip or into the main thread: these are real
+      // subagent calls whose spawn was never captured, and saying so beats both
+      // silence and a guess.
+      chips.push(
+        '<button type="button" class="cast-chip unnamed" data-pane="related" title="' +
+          esc(
+            unnamed +
+              " subagent calls carry the subagent billing marker but no Agent" +
+              " tool_use to take a name from — typically a workflow-orchestrated" +
+              " agent, whose spawn is never on the wire.",
+          ) +
+          '">unnamed <small>' +
+          unnamed +
+          "</small></button>",
+      );
+    }
+    return (
+      '<div class="cast-line"><span class="cast-lead">agents</span>' +
+      chips.join("") +
+      "</div>"
+    );
+  }
+
+  /**
+   * The session's cast as a cell: how many agents, named on hover.
+   *
+   * A count rather than the names themselves, because a fan-out runs a dozen
+   * and the column has to stay one line — the names are one hover away here and
+   * spelled out in full in the session header.
+   */
+  function castCell(s) {
+    var n = ((s && s.agentCast) || []).length;
+    var unnamed = (s && s.unnamedAgentCalls) || 0;
+    if (!n && !unnamed) return '<td class="num dim">—</td>';
+    return (
+      '<td class="num" title="' +
+      esc(castRoster(s)) +
+      '">' +
+      (n ? n : "") +
+      (n && unnamed ? ' <span class="dim">+?</span>' : "") +
+      (!n && unnamed ? '<span class="dim">?</span>' : "") +
+      "</td>"
+    );
+  }
   function debounce(fn, ms) {
     var t;
     return function () {
@@ -1989,6 +2085,7 @@
     { key: "started_at", label: "Started", sortable: true },
     { key: "duration_ms", label: "Duration", sortable: true, num: true },
     { key: "turns", label: "Turns", num: true },
+    { key: "agents", label: "Agents", num: true },
     { key: "total_in_tokens", label: "In", sortable: true, num: true },
     { key: "total_out_tokens", label: "Out", sortable: true, num: true },
     { key: "cache", label: "Cache hit", num: true },
@@ -2003,7 +2100,7 @@
       '<input id="q" type="search" placeholder="Full-text search every session (FTS5) — try an error message, a file name, a tool name…" value="' +
       esc(sess.q) +
       '" />' +
-      '<input id="f-agent" class="filter" type="text" placeholder="agent" value="' +
+      '<input id="f-agent" class="filter" type="text" placeholder="agent name or type" value="' +
       esc(sess.agent) +
       '" />' +
       '<input id="f-model" class="filter" type="text" placeholder="model" value="' +
@@ -2151,6 +2248,7 @@
           '<td class="num">' +
           (s.turns || 0) +
           "</td>" +
+          castCell(s) +
           '<td class="num">' +
           fmtTok(s.totalInTokens) +
           "</td>" +
@@ -2427,6 +2525,16 @@
       " · " +
       fmtTime(s.startedAt) +
       "</span>" +
+      // WHO ran, by name. The `claude` pill above is the harness family and is
+      // the same on every session ever captured; the names that actually differ
+      // are the ones each parent gave the agents it spawned, and they were
+      // reachable only in the Related pane, two clicks down.
+      //
+      // This matters most on the sessions that ARE a fan-out: grouping is by
+      // system prompt, so subagent traffic forms its own session, and one of
+      // them held six differently-named agents under a header that said
+      // "claude" and nothing else.
+      castLineHtml(s) +
       '<span class="actions">' +
       (data.reportAvailable
         ? '<a href="/report?session=' +
@@ -2620,15 +2728,20 @@
   }
 
   function bindSessionPanes(sessionId, reqs) {
-    var nav = document.getElementById("session-subnav");
-    if (nav) {
-      nav.addEventListener("click", function (e) {
+    // The subnav and the header's cast chips are two different containers that
+    // both switch panes, so the listener is bound to each rather than to the
+    // subnav alone — a chip outside #session-subnav would otherwise be inert.
+    ["session-subnav", "detail-head"].forEach(function (sel) {
+      var host =
+        document.getElementById(sel) || document.querySelector("." + sel);
+      if (!host) return;
+      host.addEventListener("click", function (e) {
         var a = e.target.closest("[data-pane]");
         if (!a) return;
         e.preventDefault();
         activatePane(a.getAttribute("data-pane"));
       });
-    }
+    });
     // One delegated listener for every inspectable row in every pane. Panes
     // re-render their own innerHTML freely (the hooks filter, the x-ray reload)
     // and delegation means none of them ever need re-binding — the class of bug
@@ -3377,10 +3490,12 @@
       " named agent" +
       (namedSubs === 1 ? "" : "s") +
       ")</small></h2>" +
-      '<div class="dim rel-note">One session id can hold a main thread and every ' +
-      "agent it spawned. Names come from the spawning Agent tool call; an agent " +
-      "started by a workflow rather than that tool has no parent record to join " +
-      'to and is shown as "unnamed" rather than merged into the main thread.</div>' +
+      '<div class="dim rel-note">Sessions are grouped by system prompt, so a ' +
+      "fan-out lands here rather than inside its parent: every agent that shared " +
+      "one prompt appears as its own conversation. Names come from the spawning " +
+      "Agent tool call; an agent started by a workflow rather than that tool has " +
+      'no parent record to join to and is shown as "unnamed" rather than merged ' +
+      "into the main thread.</div>" +
       '<div class="tbl-wrap"><table><thead><tr>' +
       "<th>conversation</th>" +
       '<th class="num">calls</th><th class="num">context read</th>' +
@@ -3404,9 +3519,14 @@
         return (
           '<tr class="click" data-goto="' +
           esc(x.sessionId) +
-          '"><td>' +
-          agentPill(x.agent) +
-          "</td><td>" +
+          // The agent pill read "CLAUDE" on all 36 rows — a column that cannot
+          // distinguish anything it lists. What separates siblings is the same
+          // thing that separates sessions anywhere else: what they were asked.
+          '"><td class="s-title"><span class="s-ask">' +
+          esc(x.title || "untitled session") +
+          "</span></td>" +
+          castCell(x) +
+          "<td>" +
           esc(x.model || "—") +
           "</td><td>" +
           fmtTime(x.startedAt) +
@@ -3435,7 +3555,7 @@
       "establishing which spawned which needs per-agent identity that is not " +
       "captured yet.</div>" +
       '<div class="tbl-wrap"><table><thead><tr>' +
-      "<th>agent</th><th>model</th><th>started</th>" +
+      '<th>session</th><th class="num">agents</th><th>model</th><th>started</th>' +
       '<th class="num">duration</th><th class="num">turns</th><th class="num">cost</th>' +
       "</tr></thead><tbody>" +
       rows +

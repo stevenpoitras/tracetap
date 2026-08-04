@@ -890,6 +890,61 @@ h1 {
 .detail-head .actions {
   margin-left: auto;
   font-size: var(--fs-200);
+  order: 2;
+}
+
+/* -- the cast ----------------------------------------------------------- */
+/* One session id covers the main thread and every agent it spawned, so the
+   header names them. `flex-basis: 100%` (with the actions ordered ahead of it)
+   gives the roster its own row instead of squeezing it between the model and
+   the report links. */
+.cast-line {
+  order: 3;
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.cast-lead {
+  font-family: var(--font-chrome);
+  font-size: var(--fs-100);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.cast-chip {
+  font: inherit;
+  font-size: var(--fs-200);
+  line-height: var(--lh-tight);
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px var(--sp-2) 3px;
+  max-width: 32ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.cast-chip:hover,
+.cast-chip:focus-visible {
+  border-color: var(--border-strong);
+  color: var(--bright);
+}
+.cast-chip small {
+  color: var(--dim);
+  font-size: var(--fs-100);
+  margin-left: 2px;
+}
+/* Unnamed agents are real calls with no recoverable name, so they read as a
+   gap rather than as another cast member. */
+.cast-chip.unnamed,
+.cast-chip.more {
+  color: var(--dim);
+  border-style: dashed;
 }
 
 

@@ -74,6 +74,73 @@ test("collapses newlines so a title can never grow a second line", () => {
   assert.equal(sessionTitle(["fix\n\n  the   \n bug"]), "fix the bug");
 });
 
+test("harness envelopes measured on the live index are skipped", () => {
+  // Each of these titled real sessions before it was listed: the caveat wrapper
+  // 5 of 86, the background-task notification 3, the post-compaction tool echo
+  // 2. All three announce in their own text that they are not the user talking.
+  assert.equal(isNoiseStep("<local-command-caveat>Caveat: The messages below…"), true);
+  assert.equal(isNoiseStep("[SYSTEM NOTIFICATION - NOT USER INPUT]\nautomated event"), true);
+  assert.equal(
+    isNoiseStep('Called the Read tool with the following input: {"file_path":"/a/b.ts"}'),
+    true,
+  );
+  assert.equal(isNoiseStep("Result of calling the Bash tool: ok"), true);
+  // Twin: the tool-echo frame is matched whole, so ordinary prose that starts
+  // with the same word survives.
+  assert.equal(isNoiseStep("Called the shots on the release plan"), false);
+  assert.equal(
+    sessionTitle([
+      "<local-command-caveat>Caveat: The messages below…",
+      "[SYSTEM NOTIFICATION - NOT USER INPUT]\nautomated event",
+      'Called the Read tool with the following input: {"file_path":"/a/b.ts"}',
+      "Survey the design corpus and propose a consolidation",
+    ]),
+    "Survey the design corpus and propose a consolidation",
+  );
+});
+
+test("a <session> wrapper is OPENED, because its contents are the ask", () => {
+  // Claude Code's own title-generation call hands the model the conversation it
+  // is naming, wrapped, followed by instructions. The wrapper is scaffolding;
+  // what it holds is the only real ask in that session.
+  assert.equal(
+    sessionTitle([
+      "<session>\nfor the context storage via MCP, what resources would you expose?\n</session>\n\n" +
+        "Write the title in the predominant language of the session.",
+    ]),
+    "for the context storage via MCP, what resources would you expose?",
+  );
+  // The same shape ships under a second tag name.
+  assert.equal(
+    sessionTitle(["<conversation>\n# Fix the Wire pane renderers\n</conversation>\nSummarise."]),
+    "# Fix the Wire pane renderers",
+  );
+  // Twin: an UNCLOSED tag is not a wrapper, so nothing is silently unwrapped.
+  assert.equal(sessionTitle(["<session>\nhalf a wrapper"]), "<session> half a wrapper");
+});
+
+test("a concatenated transcript dump is not an ask", () => {
+  // Auxiliary calls (permission checks, title generation) are handed the whole
+  // transcript as ONE user message — several envelopes joined, which is the tell
+  // that no single person typed it.
+  const dump = '{"Bash":"git status"} {"user":"<command-name>/model</command-name>"}';
+  assert.equal(isNoiseStep(dump), true);
+  // Twin: ONE well-formed envelope still yields its ask, so the rule keys on
+  // "does not parse", not on "starts with a brace".
+  assert.equal(isNoiseStep('{"user":"ship the release"}'), false);
+  assert.equal(sessionTitle([dump, '{"user":"ship the release"}']), "ship the release");
+});
+
+test("both halves of the transcript wrapper are skipped", () => {
+  assert.equal(isNoiseStep("</transcript>"), true);
+  assert.equal(isNoiseStep("Subagent has finished and is handing back control to the main agent."), true);
+  // Twin: the wrapper skips do not swallow the ask that follows them.
+  assert.equal(
+    sessionTitle(["<transcript>", "</transcript>", "rename the pane"]),
+    "rename the pane",
+  );
+});
+
 test("an injected rules/CLAUDE.md file is configuration, not an ask", () => {
   assert.equal(
     isNoiseStep("Contents of /Users/sp/git/x/.claude/rules/hooks.md: # Hooks — adopt"),
