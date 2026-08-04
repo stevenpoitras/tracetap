@@ -15,6 +15,21 @@
     '<div class="dim inspector-empty">Select a row to inspect its payload</div>';
 
   /**
+   * Re-measure every registered chart after the inspector rail appears or goes.
+   *
+   * The rail is a grid column, so opening it narrows its neighbour by ~400px in
+   * the same frame. Charts are laid out at the width they will occupy and are
+   * never scaled to reach it, which is exactly why they have to be told the
+   * width changed. Deferred one frame so the measurement reads the new layout
+   * rather than the one being replaced.
+   */
+  function reflowAfterRailToggle() {
+    requestAnimationFrame(function () {
+      if (typeof fitCharts === "function") fitCharts();
+    });
+  }
+
+  /**
    * The one detail surface, shared by every pane.
    *
    * A docked panel rather than a hover popover, and that is a correctness
@@ -52,8 +67,10 @@
       stack.length = 0;
       token += 1;
       if (el) {
+        var wasOpen = el.classList.contains("open");
         el.innerHTML = INSPECTOR_EMPTY;
         el.classList.remove("open");
+        if (wasOpen) reflowAfterRailToggle();
       }
       document
         .querySelectorAll("[data-inspect].selected")
@@ -137,7 +154,13 @@
         .join("");
 
       el.innerHTML = head + body + note + actions;
+      var wasOpen = el.classList.contains("open");
       el.classList.add("open");
+      // Opening the rail takes ~400px away from the pane beside it, and a chart
+      // laid out at the old width would be a chart drawn for a box that no
+      // longer exists. Only on the transition — re-rendering into an already
+      // open rail changes nothing about the width.
+      if (!wasOpen) reflowAfterRailToggle();
 
       el.querySelector(".inspector-close").addEventListener("click", clear);
       var backBtn = el.querySelector(".inspector-back");
@@ -1997,13 +2020,13 @@
     // not a rendering failure — some sessions (permission-hook fan-outs) record
     // one shared instruction and an empty placeholder for every response. Say
     // that in words once, rather than letting 257 repeat marks imply a bug.
-    var uniform =
-      turns.length > 3 && Object.keys(distinct).length <= 1
-        ? '<div class="ribbon-note dim">No per-call transcript content indexed for ' +
-          "this session — all " + turns.length +
-          " calls share one prompt and record no response text. Rows are still " +
-          "distinguished by context size, duration and events.</div>"
-        : "";
+    var isUniform = turns.length > 3 && Object.keys(distinct).length <= 1;
+    var uniform = isUniform
+      ? '<div class="ribbon-note dim">No per-call transcript content indexed for ' +
+        "this session — all " + turns.length +
+        " calls share one prompt and record no response text. Rows are still " +
+        "distinguished by context size, duration and events.</div>"
+      : "";
     var rows = turns
       .map(function (t) {
         var repeat = t.summary !== "" && t.summary === prevSummary;
@@ -2068,7 +2091,12 @@
       // rows were narrower by the scrollbar width while the header was not, and
       // since the shared grid is `ch`-and-fr the difference landed entirely on
       // the elastic column — 10px of drift by the right-hand numerics.
-      '<div class="turn-spine" id="turn-spine">' +
+      // When every row's summary is the same one, the "what" column holds a
+      // ditto mark 257 times in 938px — 62% of the spine spent saying "same as
+      // above". The note above already says it once in words, so the column is
+      // dropped and its width goes to the context bar, which is the thing that
+      // still differs row to row and gains resolution from every pixel.
+      '<div class="turn-spine' + (isUniform ? " spine-uniform" : "") + '" id="turn-spine">' +
       '<div class="turn-body">' +
       '<div class="turn-row turn-head" aria-hidden="true">' +
       "<span></span><span>#</span><span>what</span><span>context</span>" +

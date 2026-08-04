@@ -1418,6 +1418,18 @@ h1 {
   grid-template-columns: minmax(0, 1fr);
 }
 .session-body.no-inspector .inspector { display: none; }
+/* The same argument applies to a rail that is merely CLOSED. Until a row is
+   selected the panel can only say "select a row", and it was saying it in a
+   400px column on five panes — so a spine got 1516px of a 1990px window and
+   the x-ray charts were laid out 400px narrower than the space available.
+   The column appears when there is something in it; `fitCharts()` runs on the
+   same transition so anything measured re-measures. */
+.session-body:has(> .inspector:not(.open)) {
+  grid-template-columns: minmax(0, 1fr);
+}
+.session-body:has(> .inspector:not(.open)) .inspector {
+  display: none;
+}
 .inspector {
   position: sticky;
   top: 64px;
@@ -2227,7 +2239,12 @@ tr[data-inspect]:focus-visible {
 .turn[hidden] { display: none; }
 .turn-row {
   display: grid;
-  grid-template-columns: 2ch 5ch minmax(30ch, 3fr) minmax(14ch, 1fr) 8ch 7ch 6ch;
+  /* The "what" column is CAPPED, not given the larger elastic share. It holds
+     one line of prose, so past ~72ch more width buys nothing; the context bar
+     beside it is a chart, and every extra pixel is resolution. The old
+     `3fr / 1fr` split gave the prose 938px and the chart 313px at a 1516px
+     spine — backwards. */
+  grid-template-columns: 2ch 5ch minmax(30ch, 72ch) minmax(20ch, 1fr) 8ch 7ch 6ch;
   align-items: center;
   gap: var(--sp-3);
   /* --row-compact: high-cardinality scan lists. Row separators were at
@@ -2270,6 +2287,16 @@ tr[data-inspect]:focus-visible {
   outline: none;
   background: rgba(127, 143, 255, 0.14);
   box-shadow: inset 2px 0 0 var(--accent);
+}
+/* Every row's summary is the same one, and the note above the spine says so in
+   words. The column is removed rather than left holding 257 ditto marks; the
+   header cell goes with it so the two templates cannot drift. */
+.spine-uniform .turn-row {
+  grid-template-columns: 2ch 5ch minmax(20ch, 1fr) 8ch 7ch 6ch;
+}
+.spine-uniform .turn-what,
+.spine-uniform .turn-head > span:nth-child(3) {
+  display: none;
 }
 .turn-caret { color: var(--dim); cursor: pointer; }
 .turn-seq { color: var(--dim); text-align: right; }
