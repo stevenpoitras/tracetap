@@ -1984,8 +1984,7 @@
   };
 
   var SESSION_COLS = [
-    { key: "agent", label: "Agent", sortable: true },
-    { key: "model", label: "Model", sortable: true },
+    { key: "title", label: "Session" },
     { key: "project_cwd", label: "Project", sortable: true },
     { key: "started_at", label: "Started", sortable: true },
     { key: "duration_ms", label: "Duration", sortable: true, num: true },
@@ -2133,12 +2132,11 @@
           '<tr class="click" data-id="' +
           esc(s.sessionId) +
           '">' +
-          "<td>" +
-          agentPill(s.agent) +
-          "</td>" +
-          "<td>" +
+          '<td class="s-title"><span class="s-ask">' +
+          esc(s.title || "untitled session") +
+          '</span><span class="s-meta">' +
           esc(s.model || "—") +
-          "</td>" +
+          "</span></td>" +
           '<td class="dim" title="' +
           esc(s.projectCwd) +
           '">' +
@@ -2417,12 +2415,14 @@
 
     var html =
       '<div class="crumb"><a href="#sessions">← sessions</a></div>' +
+      // The ask is the session's IDENTITY; the model and project are properties
+      // of it. Titling by model gave nine consecutive headers reading
+      // "claude-opus-5 · eMachina" with nothing to tell them apart.
       '<div class="detail-head"><h1>' +
-      agentPill(s.agent) +
-      " " +
-      esc(s.model) +
+      esc(s.title || "untitled session") +
       "</h1>" +
       '<span class="dim">' +
+      agentPill(s.agent) + " " + esc(s.model) + " · " +
       esc(s.projectCwd) +
       " · " +
       fmtTime(s.startedAt) +
@@ -4516,10 +4516,16 @@
       '<span class="ctl-hint">applies to every figure on this page</span>' +
       "</div>" +
       '<div class="scope-line" id="an-scope-line">Loading&hellip;</div>' +
-      '<div id="an-cards">' + skelCards(7) + "</div>" +
-      '<div id="an-insights"></div>' +
-      '<div id="an-recent"></div>' +
-      '<div id="an-calendar"></div>' +
+      // A single column of full-width blocks made a 3168px page out of content
+      // that mostly wanted half the width: short wide rows with dead space on
+      // both sides. The grid pairs blocks whose natural widths differ — a list
+      // that wants to be long beside a chart that wants to be square.
+      '<div class="an-grid">' +
+      '<div class="an-full" id="an-cards">' + skelCards(7) + "</div>" +
+      '<div class="an-full" id="an-insights"></div>' +
+      '<div class="an-wide" id="an-recent"></div>' +
+      '<div class="an-side" id="an-calendar"></div>' +
+      '<div class="an-full">' +
       '<h2 class="sec">Spend over time <small>(the same slice, bucketed &mdash; granularity and breakdown reshape this section only)</small></h2>' +
       '<div class="controls sub">' +
       '<select id="an-gran" title="bucket size">' +
@@ -4528,11 +4534,12 @@
       }).join("") +
       "</select>" +
       '<label class="check"><input id="an-breakdown" type="checkbox"' + (an.breakdown ? " checked" : "") + "/> per-model breakdown</label>" +
-      "</div>" +
-      '<div id="an-series"><div class="tbl-wrap"><table><tbody>' + skelRows(6, 8) + "</tbody></table></div></div>" +
-      '<div id="an-viz"></div>' +
-      '<div id="an-tables"></div>' +
-      '<div class="note" id="an-note"></div>'
+      "</div></div>" +
+      '<div class="an-full" id="an-series"><div class="tbl-wrap"><table><tbody>' + skelRows(6, 8) + "</tbody></table></div></div>" +
+      '<div class="an-full" id="an-viz"></div>' +
+      '<div class="an-full" id="an-tables"></div>' +
+      '<div class="an-full note" id="an-note"></div>' +
+      "</div>"
     );
 
     ["an-since", "an-until", "an-agent"].forEach(function (id) {
@@ -4787,7 +4794,10 @@
 
     var tables = document.getElementById("an-tables");
     tables.innerHTML =
-      '<div class="split">' +
+      // Four narrow tables, laid out by `auto-fit` on their own minimum rather
+      // than by a hardcoded column count: at 2100px they sit three across, at
+      // 1200px two, and none of them ever gets stretched to a full 2152px.
+      '<div class="an-tables-grid">' +
       '<div><h2 class="sec">Per model <small>(wire latency &amp; reliability)</small></h2>' +
       '<div class="tbl-wrap"><table><thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Err</th><th class="num">TTFT p50</th><th class="num">TTFT p95</th><th class="num">Dur p50</th><th class="num">Out</th></tr></thead><tbody>' +
       (modelRows || '<tr><td colspan="7" class="dim">no wire data</td></tr>') + "</tbody></table></div>" +
@@ -4795,8 +4805,8 @@
       '<div class="tbl-wrap"><table><thead><tr><th>Agent</th><th class="num">Sessions</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th></tr></thead><tbody>' +
       (agentRows || '<tr><td colspan="5" class="dim">no data</td></tr>') + "</tbody></table></div></div>" +
       '<div><h2 class="sec">Top tools</h2>' +
-      '<div class="tbl-wrap"><table><tbody>' + (toolRows || '<tr><td class="dim">no tool calls</td></tr>') + "</tbody></table></div>" +
-      '<h2 class="sec">Top sessions by cost</h2>' +
+      '<div class="tbl-wrap"><table><tbody>' + (toolRows || '<tr><td class="dim">no tool calls</td></tr>') + "</tbody></table></div></div>" +
+      '<div><h2 class="sec">Top sessions by cost</h2>' +
       '<div class="tbl-wrap"><table><thead><tr><th>Session</th><th>Project</th><th>Started</th><th class="num">Dur</th><th class="num">Turns</th><th class="num">Cost</th></tr></thead><tbody>' +
       (topSessionRows || '<tr><td colspan="6" class="dim">no sessions</td></tr>') + "</tbody></table></div></div>" +
       "</div>";
@@ -4993,8 +5003,9 @@
               '<button type="button" class="an-recent-row" data-goto="#session/' +
               esc(encodeURIComponent(s.sessionId)) + '">' +
               '<span class="rc-when">' + esc(fmtWhen(s.startedAt)) + "</span>" +
-              '<span class="rc-proj">' + esc(basename(s.projectCwd) || "—") + "</span>" +
-              '<span class="rc-model">' + esc(s.model || "") + "</span>" +
+              '<span class="rc-title">' + esc(s.title || "untitled session") + "</span>" +
+              '<span class="rc-model">' + esc(basename(s.projectCwd) || "—") +
+              " · " + esc(s.model || "") + "</span>" +
               '<span class="rc-n">' + (s.turns || 0) + " turns</span>" +
               '<span class="rc-n">' + esc(fmtDur(s.durationMs)) + "</span>" +
               '<span class="rc-n' + (s.errorCount ? " bad" : "") + '">' +
@@ -5086,9 +5097,16 @@
     }
     note = '<div class="note">' + note + "</div>";
 
-    host.innerHTML = chart +
-      '<div class="tbl-wrap"><table><thead><tr>' + head + "</tr></thead><tbody>" +
-      rowsHtml.join("") + "</tbody></table></div>" + note;
+    // The chart and the table are the SAME numbers, so they sit side by side
+    // rather than stacked: at full width five daily buckets became five bars
+    // stranded in the middle of a 1960px box, and the table below it spread
+    // eight columns across the same width for no reason.
+    host.innerHTML =
+      '<div class="an-series-grid">' +
+      (chart ? '<div class="an-series-chart">' + chart + "</div>" : "") +
+      '<div class="an-series-table"><div class="tbl-wrap"><table><thead><tr>' +
+      head + "</tr></thead><tbody>" + rowsHtml.join("") +
+      "</tbody></table></div>" + note + "</div></div>";
     if (chart) {
       registerChart("an-fig2", function (w) {
         return columnChart(items, { height: 130, labels: true, colWidth: 34, width: w });

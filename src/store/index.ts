@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import { sessionTitle } from "./title.js";
 import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
@@ -174,6 +175,12 @@ export interface SessionSummary {
   turns: number;
   /** Number of steps flagged as errored. */
   errorCount: number;
+  /**
+   * What the session was ABOUT — its first genuine user ask, clipped.
+   * Empty when the transcript contains none, which is a real state rather than
+   * a missing value; see {@link sessionTitle}.
+   */
+  title: string;
 }
 
 /**
@@ -1192,6 +1199,40 @@ export class Store {
    * carries two cheap derived counts (`turns`, `errorCount`) from the per-step
    * FTS rows. Read-only: this never writes to the store.
    */
+  /**
+   * First-ask titles for a batch of sessions, in ONE query.
+   *
+   * Per-session lookup would be N+1 across a list that is routinely 80+ rows.
+   * The cap of 24 user steps per session is generous against the worst case
+   * observed on the live index (the real ask at user step 7, behind six
+   * envelopes) while keeping the scan bounded on permission-hook fan-outs,
+   * where a session can carry hundreds of user steps and no ask at all.
+   */
+  private titlesFor(sessionIds: string[]): Map<string, string> {
+    const out = new Map<string, string>();
+    if (!sessionIds.length) return out;
+    const placeholders = sessionIds.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT session_id AS sessionId, message
+           FROM steps_fts
+          WHERE session_id IN (${placeholders}) AND role = 'user'
+          ORDER BY session_id, rowid`,
+      )
+      .all(...sessionIds) as any[];
+    const bySession = new Map<string, string[]>();
+    for (const r of rows) {
+      const id = String(r.sessionId);
+      const list = bySession.get(id) ?? [];
+      if (list.length < 24) {
+        list.push(String(r.message ?? ""));
+        bySession.set(id, list);
+      }
+    }
+    for (const [id, msgs] of bySession) out.set(id, sessionTitle(msgs));
+    return out;
+  }
+
   listSessions(filters: SessionListFilters = {}): SessionSummary[] {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
@@ -1277,6 +1318,7 @@ export class Store {
     `;
 
     const rows = this.db.prepare(sql).all(params) as any[];
+    const titles = this.titlesFor(rows.map((r) => String(r.sessionId)));
     return rows.map((r): SessionSummary => {
       let toolHistogram: Record<string, number> = {};
       try {
@@ -1299,6 +1341,7 @@ export class Store {
         cacheCreation: Number(r.cacheCreation ?? 0),
         costUsd: r.costUsd == null ? null : Number(r.costUsd),
         toolHistogram,
+        title: titles.get(String(r.sessionId)) ?? "",
         sourcePath: String(r.sourcePath ?? ""),
         turns: Number(r.turns ?? 0),
         errorCount: Number(r.errorCount ?? 0),

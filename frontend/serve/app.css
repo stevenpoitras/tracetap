@@ -2783,7 +2783,7 @@ button.xray-seg:focus-visible {
 }
 .an-recent-row {
   display: grid;
-  grid-template-columns: 10ch minmax(0, 1fr) 24ch 10ch 10ch 8ch 10ch;
+  grid-template-columns: 10ch minmax(0, 1fr) 30ch 9ch 9ch 7ch 9ch;
   align-items: center;
   gap: var(--sp-4);
   width: 100%;
@@ -2801,7 +2801,7 @@ button.xray-seg:focus-visible {
 .an-recent-row:last-child { border-bottom: 0; }
 .an-recent-row:hover { background: rgba(255, 255, 255, 0.06); }
 .rc-when { color: var(--mid); }
-.rc-proj { color: var(--bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rc-title { color: var(--bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rc-model { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rc-n { text-align: right; color: var(--mid); }
 .rc-n.bad { color: var(--red); }
@@ -2810,3 +2810,65 @@ button.xray-seg:focus-visible {
   .an-recent-row { grid-template-columns: 10ch minmax(0, 1fr) 10ch; }
   .rc-model, .rc-n { display: none; }
 }
+
+/* The session list's identity column: the ask on top, the model beneath it as
+   the property it is. Two lines, so the row keeps one height either way. */
+.s-title { max-width: 62ch; }
+.s-ask {
+  display: block;
+  color: var(--bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.s-meta {
+  display: block;
+  color: var(--dim);
+  font-size: var(--fs-200);
+}
+
+/* -- analytics layout ----------------------------------------------------- */
+/* Twelve columns, so a block can claim the width it actually wants instead of
+   every block claiming all of it. The page was 3168px of full-width rows at a
+   2152px viewport — content that mostly wanted half the width, stacked. */
+.an-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 0 var(--sp-5);
+  align-items: start;
+}
+.an-full { grid-column: 1 / -1; min-width: 0; }
+/* A recency list is long and thin; a 26-week calendar is close to square. Side
+   by side they fill one band instead of two. */
+.an-wide { grid-column: span 7; min-width: 0; }
+.an-side { grid-column: span 5; min-width: 0; }
+@media (max-width: 1200px) {
+  .an-wide, .an-side { grid-column: 1 / -1; }
+}
+/* The calendar sits beside a list rather than alone in a full-width box, so it
+   no longer needs to stretch to fill one. */
+.an-side .chart-box { margin-bottom: var(--sp-6); }
+
+/* Bottom tables: per-model, per-agent and top-tools are three narrow things
+   that were stacked into 1177px of column. */
+.an-tables-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: var(--sp-5);
+  align-items: start;
+}
+
+/* Chart and its own table, side by side — same numbers, two readings. */
+.an-series-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+  gap: var(--sp-5);
+  align-items: start;
+}
+@media (max-width: 1200px) {
+  .an-series-grid { grid-template-columns: minmax(0, 1fr); }
+}
+/* A time axis reads left to right, so a chart narrower than its box starts at
+   the left rather than floating in the middle. Centring is right for a
+   calendar or a treemap, which have no reading direction; it is wrong here. */
+.an-series-chart .chart-box svg { margin-inline: 0; }
