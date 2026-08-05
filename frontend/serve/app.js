@@ -2832,6 +2832,13 @@
     // this call earlier, restoring pane B wrote B's row into A's cursor slot
     // and A could never be restored again.
     syncInspectorToPane(name);
+    // Land on the SAME CALL in the pane you just switched to. `reselectInPane`
+    // was written for exactly this and was never called from anywhere, so the
+    // selection only ever crossed panes via the LEFT/RIGHT keys — clicking a
+    // tab dropped it and left you at the top of a 258-row list. It prefers the
+    // shared turn over the pane's remembered cursor, which is what "the same
+    // thing, another view" has to mean.
+    reselectInPane(false);
     var body = document.querySelector(".session-body");
     if (body) body.classList.toggle("no-inspector", name === "journey");
     // A hidden pane measures 0 wide, so a chart registered while it was down
@@ -2868,6 +2875,15 @@
         // returning would land on nothing, while the keyboard remembered.
         if (current.pane) paneCursor[current.pane] = id;
         var type = id.slice(0, id.indexOf(":"));
+        // A `ctp:` row IS an API call, and which call you are looking at is a
+        // property of the SESSION, not of the pane you happen to be in. Set in
+        // the one place every selection passes through — a mouse click, a
+        // keypress and an arrow key all arrive here — so no caller has to
+        // remember to keep the cross-pane cursor in step.
+        if (type === "ctp") {
+          var n = Number(id.slice(4));
+          if (Number.isFinite(n)) selectedSeq = n;
+        }
         if (type === "flow") inspectFlowNode(el, sessionId);
         else if (type === "seg") inspectSegment(id);
         else if (type === "hook") inspectHook(id);
@@ -4257,6 +4273,12 @@
             loadXray(sessionId, Number(bar.getAttribute("data-seq")));
           });
         }
+        // The timeline is the only thing in this pane carrying per-call rows,
+        // and it arrives on its own fetch AFTER the pane can be switched to. A
+        // restore that ran while it was still empty found nothing and was lost
+        // silently — the selection did not fail to cross, it crossed into a
+        // pane that had no rows yet. Re-run it once the rows exist.
+        if (document.querySelector("#pane-xray.active")) reselectInPane(false);
       })
       .catch(function (err) {
         host.innerHTML =
@@ -6390,25 +6412,47 @@
     el.click();
   }
 
-  /** After switching panes, land on the same turn if this pane has it. */
-  function reselectInPane() {
+  /**
+   * Re-entrancy guard. `selectTarget` clicks a real row, and some rows switch
+   * panes when clicked — the x-ray timeline bar calls `activatePane("xray")`.
+   * Without this, restoring into the x-ray would click the bar, whose handler
+   * re-enters `activatePane`, which restores again: an infinite loop that hangs
+   * the tab rather than failing visibly.
+   */
+  var reselecting = false;
+
+  /**
+   * After switching panes, land on the same turn if this pane has it.
+   *
+   * @param allowFallback select the pane's first row when there is nothing to
+   *   restore. TRUE for keyboard traversal, where landing somewhere is the
+   *   point; FALSE for a tab click, because inventing a selection would pop the
+   *   inspector rail open every time you looked at a different pane.
+   */
+  function reselectInPane(allowFallback) {
+    if (reselecting) return;
     var list = paneTargets();
     if (!list.length) return;
     // A turn wins over a remembered cursor: if this pane can show the call you
     // were just looking at, that is what "the same thing, another view" means.
     var wanted = selectedSeq != null ? "ctp:" + selectedSeq : null;
     var remembered = paneCursor[current.pane];
-    for (var pass = 0; pass < 2; pass++) {
-      var want = pass === 0 ? wanted : remembered;
-      if (!want) continue;
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].getAttribute("data-inspect") === want) {
-          selectTarget(list[i]);
-          return;
+    reselecting = true;
+    try {
+      for (var pass = 0; pass < 2; pass++) {
+        var want = pass === 0 ? wanted : remembered;
+        if (!want) continue;
+        for (var i = 0; i < list.length; i++) {
+          if (list[i].getAttribute("data-inspect") === want) {
+            selectTarget(list[i]);
+            return;
+          }
         }
       }
+      if (allowFallback) selectTarget(list[0]);
+    } finally {
+      reselecting = false;
     }
-    selectTarget(list[0]);
   }
 
   function sessionArrowNav(e) {
