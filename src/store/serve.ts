@@ -478,7 +478,7 @@ function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilt
   for (const r of agentRows) {
     // Three buckets, never merged: the main thread, each NAMED agent, and the
     // marked-but-unnamed calls whose spawn was never captured.
-    const key = !r.sub ? " main" : r.label || "unnamed";
+    const key = !r.sub ? "\u0000main" : r.label || "\u0001unnamed";
     let pa = perNamedAgent.get(key);
     if (!pa) {
       pa = {
