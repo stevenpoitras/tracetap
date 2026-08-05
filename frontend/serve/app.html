@@ -17,10 +17,10 @@
   <div class="brand">tracetap<span class="brand-sub">:: OBSERVATORY</span></div>
   <nav class="tabs" id="tabs">
     <a href="#sessions" data-tab="sessions"><span class="tab-n">1</span>sessions</a>
-    <a href="#usage" data-tab="usage"><span class="tab-n">2</span>usage</a>
-    <a href="#analytics" data-tab="analytics"><span class="tab-n">3</span>analytics</a>
-    <a href="#prompts" data-tab="prompts"><span class="tab-n">4</span>prompts</a>
-    <a href="#audit" data-tab="audit"><span class="tab-n">5</span>audit</a>
+    <a href="#analytics" data-tab="analytics"><span class="tab-n">2</span>analytics</a>
+    <a href="#prompts" data-tab="prompts"><span class="tab-n">3</span>prompts</a>
+    <a href="#audit" data-tab="audit"><span class="tab-n">4</span>audit</a>
+    <a href="#tooltax" data-tab="tooltax"><span class="tab-n">5</span>tools</a>
   </nav>
   <div class="topbar-right">
     <button class="kbd-hint" id="palette-btn" title="Command palette (⌘K)">⌘K</button>
@@ -31,6 +31,9 @@
   <span class="sb-item sb-db" id="sb-db"></span>
   <span class="sb-item" id="sb-counts"></span>
   <span class="sb-spacer"></span>
+  <!-- A button, not a label: a refresh cannot clear this (compiled server code
+       is frozen at process start), so the badge has to be the way to act. -->
+  <button type="button" class="sb-item sb-stale" id="sb-stale" hidden></button>
   <span class="sb-item" id="sb-prices"></span>
   <span class="live" id="live" title="Live index updates (SSE)"><span class="dot"></span><span id="live-label">connecting</span></span>
 </footer>

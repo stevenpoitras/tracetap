@@ -298,12 +298,41 @@ export async function auditFilePaths(
   paths: string[],
   opts: { mode?: RedactMode; redactCheck?: boolean } = {},
 ): Promise<AuditReport> {
-  const st = newScanState(opts);
+  const scans: AuditFileScan[] = [];
   for (const p of paths) {
+    const scan = await auditOneFilePath(p, opts);
+    if (scan) scans.push(scan);
+  }
+  return reportFromScans(scans, opts);
+}
+
+/**
+ * One file's contribution to an audit — the unit that can be cached.
+ *
+ * A log's scan result depends only on its bytes and the detector mode, so a
+ * file whose content hash is unchanged never needs rescanning. Keeping the
+ * per-file result separate from the aggregate is what makes that possible;
+ * `AuditReport` alone cannot be merged, because its groups are already folded.
+ */
+export interface AuditFileScan {
+  path: string;
+  pairsScanned: number;
+  occurrences: AuditOccurrence[];
+  standardMasked: number;
+  strictMasked: number;
+}
+
+/** Scan a single log. Returns null when the path is not a readable file. */
+export async function auditOneFilePath(
+  p: string,
+  opts: { mode?: RedactMode; redactCheck?: boolean } = {},
+): Promise<AuditFileScan | null> {
+  const st = newScanState(opts);
+  {
     try {
-      if (!fs.statSync(p).isFile()) continue;
+      if (!fs.statSync(p).isFile()) return null;
     } catch {
-      continue; // moved/deleted since indexing
+      return null; // moved/deleted since indexing
     }
     st.filesScanned += 1;
     let pairIndex = 0;
@@ -330,6 +359,28 @@ export async function auditFilePaths(
     } finally {
       rl.close();
     }
+  }
+  return {
+    path: p,
+    pairsScanned: st.pairsScanned,
+    occurrences: st.occurrences,
+    standardMasked: st.standardMasked,
+    strictMasked: st.strictMasked,
+  };
+}
+
+/** Fold cached and freshly-scanned per-file results into one report. */
+export function reportFromScans(
+  scans: AuditFileScan[],
+  opts: { mode?: RedactMode; redactCheck?: boolean } = {},
+): AuditReport {
+  const st = newScanState(opts);
+  for (const s of scans) {
+    st.filesScanned += 1;
+    st.pairsScanned += s.pairsScanned;
+    st.standardMasked += s.standardMasked;
+    st.strictMasked += s.strictMasked;
+    for (const o of s.occurrences) st.occurrences.push(o);
   }
   return buildReport(st);
 }
