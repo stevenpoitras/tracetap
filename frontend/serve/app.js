@@ -5243,6 +5243,15 @@
   var anActivity = { days: [], minDate: "", maxDate: "", truncated: false };
   /** Anchor index while dragging; null when not. */
   var spineAnchor = null;
+  /**
+   * Whether the opening scope has been applied yet. The pane lands on a trailing
+   * window rather than on all time, but that window is only knowable once the
+   * activity data says which day is newest — so the first render defers.
+   *
+   * Latched, not recomputed: leaving for Sessions and coming back must preserve
+   * whatever you dragged to, and a reset to all time must STAY all time.
+   */
+  var anScopeInitialized = false;
 
   function anSpineHtml() {
     var days = anActivity.days;
@@ -5302,16 +5311,34 @@
   function loadActivity() {
     var p = new URLSearchParams();
     if (an.agent) p.set("agent", an.agent);
+    var first = !anScopeInitialized;
     fetchJSON("/api/activity" + (p.toString() ? "?" + p : ""))
       .then(function (d) {
         anActivity = d;
+        // Set the scope BEFORE building the strip: anSpineHtml() bakes the
+        // scope text into the axis label as it renders.
+        if (first) {
+          anScopeInitialized = true;
+          an.since = d.defaultSince || "";
+          an.until = d.defaultUntil || "";
+        }
         var host = document.getElementById("an-spine-host");
-        if (!host) return;
-        host.innerHTML = anSpineHtml();
-        paintSpineSelection();
+        if (host) host.innerHTML = anSpineHtml();
+        // Deferred, not duplicated: renderAnalytics() withheld its own query so
+        // the pane fires ONE, against the default scope — not an all-time query
+        // it throws away a beat later. afterScopeChange() also brings the scope
+        // chrome in line, so the opening window looks like any other selection.
+        if (first) afterScopeChange();
+        else paintSpineSelection();
       })
       .catch(function () {
-        /* the spine is a convenience; analytics still answers without it */
+        // The spine is a convenience; analytics still answers without it — but
+        // only if the deferred first query is released. Failing to fetch the
+        // default must degrade to all time, never to a blank pane.
+        if (first) {
+          anScopeInitialized = true;
+          loadAnalytics();
+        }
       });
   }
 
@@ -5478,7 +5505,12 @@
       document.getElementById(id).addEventListener("change", onSeriesControls);
     });
 
-    loadAnalytics();
+    // Withheld on the very first entry: the opening window is a trailing slice
+    // of history, and which days those are is only knowable once /api/activity
+    // answers. loadActivity() fires this once it has the dates. Every later
+    // render — a reset, a return from Sessions — already has a scope and asks
+    // immediately.
+    if (anScopeInitialized) loadAnalytics();
   }
 
   /** Scope changed - everything on the page has to be re-asked. */
