@@ -137,19 +137,25 @@ export function installSnippet(tracetapBin = "tracetap", opts: InstallOptions = 
   return { hooks };
 }
 
-function deepMergeHooks(target: any, source: any): any {
+function deepMergeHooks(target: any, source: any): { merged: any; addedEvents: string[] } {
   const out = { ...(target || {}) };
   const th = { ...(out.hooks || {}) };
   const sh = source.hooks || {};
+  const addedEvents: string[] = [];
   for (const [event, matchers] of Object.entries(sh)) {
     const existing = Array.isArray(th[event]) ? [...th[event]] : [];
     const incoming = Array.isArray(matchers) ? matchers : [];
+    // Scoped to this event's own hook list: a tap on another event (or the
+    // marker string in a permissions entry) must not block this one.
     const already = JSON.stringify(existing).includes(MARKER);
-    if (!already) existing.push(...incoming);
+    if (!already) {
+      existing.push(...incoming);
+      addedEvents.push(event);
+    }
     th[event] = existing;
   }
   out.hooks = th;
-  return out;
+  return { merged: out, addedEvents };
 }
 
 export function runHooksInstall(opts: InstallOptions = {}): void {
@@ -166,12 +172,15 @@ export function runHooksInstall(opts: InstallOptions = {}): void {
       return;
     }
   }
-  if (JSON.stringify(existing).includes(MARKER)) {
-    console.log(`Already installed in ${sp} (found "${MARKER}").`);
+  // Merge per event, never per file: a whole-file marker check would read a
+  // tracked hook (or a permissions entry naming the tap) as "installed" and
+  // silently skip everything — including taps added since the last install,
+  // like PreCompact/PostCompact.
+  const { merged, addedEvents } = deepMergeHooks(existing, snippet);
+  if (!addedEvents.length) {
+    console.log(`Already installed in ${sp} (every tap event carries "${MARKER}").`);
     const hasFull = /tracetap hooks tap[^"]*--full/.test(JSON.stringify(existing));
     if (full && !hasFull) {
-      // Merge is skipped wholesale once the marker is present, so --full on a
-      // second run would otherwise be silently dropped.
       console.log(
         `Note: existing taps do not carry --full. Run \`tracetap hooks uninstall\` then \`tracetap hooks install --full\` to switch on payload capture.`,
       );
@@ -179,14 +188,17 @@ export function runHooksInstall(opts: InstallOptions = {}): void {
     console.log(`Tip: run \`tracetap hooks discover\` then \`tracetap hooks track\` to wrap real repo hooks.`);
     return;
   }
-  const merged = deepMergeHooks(existing, snippet);
   try {
     ensureDir(path.dirname(sp));
     if (fs.existsSync(sp) && !fs.existsSync(sp + ".tracetap.bak")) {
       fs.copyFileSync(sp, sp + ".tracetap.bak");
     }
     fs.writeFileSync(sp, JSON.stringify(merged, null, 2) + "\n", "utf-8");
-    console.log(`Merged observe hooks into ${sp}`);
+    console.log(
+      addedEvents.length === INSTALL_TAPS.length
+        ? `Merged observe hooks into ${sp}`
+        : `Merged observe hooks into ${sp} (added ${addedEvents.join(", ")}; other events already tapped)`,
+    );
     console.log(`Hook events will append under ${hooksDir()}`);
     console.log(
       full
@@ -223,7 +235,10 @@ export function runHooksStatus(): void {
   let settingsHit = false;
   if (fs.existsSync(sp)) {
     try {
-      settingsHit = fs.readFileSync(sp, "utf-8").includes(MARKER);
+      // Scoped to the hooks section: the marker can also appear elsewhere in
+      // settings.json (e.g. a permissions allowlist entry), which is not an install.
+      const parsed = JSON.parse(fs.readFileSync(sp, "utf-8"));
+      settingsHit = JSON.stringify(parsed?.hooks ?? {}).includes(MARKER);
     } catch {
       /* ignore */
     }
@@ -332,6 +347,7 @@ export async function runHooksCli(argv: string[]): Promise<void> {
     console.log(
       `uninstall: removed ${res.removedCommands} tap command(s); settings cleared=${res.settingsCleared}`,
     );
+    for (const e of res.errors) console.error(`  error: ${e} — taps may still be installed`);
     if (res.filesRestored.length) {
       console.log(`restored:`);
       for (const f of res.filesRestored) console.log(`  ${f}`);

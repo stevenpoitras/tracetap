@@ -99,6 +99,50 @@ test("a session with no bodies and no precompute still yields a timeline", () =>
   assert.equal(tl.peakPromptTokens, 250);
 });
 
+test("fallback context size composes full wire context, not just uncached input", () => {
+  // On a warm session usage.input_tokens is a few hundred while the real
+  // context sits in cache_read: the fallback must add all three fields.
+  const warm = (seq, promptTokens, cacheRead, cacheCreation, items) => ({
+    ...req(seq, promptTokens, items),
+    cacheRead,
+    cacheCreation,
+  });
+  const tl = buildContextTimeline({
+    requests: [warm(0, 300, 140000, 2000, 20), warm(1, 250, 143000, 1500, 22)],
+  });
+  assert.equal(tl.points[0].approxTokens, 300 + 140000 + 2000);
+  assert.equal(tl.points[0].approxChars, (300 + 140000 + 2000) * 4);
+  assert.equal(tl.peakApproxTokens, 250 + 143000 + 1500);
+});
+
+test("a compaction whose point fell back does not fabricate a 100K-scale reclaim", () => {
+  // seq 0-1 have precomputed composition (~150K); the compaction call does
+  // not, so it falls back. With the bare promptTokens fallback the post size
+  // was ~300 and the reclaim a fabricated ~151K; wire composition keeps both
+  // sides at context scale.
+  const warm = (seq, promptTokens, cacheRead, cacheCreation, items) => ({
+    ...req(seq, promptTokens, items),
+    cacheRead,
+    cacheCreation,
+  });
+  const tl = buildContextTimeline({
+    requests: [
+      warm(0, 400, 148000, 1600, 20),
+      warm(1, 350, 150000, 1650, 25),
+      warm(2, 300, 138000, 2000, 8), // shrunk → compaction, no precomputed row
+    ],
+    precomputedBySeq: new Map([
+      [0, { totalChars: 600000, totalApproxTokens: 150000, buckets: {} }],
+      [1, { totalChars: 608000, totalApproxTokens: 152000, buckets: {} }],
+    ]),
+  });
+  const c = tl.points[2].compaction;
+  assert.ok(c, "seq 2 shrank the transcript");
+  assert.equal(c.preApproxTokens, 152000);
+  assert.equal(c.postApproxTokens, 300 + 138000 + 2000);
+  assert.equal(c.efficacy.reclaimedTokens, 152000 - 140300);
+});
+
 // ---------------------------------------------------------------------------
 // Compaction efficacy
 //
@@ -225,7 +269,7 @@ test("verdict boundary: marginal when the reclaim is regrown within 5 calls", ()
   assert.match(p.verdictReason, /holding for 6 calls/);
 });
 
-test("verdict boundary: reclaim below the attributable rebuild is negative", () => {
+test("verdict boundary: estimated reclaim vs wire rebuild honours the tolerance band", () => {
   const at = (reclaimed) =>
     timelineOf([
       ...filler(5, { cc: 1000 }),
@@ -234,7 +278,12 @@ test("verdict boundary: reclaim below the attributable rebuild is negative", () 
       ...filler(6, { items: 8, ctx: 60000, cc: 1000 }),
     ]).points[6].compaction.efficacy;
 
-  assert.equal(at(9999).verdict, "negative", "one token short of paying for itself");
+  // The reclaim is a chars/4 estimate but the rebuild is wire tokens, so a
+  // shortfall the ~20% estimation error can explain must not be called
+  // negative. 8333 * 1.2 < 10000 is the last clearly-negative value.
+  assert.equal(at(8333).verdict, "negative", "under water even with full estimation headroom");
+  assert.equal(at(9999).verdict, "marginal", "one token short is inside the estimation band");
+  assert.match(at(9999).verdictReason, /within estimation tolerance/);
   assert.equal(at(10000).verdict, "positive", "breaking even, and it never regrew");
   assert.equal(at(10000).callsToRegrow, null);
 });

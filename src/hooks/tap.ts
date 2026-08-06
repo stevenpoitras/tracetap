@@ -100,8 +100,17 @@ export function buildStdoutPreview(
         }
       }
       if (typeof j.continue === "boolean") out.continue = j.continue;
-      // Keep structured return for expand (capped via text already).
-      out.returned = j;
+      // Keep structured return for expand — but capped like every other field.
+      // stdout can be as large as spawnSync's 32MB maxBuffer, and this object
+      // is written verbatim into every JSONL line and the stdout_preview
+      // column, so a big return must not bypass the STDOUT_TEXT_CAP contract.
+      const serialized = JSON.stringify(j);
+      if (serialized.length > STDOUT_TEXT_CAP) {
+        out.returned = serialized.slice(0, STDOUT_TEXT_CAP) + "…";
+        out.returned_truncated = true;
+      } else {
+        out.returned = j;
+      }
     }
   } catch {
     out.preview = trimmed.slice(0, 160) + (trimmed.length > 160 ? "…" : "");
@@ -195,11 +204,15 @@ export function buildHookEvent(opts: BuildHookEventOpts): HookEvent {
   return ev;
 }
 
-/** Append one event line to the session hook log. Returns the path written. */
+/**
+ * Append one event line to the session hook log. Returns the path written.
+ * Logs hold prompt/tool text (full payloads under --full), so the dir and
+ * file are created owner-only: 0700 / 0600.
+ */
 export function appendHookEvent(event: HookEvent, hooksDir = defaultHooksDir()): string {
-  ensureDir(hooksDir);
+  ensureDir(hooksDir, 0o700);
   const file = hookLogPath(event.session_id, hooksDir);
-  fs.appendFileSync(file, JSON.stringify(event) + "\n", "utf-8");
+  fs.appendFileSync(file, JSON.stringify(event) + "\n", { encoding: "utf-8", mode: 0o600 });
   return file;
 }
 
@@ -219,6 +232,7 @@ export function wrapsRealCommand(cmd?: string[]): boolean {
 
 export interface TapRunResult {
   event: HookEvent;
+  /** Path written, or "" when the log append failed (the tap still re-emits). */
   logPath: string;
   stdout: string;
   stderr: string;
@@ -271,7 +285,17 @@ export function runTap(opts: {
     includePayload: opts.includePayload,
     wrapped: wrapsRealCommand(opts.wrappedCmd),
   });
-  const logPath = appendHookEvent(event, opts.hooksDir ?? defaultHooksDir());
+  // Best-effort bookkeeping: a failed log write (unwritable dir, full disk)
+  // must never eat the wrapped hook's decision. The caller re-emits
+  // stdout/stderr/exit code off this result regardless.
+  let logPath = "";
+  try {
+    logPath = appendHookEvent(event, opts.hooksDir ?? defaultHooksDir());
+  } catch (err) {
+    process.stderr.write(
+      `tracetap: hook log write failed: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
   return { event, logPath, stdout, stderr, exitCode };
 }
 

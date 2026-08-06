@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { MARKER, wrapCommand, type DiscoveredHook } from "./discover";
+import { CANDIDATE_FILES, MARKER, unwrapCommand, wrapCommand, type DiscoveredHook } from "./discover";
 import { ensureDir } from "./paths";
 
 /**
@@ -34,6 +34,9 @@ export interface UninstallResult {
   settingsCleared: boolean;
   filesRestored: string[];
   removedCommands: number;
+  /** Read/parse/write failures — surfaced, never swallowed: a silent skip
+   *  reads as a clean uninstall while the taps keep firing. */
+  errors: string[];
 }
 
 function settingsPath(): string {
@@ -216,12 +219,15 @@ export function trackSettings(
 
 /**
  * Remove tracetap tap wrappers from settings.json and restore any
- * `*.tracetap.bak` hook files next to discovered sources (or under root).
+ * `*.tracetap.bak` files trackInject created under root — plugin hooks.json,
+ * project settings, and cursor hooks alike. Sources whose backup is gone get
+ * their wrappers unwrapped in place instead.
  */
 export function uninstallTracking(opts?: { restoreBackupsUnder?: string }): UninstallResult {
   let settingsCleared = false;
   let removedCommands = 0;
   const filesRestored: string[] = [];
+  const errors: string[] = [];
 
   const sp = settingsPath();
   if (fs.existsSync(sp)) {
@@ -250,28 +256,70 @@ export function uninstallTracking(opts?: { restoreBackupsUnder?: string }): Unin
         writeJson(sp, data);
         settingsCleared = true;
       }
-    } catch {
-      /* leave settings alone */
+    } catch (err) {
+      errors.push(`could not clean ${sp}: ${(err as Error).message}`);
     }
   }
 
   const root = opts?.restoreBackupsUnder ? path.resolve(opts.restoreBackupsUnder) : null;
   if (root && fs.existsSync(root)) {
-    // Restore any hooks.json.tracetap.bak under the tree (shallow well-known paths).
-    const candidates = [
-      path.join(root, "hooks", "hooks.json.tracetap.bak"),
-      path.join(root, "plugin", "hooks", "hooks.json.tracetap.bak"),
-      path.join(root, ".claude-plugin", "hooks", "hooks.json.tracetap.bak"),
-    ];
-    for (const bak of candidates) {
-      if (!fs.existsSync(bak)) continue;
-      const target = bak.replace(/\.tracetap\.bak$/, "");
-      fs.copyFileSync(bak, target);
-      filesRestored.push(target);
+    // trackInject rewrites (and backs up) any CANDIDATE_FILES source, so every
+    // one of them is a restore candidate — not just the plugin hooks.json.
+    for (const rel of CANDIDATE_FILES) {
+      const target = path.join(root, rel);
+      const bak = target + ".tracetap.bak";
+      if (fs.existsSync(bak)) {
+        try {
+          fs.copyFileSync(bak, target);
+          filesRestored.push(target);
+        } catch (err) {
+          errors.push(`could not restore ${target}: ${(err as Error).message}`);
+        }
+        continue;
+      }
+      // No backup: unwrap remaining tap wrappers in place. Inject wrapped the
+      // only copy of the user's hook, so strip the wrapper, never the hook.
+      removedCommands += unwrapFile(target, errors);
     }
   }
 
-  return { settingsCleared, filesRestored, removedCommands };
+  return { settingsCleared, filesRestored, removedCommands, errors };
+}
+
+/** Replace wrapped commands in one hook file with their originals. */
+function unwrapFile(file: string, errors: string[]): number {
+  if (!fs.existsSync(file)) return 0;
+  let data: any;
+  try {
+    data = readJson(file);
+  } catch (err) {
+    errors.push(`could not parse ${file}: ${(err as Error).message}`);
+    return 0;
+  }
+  if (!data?.hooks || typeof data.hooks !== "object") return 0;
+  let changed = 0;
+  for (const matchers of Object.values(data.hooks)) {
+    if (!Array.isArray(matchers)) continue;
+    for (const matcher of matchers as any[]) {
+      if (!Array.isArray(matcher?.hooks)) continue;
+      for (const h of matcher.hooks) {
+        if (typeof h?.command !== "string" || !h.command.includes(MARKER)) continue;
+        const original = unwrapCommand(h.command);
+        if (original == null) continue;
+        h.command = original;
+        changed += 1;
+      }
+    }
+  }
+  if (changed) {
+    try {
+      writeJson(file, data);
+    } catch (err) {
+      errors.push(`could not write ${file}: ${(err as Error).message}`);
+      return 0;
+    }
+  }
+  return changed;
 }
 
 export { settingsPath };

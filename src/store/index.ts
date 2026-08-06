@@ -1497,6 +1497,16 @@ export class Store {
    * Hooks for a wire session: exact `session_id` match OR time-overlap with the
    * session window (±10 min slack). Wire conversation keys rarely equal Claude's
    * hook session_id, so time correlation is the practical bridge.
+   *
+   * The time join is fenced so it cannot serve another session's data:
+   * - When any exact `session_id` row exists, the wire id IS the hook session
+   *   id, so the join is skipped outright — it could only add foreign rows.
+   * - A hook event that carries a `cwd` identity conflicting with this
+   *   session's project cwd belongs to a different session and is dropped.
+   * - When more than one hook session survives in the window, none can be
+   *   attributed with certainty, so full `payload` bodies (--full stdin: prompt
+   *   text, tool inputs) are withheld from all of them — the timeline keeps its
+   *   shape, but another session's payloads are never served under this one.
    */
   listHooksForSession(sessionId: string): HookRow[] {
     const session = this.getSession(sessionId);
@@ -1510,7 +1520,7 @@ export class Store {
       .all(sessionId) as any[];
 
     let byTime: any[] = [];
-    if (session) {
+    if (session && !byId.length) {
       const slack = 600; // 10 minutes — long tool calls can lag the wire window
       const start = session.startedAt > 0 ? session.startedAt - slack : 0;
       const end = session.endedAt > 0 ? session.endedAt + slack : Number.MAX_SAFE_INTEGER;
@@ -1526,14 +1536,22 @@ export class Store {
         .all(start, end) as any[];
     }
 
-    const seen = new Set<number>();
-    const rows: HookRow[] = [];
-    for (const r of [...byId, ...byTime]) {
-      const id = Number(r.id);
-      if (seen.has(id)) continue;
-      seen.add(id);
-      rows.push(hookRowFromDb(r));
+    const rows: HookRow[] = byId.map(hookRowFromDb);
+    const sessionCwd = normalizeCwd(session?.projectCwd);
+    const timeRows: HookRow[] = [];
+    for (const r of byTime) {
+      const row = hookRowFromDb(r);
+      // The tap records Claude's cwd in the stdin preview; a mismatch with the
+      // wire session's project is positive identity for a DIFFERENT session.
+      const hookCwd = normalizeCwd((row.stdinPreview as any)?.cwd);
+      if (hookCwd && sessionCwd && hookCwd !== sessionCwd) continue;
+      timeRows.push(row);
     }
+    const hookSessions = new Set(timeRows.map((r) => r.sessionId));
+    if (hookSessions.size > 1) {
+      for (const row of timeRows) row.payload = null;
+    }
+    rows.push(...timeRows);
     rows.sort((a, b) => a.ts - b.ts || a.id - b.id);
     return rows;
   }
@@ -1555,7 +1573,10 @@ export class Store {
    * 100MB. Callers that need more than a single pair must go through here so
    * they pay that once, not once per pair.
    *
-   * Returns null when the source file is missing or unreadable.
+   * Returns null when the source file is missing or unreadable, or when its
+   * current content no longer contains this session — a log rewritten or
+   * rotated in place between index passes holds a *different* conversation,
+   * and serving its pairs under this session id would cross-wire bodies.
    */
   private loadSessionPairs(sessionId: string): RawPair[] | null {
     const session = this.getSession(sessionId);
@@ -1567,9 +1588,12 @@ export class Store {
       return null;
     }
     const pairs = parsePairs(content);
-    // Pairs in the file may span multiple conversation groups; filter to this session.
+    // Pairs in the file may span multiple conversation groups; filter to this
+    // session. No fallback: the grouping is deterministic over content, so a
+    // miss means the file no longer holds this conversation — answer null (the
+    // routes 404) rather than another session's bodies.
     const groups = groupPairs(pairs);
-    const group = groups.find((g) => g.sessionId === sessionId) ?? groups[0];
+    const group = groups.find((g) => g.sessionId === sessionId);
     return group ? group.pairs : null;
   }
 
@@ -1856,6 +1880,16 @@ function contextMetricsForPair(
   } catch {
     return null;
   }
+}
+
+/**
+ * A comparable form of a working-directory identity: trailing separators
+ * stripped so `/a/b/` and `/a/b` compare equal. Empty string when absent —
+ * callers treat empty as "carries no identity" and never match on it.
+ */
+function normalizeCwd(cwd: unknown): string {
+  if (typeof cwd !== "string" || !cwd.trim()) return "";
+  return cwd.replace(/[\\/]+$/, "") || "/";
 }
 
 function hookRowFromDb(r: any): HookRow {

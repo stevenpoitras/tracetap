@@ -1429,7 +1429,15 @@
     if (!tl || !tl.points || !tl.points.length) {
       return '<div class="dim">No context timeline points.</div>';
     }
-    var peak = Math.max(1, tl.peakPromptTokens || tl.peakApproxTokens || 1);
+    // Numerator and denominator must share one token basis: wire prompt
+    // tokens when any usage was captured, approx (chars/4) sizes otherwise.
+    // Mixing them (promptTokens over an approx peak) rendered every column at
+    // the 4% floor whenever usage was missing but bodies were segmented.
+    var usePrompt = (tl.peakPromptTokens || 0) > 0;
+    var peak = Math.max(
+      1,
+      (usePrompt ? tl.peakPromptTokens : tl.peakApproxTokens) || 1
+    );
     var html =
       '<h2 class="sec">Context size timeline <small>' +
       tl.points.length +
@@ -1437,10 +1445,12 @@
       tl.compactionCount +
       " compaction(s) · peak " +
       fmtTok(peak) +
-      " prompt tokens · click any column to x-ray it · amber ⇣ = compaction</small></h2>" +
+      (usePrompt ? " prompt tokens" : " approx tokens (usage not captured)") +
+      " · click any column to x-ray it · amber ⇣ = compaction</small></h2>" +
       '<div class="context-timeline" id="context-timeline">';
     tl.points.forEach(function (p) {
-      var h = Math.max(4, Math.round((p.promptTokens / peak) * 100));
+      var size = usePrompt ? p.promptTokens : p.approxTokens || 0;
+      var h = Math.max(4, Math.round((size / peak) * 100));
       // The BUTTON is a full-height transparent column; the bar inside it is
       // what encodes the value. Sizing the button itself meant a call with a
       // small prompt got a ~3px-tall click target — visible, but in practice
@@ -1453,8 +1463,8 @@
         "#" +
         p.seq +
         " · " +
-        fmtTok(p.promptTokens) +
-        " prompt · " +
+        (usePrompt ? fmtTok(p.promptTokens) + " prompt" : "≈" + fmtTok(size)) +
+        " · " +
         p.transcriptItems +
         " items" +
         (p.compaction

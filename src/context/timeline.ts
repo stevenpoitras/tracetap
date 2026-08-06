@@ -120,6 +120,16 @@ const TRIVIAL_RECLAIM_TOKENS = 500;
 /** callsToRegrow at or below this means the reclaim did not last. */
 const SHORT_LIVED_CALLS = 5;
 
+/**
+ * The reclaim side of the verdict is a chars/4 estimate while the rebuild side
+ * is wire-exact `cache_creation` tokens. Code-heavy contexts tokenize nearer
+ * 3.3 chars/token, so chars/4 under-counts the reclaim by up to ~20% relative
+ * to the wire cost. A comparison inside that band cannot honestly be called
+ * "negative" — it is treated as roughly break-even instead of letting the
+ * estimation skew flip a compaction that actually paid for itself.
+ */
+const RECLAIM_ESTIMATE_TOLERANCE = 0.2;
+
 function median(xs: number[]): number {
   if (!xs.length) return 0;
   const s = [...xs].sort((a, b) => a - b);
@@ -190,6 +200,19 @@ function fmtTokens(n: number): string {
 }
 
 /**
+ * Wire-exact total context for one call: uncached input + cache reads + cache
+ * writes. `promptTokens` alone is Anthropic `usage.input_tokens`, which
+ * EXCLUDES the cached prefix — on a warm session it is a few hundred tokens
+ * while the real context is 100K+ sitting in `cache_read`. Any fallback that
+ * stands in for an approx context size must use this composition, or a
+ * timeline mixing precomputed (~150K-scale) and fallback (~300-scale) points
+ * fabricates compaction reclaims and breaks callsToRegrow.
+ */
+function wireContextTokens(r: ContextTimelineRequest): number {
+  return r.promptTokens + r.cacheRead + r.cacheCreation;
+}
+
+/**
  * Verdict for one compaction, from what it reclaimed against what the re-cache
  * cost above the ambient baseline.
  *
@@ -197,6 +220,11 @@ function fmtTokens(n: number): string {
  * lower bound on the true cost (it ignores knock-on re-cache on later calls),
  * and a reclaim that is regrown within a handful of calls bought nothing
  * durable even when the arithmetic nets out positive.
+ *
+ * Equally conservative about claiming a loss: the reclaim is a chars/4
+ * estimate compared against wire cache tokens, so a shortfall inside
+ * {@link RECLAIM_ESTIMATE_TOLERANCE} is reported as "marginal" (an estimated
+ * break-even), not "negative".
  */
 export function computeCompactionEfficacy(input: {
   reclaimedTokens: number;
@@ -228,7 +256,9 @@ export function computeCompactionEfficacy(input: {
 
   let verdict: CompactionEfficacy["verdict"];
   let verdictReason: string;
-  if (reclaimedTokens < attributableRebuild) {
+  if (reclaimedTokens * (1 + RECLAIM_ESTIMATE_TOLERANCE) < attributableRebuild) {
+    // Clearly under water even after granting the reclaim its full estimation
+    // headroom — safe to call negative outright.
     verdict = "negative";
     verdictReason = `reclaimed ${fmtTokens(reclaimedTokens)} tokens but paid ~${fmtTokens(
       attributableRebuild,
@@ -236,6 +266,13 @@ export function computeCompactionEfficacy(input: {
   } else if (reclaimedTokens < TRIVIAL_RECLAIM_TOKENS) {
     verdict = "negative";
     verdictReason = `reclaimed only ${fmtTokens(reclaimedTokens)} tokens (${reclaimedPct}% of context)`;
+  } else if (reclaimedTokens < attributableRebuild) {
+    // Inside the estimation band: the wire cost nominally exceeds the
+    // estimated reclaim, but by less than the chars/4 error can account for.
+    verdict = "marginal";
+    verdictReason = `reclaimed ~${fmtTokens(reclaimedTokens)} tokens (estimated) against ~${fmtTokens(
+      attributableRebuild,
+    )} of cache rebuild — within estimation tolerance, roughly break-even`;
   } else if (regrow !== null && regrow <= SHORT_LIVED_CALLS) {
     verdict = "marginal";
     verdictReason = `reclaimed ${fmtTokens(reclaimedTokens)} tokens (${reclaimedPct}%) but context was back to its old size within ${regrow} call${regrow === 1 ? "" : "s"}`;
@@ -309,8 +346,8 @@ export function buildContextTimeline(opts: {
       buckets = {};
       for (const b of xray.buckets) buckets[b.bucket] = b.approxTokens;
     } else {
-      approxTokens = r.promptTokens;
-      approxChars = r.promptTokens * 4;
+      approxTokens = wireContextTokens(r);
+      approxChars = approxTokens * 4;
     }
 
     const point: ContextTimelinePoint = {
@@ -339,7 +376,7 @@ export function buildContextTimeline(opts: {
         droppedItems: c.from - c.to,
         prePromptTokens: prevReq.promptTokens,
         postPromptTokens: r.promptTokens,
-        preApproxTokens: prev?.approxTokens ?? prevReq.promptTokens,
+        preApproxTokens: prev?.approxTokens ?? wireContextTokens(prevReq),
         postApproxTokens: approxTokens,
         // Filled in below: callsToRegrow needs the whole timeline.
         efficacy: undefined as unknown as CompactionEfficacy,
