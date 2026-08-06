@@ -1062,10 +1062,82 @@ function firstParam(value: string | string[] | undefined): string | undefined {
 }
 
 /**
- * Parse the `since` / `until` / `agent` scope shared by `/api/usage` and
- * `/api/analytics`. One parser means the merged analytics pane can send one
- * control set to both endpoints and get back two views of the SAME slice —
- * anything else and the page's filters would silently govern only half of it.
+ * `YYYY-MM-DD` (and the `today` / `yesterday` / `<N>d` forms) OR a raw epoch
+ * second. Callers hand this whatever a query string carried; a bare integer is
+ * already the unit the store filters in, so re-parsing it as a date would be
+ * the one way to turn a valid bound into an error.
+ */
+function parseWhenParam(raw: string, opts: { endOfDay?: boolean } = {}): number {
+  const s = raw.trim();
+  if (/^\d+$/.test(s)) return Number(s);
+  return parseWhen(s, opts);
+}
+
+/** One column per day in the scope brush, so a year of history stays scrubbable. */
+const ACTIVITY_MAX_DAYS = 400;
+
+export interface ActivityDay {
+  /** Local `YYYY-MM-DD`, matching `parseWhen`'s local-midnight boundaries. */
+  date: string;
+  sessions: number;
+  costUsd: number;
+  /** Distinct agents active that day. */
+  agents: number;
+}
+
+/**
+ * Expand a sparse day aggregate into a CONTIGUOUS run of days.
+ *
+ * The brush maps an x-offset to a column index and a column index to a date, so
+ * a missing quiet day would silently shift every date to its left — you would
+ * drag to what reads as the 2nd and select the 4th. Idle days are also the
+ * point of the picture: a gap is information, not an absence of it.
+ */
+function zeroFillDays(rows: { day: string; sessions: number; cost: number; agents: number }[]): {
+  days: ActivityDay[];
+  minDate: string;
+  maxDate: string;
+  truncated: boolean;
+} {
+  if (!rows.length) return { days: [], minDate: "", maxDate: "", truncated: false };
+  const byDay = new Map(rows.map((r) => [r.day, r]));
+  const maxDate = rows[rows.length - 1].day;
+  const toDate = (s: string) => {
+    const [y, m, d] = s.split("-").map(Number);
+    return new Date(y, m - 1, d);
+  };
+  const iso = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+  // Walk back from the newest day, not forward from the oldest: when history
+  // exceeds the cap it is the RECENT window you want kept.
+  const end = toDate(maxDate);
+  const floor = new Date(end);
+  floor.setDate(floor.getDate() - (ACTIVITY_MAX_DAYS - 1));
+  const wanted = toDate(rows[0].day);
+  const truncated = wanted < floor;
+  const start = truncated ? floor : wanted;
+
+  const days: ActivityDay[] = [];
+  // setDate (not +86400e3) so a DST shift moves the clock, not the calendar.
+  for (const cur = new Date(start); cur <= end; cur.setDate(cur.getDate() + 1)) {
+    const key = iso(cur);
+    const hit = byDay.get(key);
+    days.push({
+      date: key,
+      sessions: hit ? hit.sessions : 0,
+      costUsd: hit ? hit.cost : 0,
+      agents: hit ? hit.agents : 0,
+    });
+  }
+  return { days, minDate: days[0].date, maxDate, truncated };
+}
+
+/**
+ * Parse the `since` / `until` / `agent` scope shared by `/api/usage`,
+ * `/api/analytics` and `/api/sessions`. One parser means the analytics pane can
+ * send one control set to all three and get back three views of the SAME slice —
+ * anything else and the page's filters would silently govern only part of it.
  * Returns `{ error }` (→ 400) instead of throwing on an unparseable date.
  */
 function parseScope(q: URLSearchParams): { filters: AnalyticsFilters } | { error: string } {
@@ -1074,8 +1146,8 @@ function parseScope(q: URLSearchParams): { filters: AnalyticsFilters } | { error
   const until = firstParam(q.get("until") ?? undefined);
   const agent = firstParam(q.get("agent") ?? undefined);
   try {
-    if (since) filters.since = parseWhen(since);
-    if (until) filters.until = parseWhen(until, { endOfDay: true });
+    if (since) filters.since = parseWhenParam(since);
+    if (until) filters.until = parseWhenParam(until, { endOfDay: true });
   } catch (err) {
     return { error: (err as Error).message };
   }
@@ -1170,6 +1242,36 @@ export async function handleRequest(
       return;
     }
 
+    // The activity spine behind the analytics scope brush: one row per calendar
+    // day, GAPS INCLUDED. Deliberately NOT date-scoped — it is the thing you
+    // select a scope WITH, so scoping it by the current selection would shrink
+    // the control to the window it just chose and strand you there. Only the
+    // agent filter applies, because that one narrows what "activity" means
+    // rather than which slice of it you are looking at.
+    if (pathname === "/api/activity") {
+      const agent = firstParam(q.get("agent") ?? undefined);
+      const rows = store.db
+        .prepare(
+          `SELECT date(started_at, 'unixepoch', 'localtime') AS day,
+                  COUNT(*)                                   AS sessions,
+                  COALESCE(SUM(cost_usd), 0)                 AS cost,
+                  COUNT(DISTINCT agent)                      AS agents
+             FROM sessions
+            WHERE started_at > 0
+              ${agent ? "AND lower(agent) = lower(@agent)" : ""}
+            GROUP BY day
+            ORDER BY day`,
+        )
+        .all(agent ? { agent } : {}) as {
+        day: string;
+        sessions: number;
+        cost: number;
+        agents: number;
+      }[];
+      sendJson(res, 200, zeroFillDays(rows));
+      return;
+    }
+
     if (pathname === "/api/sessions") {
       const filters: SessionListFilters = {};
       const agent = firstParam(q.get("agent") ?? undefined);
@@ -1189,8 +1291,17 @@ export async function handleRequest(
       if (sort) filters.sort = sort;
       if (order === "asc" || order === "desc") filters.order = order;
       if (limit && Number.isFinite(Number(limit))) filters.limit = Number(limit);
-      if (since && Number.isFinite(Number(since))) filters.since = Number(since);
-      if (until && Number.isFinite(Number(until))) filters.until = Number(until);
+      // Same grammar as /api/analytics and /api/usage. This used to accept ONLY
+      // epoch numbers, so the analytics pane's `since=2026-08-02` parsed to NaN
+      // and was dropped — the scope bar claimed to govern every figure on the
+      // page while the recency list it fed answered for all time.
+      try {
+        if (since) filters.since = parseWhenParam(since);
+        if (until) filters.until = parseWhenParam(until, { endOfDay: true });
+      } catch (err) {
+        sendJson(res, 400, { error: (err as Error).message });
+        return;
+      }
       const sessions = store.listSessions(filters);
       sendJson(res, 200, { count: sessions.length, sessions });
       return;
