@@ -72,7 +72,7 @@ ${colors.yellow}COMMANDS:${colors.reset}
                               search · filter · live-tail · diff · ATIF export
   serve [--port <n>]          Launch a local dashboard (browser UI) over every
                               indexed session (--host/--db; default :4000)
-  hooks <tap|install|status|discover|track|uninstall>
+  hooks <tap|install|status|discover|track|prune|uninstall>
                               Capture Claude Code hook events into
                               ~/.tracetap/hooks for Flow / Hooks / Context X-Ray
                               (discover/track wrap repo hooks; uninstall cleans up —

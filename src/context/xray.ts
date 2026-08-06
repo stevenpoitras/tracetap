@@ -52,6 +52,19 @@ export interface ContextXray {
     newCount: number;
     carriedCount: number;
     droppedCount: number;
+    /**
+     * The PREVIOUS call's buckets, summarised the same way as `buckets`.
+     *
+     * Carried so the pane can show pre → net → post per bucket rather than the
+     * ending size alone. "TOOLS 117K" answers what is in the window now; only
+     * "TOOLS 96K → +21K → 117K" answers what this turn DID to it, which is the
+     * question a compaction makes urgent — a call can free 18K and be followed
+     * by one carrying 110K more.
+     *
+     * Includes buckets that exist only on one side (a bucket emptied to zero is
+     * a result, not an absence), which is why it is not derived from `buckets`.
+     */
+    prevBuckets: XrayBucketSummary[];
     items: XrayDelta[];
   };
 }
@@ -265,6 +278,7 @@ function diffSegments(prev: XraySegment[], curr: XraySegment[], prevSeq: number)
     newCount: items.filter((i) => i.kind === "new").length,
     carriedCount: items.filter((i) => i.kind === "carried").length,
     droppedCount: items.filter((i) => i.kind === "dropped").length,
+    prevBuckets: summarizeBuckets(prev),
     items,
   };
 }

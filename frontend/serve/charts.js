@@ -77,18 +77,41 @@ var TracetapCharts = (function () {
   }
 
   // -- calendar heatmap (26 weeks of daily cost) ---------------------------
-  function calendarHeatmap(trend) {
+  /**
+   * Every chart in this file emits its size in PIXELS, matching its viewBox
+   * one-to-one, so an SVG is laid out at the width it will occupy and is never
+   * scaled to reach it. A `viewBox` with no width let CSS pick the real size:
+   * at a 2200px shell that magnified the treemap 1.5× and — with
+   * `preserveAspectRatio="none"` on the column chart — sheared its date labels
+   * 14× horizontally. Text does not survive being scaled; layout does.
+   */
+  function svgOpen(W, H) {
+    return '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '">';
+  }
+
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function calendarHeatmap(trend, opts) {
+    opts = opts || {};
     var byDate = {}, max = 0;
     trend.forEach(function (d) {
       byDate[d.date] = d;
       if (d.costUsd > max) max = d.costUsd;
     });
-    var CELL = 12, GAP = 3, LEFT = 30, TOP = 18;
+    var GAP = 3, LEFT = 30, TOP = 18;
     var today = new Date(); today.setHours(0, 0, 0, 0);
     var start = new Date(today);
     start.setDate(start.getDate() - 181);
     start.setDate(start.getDate() - start.getDay()); // align to Sunday
     var weeks = Math.ceil(((today - start) / 86400000 + 1) / 7);
+    // The week count is fixed by the calendar, so extra width buys BIGGER days,
+    // not more of them. Bounded above because a 70px square stops reading as a
+    // heatmap cell and starts reading as a button.
+    var CELL = opts.width
+      ? clamp(Math.floor((opts.width - LEFT - 4) / weeks) - GAP, 12, 22)
+      : 12;
     var W = LEFT + weeks * (CELL + GAP) + 4, H = TOP + 7 * (CELL + GAP) + 4;
 
     var cells = [], months = [], lastMonth = -1;
@@ -115,8 +138,7 @@ var TracetapCharts = (function () {
     var days = ["", "MON", "", "WED", "", "FRI", ""].map(function (lbl, i) {
       return lbl ? '<text x="' + (LEFT - 6) + '" y="' + (TOP + i * (CELL + GAP) + 9) + '" text-anchor="end" class="hm-day">' + lbl + "</text>" : "";
     }).join("");
-    return '<svg viewBox="0 0 ' + W + " " + H + '" style="max-width:' + W + 'px">' +
-      months.join("") + days + cells.join("") + "</svg>";
+    return svgOpen(W, H) + months.join("") + days + cells.join("") + "</svg>";
   }
 
   // -- squarified treemap (cost by project) --------------------------------
@@ -170,7 +192,8 @@ var TracetapCharts = (function () {
   /** items: [{label, value, idx}] pre-sorted desc; idx points into the caller's data. */
   function treemap(items, opts) {
     opts = opts || {};
-    var W = opts.width || 940, H = opts.height || 210;
+    var W = Math.max(320, Math.floor(opts.width || 940));
+    var H = opts.height || 210;
     var rects = squarify(items, 0, 0, W, H);
     var out = rects.map(function (r) {
       var color = TM_COLORS[r.item.idx % TM_COLORS.length];
@@ -178,18 +201,22 @@ var TracetapCharts = (function () {
         '<rect x="' + (r.x + 1).toFixed(1) + '" y="' + (r.y + 1).toFixed(1) +
         '" width="' + Math.max(0, r.w - 2).toFixed(1) + '" height="' + Math.max(0, r.h - 2).toFixed(1) +
         '" rx="3" fill="' + color + '" fill-opacity="0.16" stroke="' + color + '" stroke-opacity="0.55"></rect>';
-      if (r.w > 78 && r.h > 34) {
+      // Raised with the type scale: the label is 14px and the sub 11px now, and
+      // SVG <text> has no clipping and no ellipsis — a cell that cannot hold
+      // both must show neither rather than spill across its neighbour.
+      if (r.w > 96 && r.h > 40) {
         cell += '<text x="' + (r.x + 9).toFixed(1) + '" y="' + (r.y + 18).toFixed(1) + '" class="tm-label">' + esc(r.item.label) + "</text>" +
           '<text x="' + (r.x + 9).toFixed(1) + '" y="' + (r.y + 32).toFixed(1) + '" class="tm-sub">' + esc(r.item.sub || "") + "</text>";
       }
       return cell + "</g>";
     });
-    return '<svg viewBox="0 0 ' + W + " " + H + '">' + out.join("") + "</svg>";
+    return svgOpen(W, H) + out.join("") + "</svg>";
   }
 
   // -- TTFT percentile strips per model -------------------------------------
   /** models: [{model, ttftPcts:[p10,p25,p50,p75,p90,p95], ttftN}] */
-  function ttftStrips(models) {
+  function ttftStrips(models, opts) {
+    opts = opts || {};
     var ms = models.filter(function (m) {
       return m.ttftPcts && m.ttftPcts.length === 6 && m.ttftPcts[5] != null;
     });
@@ -197,7 +224,10 @@ var TracetapCharts = (function () {
     var max = 0;
     ms.forEach(function (m) { if (m.ttftPcts[5] > max) max = m.ttftPcts[5]; });
     max = max * 1.1 || 1;
-    var LEFT = 168, RIGHT = 70, ROWH = 30, W = 680;
+    // The label gutter and the value column are fixed; extra width goes to the
+    // PLOT, which is the part that carries information.
+    var LEFT = 168, RIGHT = 70, ROWH = 30;
+    var W = clamp(Math.floor(opts.width || 680), 420, 1400);
     var H = ms.length * ROWH + 24;
     var plotW = W - LEFT - RIGHT;
     function X(v) { return LEFT + (v / max) * plotW; }
@@ -224,7 +254,7 @@ var TracetapCharts = (function () {
         "</g>";
     }).join("");
 
-    return '<svg viewBox="0 0 ' + W + " " + H + '">' + axis + rows + "</svg>";
+    return svgOpen(W, H) + axis + rows + "</svg>";
   }
 
   return { calendarHeatmap: calendarHeatmap, treemap: treemap, ttftStrips: ttftStrips, fmtDur: fmtDur, fmtCost: fmtCost };
