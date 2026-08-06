@@ -146,6 +146,19 @@ export interface SessionListFilters {
   tool?: string;
   /** Restrict to sessions that have at least one errored step. */
   errored?: boolean;
+  /**
+   * Which side of the fan-out to list. Defaults to `"any"` — every caller that
+   * asks for a specific session by id, or walks siblings, must keep seeing
+   * subagent groups, so the narrowing belongs to the caller that wants it.
+   *
+   * `"main"` keeps sessions with at least one main-thread request; `"subagent"`
+   * keeps only those whose every request is subagent traffic. Sessions with no
+   * request rows at all (Codex, Gemini, Devin, and pre-`requests` captures)
+   * count as main — "no evidence of being a subagent" must not read as "is
+   * one", or a filter about Claude fan-outs would silently empty the list for
+   * every other harness.
+   */
+  thread?: "main" | "subagent" | "any";
   /** Lower bound on the session start time (unix epoch seconds, inclusive). */
   since?: number;
   /** Upper bound on the session start time (unix epoch seconds, inclusive). */
@@ -1464,6 +1477,18 @@ export class Store {
     if (filters.errored) {
       where.push(
         "EXISTS (SELECT 1 FROM steps_fts f WHERE f.session_id = s.session_id AND f.error_flag = '1')",
+      );
+    }
+    if (filters.thread === "main" || filters.thread === "subagent") {
+      // A session is subagent traffic when it has requests and NONE of them are
+      // main-thread. `is_subagent` is recorded from Claude Code's own marker,
+      // not inferred, so this is a fact about the capture rather than a guess.
+      const subagentOnly = `EXISTS (SELECT 1 FROM requests r WHERE r.session_id = s.session_id)
+         AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.session_id = s.session_id AND r.is_subagent = 0)`;
+      where.push(
+        filters.thread === "subagent"
+          ? `(${subagentOnly})`
+          : `NOT (${subagentOnly})`,
       );
     }
     if (filters.q && filters.q.trim()) {
