@@ -15,6 +15,46 @@ export function buildStdinPreview(stdin: unknown): Record<string, unknown> {
   }
   const o = stdin as Record<string, unknown>;
   const out: Record<string, unknown> = {};
+  // The first group is context; the second is JOIN KEYS, and they are the whole
+  // reason a hook event can ever be attributed to anything. Claude Code hands
+  // them to us on stdin and they are cheap identifiers, not payload:
+  //
+  //   tool_use_id  the `toolu_…` of the tool call this hook gated or observed —
+  //                the exact key that pairs PreToolUse with its tool call and
+  //                with the matching PostToolUse.
+  //   prompt_id    shared by every hook fired during one user turn, which is
+  //                what partitions a flat hook stream into turns.
+  //   agent_id     which subagent fired this, so lanes stop being guessed from
+  //                tool names.
+  //   agent_type   that subagent's label ("Explore", "claude"), which names the
+  //                lane agent_id only identifies.
+  //   source       why a SessionStart fired — a closed enum of startup, resume,
+  //                clear, compact, fork. Not a join key; it is here because it
+  //                is the only wire-side witness to a session's provenance, and
+  //                it is bounded to those five literals.
+  //
+  // Every key on this list is an opaque identifier or a bounded literal, which
+  // is the bar for entering it: this allowlist is the redaction fence for hook
+  // stdin, and these events are indexed and rendered WITHOUT --redact-bodies.
+  // Measured against real captures, the longest of these is 36 chars.
+  //
+  // Their sensitive neighbours fall into two groups, and the difference matters
+  // to anyone reading a preview:
+  //   never present   session_title, compact_summary, custom_instructions,
+  //                   error_details, message, tool_response — no branch below
+  //                   emits them in any form.
+  //   summarized      prompt keeps a length AND its first 120 chars VERBATIM in
+  //                   prompt_preview; last_assistant_message keeps a length
+  //                   only. So a secret pasted into the first 120 characters of
+  //                   a prompt does reach the log. Pre-existing, and the reason
+  //                   this list must stay identifiers-only rather than becoming
+  //                   the place where new free text gets added.
+  //
+  // These are dropped at CAPTURE time, so a reindex can never recover them for
+  // events already on disk. Anything omitted here is unattributable forever,
+  // which also means the corpus is mixed-shape: events captured before this
+  // will never carry these keys, and a consumer must read absence as "captured
+  // earlier", never as "no subagent".
   const copyKeys = [
     "session_id",
     "transcript_path",
@@ -24,6 +64,11 @@ export function buildStdinPreview(stdin: unknown): Record<string, unknown> {
     "tool_name",
     "stop_hook_active",
     "trigger",
+    "tool_use_id",
+    "prompt_id",
+    "agent_id",
+    "agent_type",
+    "source",
   ];
   for (const k of copyKeys) {
     if (o[k] !== undefined) out[k] = o[k];
