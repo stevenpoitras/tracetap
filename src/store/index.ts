@@ -415,7 +415,11 @@ const SORTABLE_COLUMNS = new Set([
 // content hash is unchanged, so a closed log keeps its old stamp forever
 // without this bump — and the stamp is now the primary hook join key, not just
 // the compaction-transcript key it used to be.
-const SCHEMA_VERSION = 9;
+// 10: count_tokens sizing probes are no longer indexed as requests. Same
+// reasoning as 9 — the rows already on disk were written by the old rule and
+// indexFile will not revisit a log whose content hash is unchanged, so without
+// a bump one real capture keeps 125 non-calls inside a session's waterfall.
+const SCHEMA_VERSION = 10;
 
 /**
  * How long after a `PreCompact` hook its compacted call may arrive, and how far
