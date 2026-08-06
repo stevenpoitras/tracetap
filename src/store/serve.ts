@@ -1311,10 +1311,16 @@ export async function handleRequest(
       const limit = firstParam(q.get("limit") ?? undefined);
       const since = firstParam(q.get("since") ?? undefined);
       const until = firstParam(q.get("until") ?? undefined);
+      // Free text NARROWS this list; it does not switch the page to a different
+      // one. `listSessions` has always supported the FTS filter — the dashboard
+      // just never sent it, so a query fell through to /api/search and the pane
+      // swapped eleven sortable columns for four unsortable ones.
+      const qtext = firstParam(q.get("q") ?? undefined);
       if (agent) filters.agent = agent;
       if (model) filters.model = model;
       if (project) filters.project = project;
       if (tool) filters.tool = tool;
+      if (qtext) filters.q = qtext;
       if (q.get("errored") === "1" || q.get("errored") === "true") filters.errored = true;
       if (sort) filters.sort = sort;
       if (order === "asc" || order === "desc") filters.order = order;

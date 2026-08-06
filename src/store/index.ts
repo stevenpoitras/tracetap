@@ -227,6 +227,30 @@ export interface SessionSummary {
    * nameless is honest where inventing a name would not be.
    */
   unnamedAgentCalls: number;
+  /**
+   * Why this session is in the result set, when the list was filtered by a
+   * free-text query — otherwise absent.
+   *
+   * Search does not get its own table. A query narrows the SAME session list
+   * the pane already shows, so the columns, the sort and the row identity all
+   * survive it; the evidence for the match rides inside the row instead of
+   * replacing it.
+   */
+  match?: SessionMatch;
+}
+
+/** The best-scoring matching step in a session, and how many steps matched. */
+export interface SessionMatch {
+  /** Number of steps in the session that matched the query. */
+  hits: number;
+  /** Step index of the best-scoring match — where a deep link should land. */
+  stepIndex: number;
+  /** One-line highlighted excerpt; matched terms are wrapped in `[...]`. */
+  snippet: string;
+  /** Which field the excerpt came from ("message", "tool-output", …). */
+  snippetField: string;
+  /** Tool called at the matching step, when it was a tool step. */
+  toolName: string;
 }
 
 /**
@@ -1332,6 +1356,62 @@ export class Store {
     return out;
   }
 
+  /**
+   * The best-scoring matching step in each of `sessionIds`, plus that session's
+   * total hit count, in ONE query.
+   *
+   * This is what lets a full-text query filter the session list instead of
+   * replacing it: {@link listSessions} already narrows to sessions containing
+   * the query, and this supplies the "why" for each surviving row.
+   *
+   * The CTE is `MATERIALIZED` deliberately. SQLite flattens a plain CTE into
+   * the enclosing aggregate, and `bm25()` is only legal in a direct query
+   * against the FTS table — flattened, this fails outright with "unable to use
+   * function bm25 in the requested context" (verified, not assumed).
+   * Materializing scores the rows first, so by the time `min()` sees `score` it
+   * is an ordinary column, and SQLite's bare-column rule for a lone `min()`
+   * returns the rest of the winning row alongside it. Lower bm25 is better, so
+   * `min` is the best match, not the worst.
+   */
+  private matchesFor(
+    sessionIds: string[],
+    query: string,
+  ): Map<string, SessionMatch> {
+    const out = new Map<string, SessionMatch>();
+    if (!sessionIds.length) return out;
+    const match = buildMatchExpr(query);
+    if (!match) return out;
+    const placeholders = sessionIds.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `WITH m AS MATERIALIZED (
+           SELECT session_id, step_index, role, message, reasoning,
+                  tool_name, tool_input, observation, bm25(steps_fts) AS score
+             FROM steps_fts
+            WHERE session_id IN (${placeholders}) AND steps_fts MATCH ?
+         )
+         SELECT session_id AS sessionId, COUNT(*) AS hits, min(score) AS score,
+                step_index AS stepIndex, role AS role, message AS message,
+                reasoning AS reasoning, tool_name AS toolName,
+                tool_input AS toolInput, observation AS observation
+           FROM m
+          GROUP BY session_id`,
+      )
+      .all(...sessionIds, match) as any[];
+    const tokens = snippetTokens(query);
+    for (const r of rows) {
+      const picked = pickSnippetField(r, "all");
+      out.set(String(r.sessionId), {
+        hits: Number(r.hits ?? 0),
+        stepIndex: Number(r.stepIndex ?? 0),
+        snippet: makeSnippet(picked.text, tokens),
+        snippetField: picked.field,
+        toolName: String(r.toolName ?? ""),
+      });
+    }
+    return out;
+  }
+
   listSessions(filters: SessionListFilters = {}): SessionSummary[] {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
@@ -1434,6 +1514,12 @@ export class Store {
     const ids = rows.map((r) => String(r.sessionId));
     const titles = this.titlesFor(ids);
     const casts = this.agentCastFor(ids);
+    // Only when a query is in play: an unfiltered list has no match to explain,
+    // and this is a second FTS pass nobody should pay for by default.
+    const matches =
+      filters.q && filters.q.trim()
+        ? this.matchesFor(ids, filters.q)
+        : new Map<string, SessionMatch>();
     return rows.map((r): SessionSummary => {
       let toolHistogram: Record<string, number> = {};
       try {
@@ -1442,6 +1528,7 @@ export class Store {
       } catch {
         // leave empty
       }
+      const match = matches.get(String(r.sessionId));
       return {
         sessionId: String(r.sessionId),
         agent: String(r.agent ?? ""),
@@ -1462,6 +1549,7 @@ export class Store {
         sourcePath: String(r.sourcePath ?? ""),
         turns: Number(r.turns ?? 0),
         errorCount: Number(r.errorCount ?? 0),
+        ...(match ? { match } : {}),
       };
     });
   }

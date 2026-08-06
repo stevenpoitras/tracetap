@@ -3247,6 +3247,23 @@ button.jr-bk:focus-visible { outline: 1px solid var(--bright); outline-offset: 2
   color: var(--dim);
   font-size: var(--fs-200);
 }
+/* Match evidence under the title, only present while a query is. Clamped to one
+   line for the same reason `.s-ask` is: a row's height must not depend on how
+   verbose the matching step happened to be, or a search turns a scannable list
+   into a ragged one. */
+.s-match {
+  display: block;
+  margin-top: 2px;
+  color: var(--dim);
+  font-size: var(--fs-200);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.s-match b {
+  color: var(--accent);
+  font-weight: 500;
+}
 
 /* -- analytics layout ----------------------------------------------------- */
 /* Twelve columns, so a block can claim the width it actually wants instead of
