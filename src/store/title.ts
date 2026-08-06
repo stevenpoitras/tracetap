@@ -53,7 +53,41 @@ const NOISE_PREFIXES = [
   // Emitted into the parent's transcript when a subagent returns.
   "subagent has finished and is handing back control",
   "<user-prompt-submit-hook>",
+  // Written when a turn is cancelled. It is the HARNESS narrating the cancel,
+  // not the user, and it titled 2 of 82 live main-thread sessions — in both
+  // cases burying a real ask that came a few steps later ("you should be
+  // searching in the filesystem as well…").
+  "[request interrupted by user]",
+  // Claude Code's own next-prompt suggestion scaffolding.
+  "[suggestion mode:",
+  // A WebFetch result echoed back as a user message; titled 1 session
+  // "Web page content: --- > ## Documentation Index > Fetch the complete…".
+  "web page content:",
 ];
+
+/**
+ * The output-style banner Claude Code re-injects on nearly every turn
+ * ("Learning output style is active. Remember to follow the specific guidelines
+ * for this style."). Matched on the frame rather than listed per style, because
+ * the set of styles is open — a custom style would otherwise slip through. It
+ * titled 2 of 82 live main-thread sessions, and appeared 4+ times in one.
+ *
+ * Tested CASE-SENSITIVELY, like {@link HOOK_OUTPUT}: the style name is
+ * capitalized, and that capital is the only thing separating this from a person
+ * writing "the output style is active but wrong, please fix".
+ */
+const OUTPUT_STYLE_BANNER = /^[A-Z][\w -]* output style is active\b/;
+
+/**
+ * A mid-turn interjection, and the words the user actually typed inside it.
+ *
+ * Claude Code splices these in as
+ * `The user sent a new message while you were working: <words>` followed by a
+ * paragraph of explanation addressed to the model. Capturing group 1 is the
+ * user's own text with that trailing explanation removed.
+ */
+const INTERJECTION =
+  /^the user sent a new message while you were working:\s*([\s\S]*?)(?:\s*this is how claude code surfaces|$)/i;
 
 /**
  * Injected-file preambles. Claude Code splices rules and CLAUDE.md files into
@@ -160,8 +194,60 @@ export function isNoiseStep(raw: string): boolean {
   if (NOISE_EXACT.has(lower)) return true;
   if (INJECTED_FILE.test(lower)) return true;
   if (TOOL_ECHO.test(lower)) return true;
+  if (OUTPUT_STYLE_BANNER.test(text)) return true;
   if (HOOK_OUTPUT.test(text)) return true;
   return NOISE_PREFIXES.some((p) => lower.startsWith(p));
+}
+
+/**
+ * The user's own words out of a mid-turn interjection, or "" if this step is
+ * not one.
+ *
+ * Interjections stay on the noise list for the FIRST pass — an aside inside a
+ * running turn is not the ask a session exists to answer, and preferring one
+ * would have titled a session "proud of you!". But when a session contains no
+ * standalone ask at all, the aside is the only human text in it, and "the user
+ * typed this, mid-turn" beats an empty row. Two of 82 live main-thread sessions
+ * are titled only by this, and both had been showing
+ * "[Request interrupted by user]" or nothing.
+ */
+export function interjectionText(raw: string): string {
+  const { text, isToolResult } = unwrap(raw);
+  if (isToolResult || !text) return "";
+  const m = INTERJECTION.exec(text);
+  return m ? m[1].trim() : "";
+}
+
+/**
+ * A role-assignment preamble: "You are an INDEPENDENT REVIEWER for PR #390 in
+ * the repo at /Users/sp/Documents/git/eMachina (GitHub:…".
+ *
+ * These ARE the ask — a `claude -p` run is driven by one, and 9 of 82 live
+ * main-thread sessions open with one — but only the opening clause carries the
+ * job. The rest is setup, and at 120 characters it crowds the job out entirely:
+ * six sessions read identically as "You are running the `curate` skill, which
+ * is at ./skill/SKILL.md (read it and its refe…". Clipped to the first sentence
+ * they become distinguishable again.
+ */
+const ROLE_PROMPT = /^you are\b/i;
+
+/**
+ * How much of a role prompt to keep. Only applies when the prompt has no
+ * sentence break to cut at — a complete opening sentence is kept whole because
+ * it already names the job ("You are summarizing a Claude Code session for a
+ * daily memory log."). Without one, a tighter clip is what pulls the
+ * distinguishing part into view: at 120 characters six `curate` runs read
+ * identically, at 64 they do not.
+ */
+const ROLE_TITLE_MAX = 64;
+
+/** Clip a role prompt to its opening sentence, or failing that, tightly. */
+function roleTitle(text: string, max: number): string {
+  const end = /[.?!](?:\s|$)/.exec(text);
+  // The offset floor keeps an abbreviation in the first few words ("You are
+  // Dr. Foo's reviewer") from cutting the title down to nothing.
+  if (end && end.index >= 12) return clipTitle(text.slice(0, end.index + 1), max);
+  return clipTitle(text, Math.min(max, ROLE_TITLE_MAX));
 }
 
 /** Collapse to one line and clip on a word boundary where one is near. */
@@ -178,18 +264,60 @@ export function clipTitle(text: string, max = 120): string {
 /**
  * The session's title: the first user step that is an actual ask.
  *
+ * Resolved in two passes, best evidence first:
+ *
+ *  1. The first standalone ask — a user step that survives the noise skip list.
+ *  2. Failing that, the first mid-turn interjection's text. Still the user's
+ *     own words, just spliced into a running turn rather than opening one.
+ *
  * @param userMessages raw `message` column values for the session's user-role
  *   steps, in transcript order.
- * @returns the clipped ask, or `""` when the session contains none — which is a
- *   real state (permission-hook fan-outs record one shared instruction and no
- *   human ask at all) and must not be papered over with a placeholder.
+ * @returns the clipped ask, or `""` when the session contains no human text at
+ *   all — a real state (a permission-hook fan-out records one shared
+ *   instruction and nothing typed) that must not be papered over with an
+ *   invented placeholder. Measured on 82 live main-thread sessions: 75 resolve
+ *   in pass 1, 2 in pass 2, 5 genuinely have nothing.
  */
 export function sessionTitle(userMessages: string[], max = 120): string {
   for (const raw of userMessages) {
     if (!raw || isNoiseStep(raw)) continue;
     const { text } = unwrap(raw);
     if (!text) continue;
-    return clipTitle(text, max);
+    return ROLE_PROMPT.test(text) ? roleTitle(text, max) : clipTitle(text, max);
+  }
+  for (const raw of userMessages) {
+    if (!raw) continue;
+    const said = interjectionText(raw);
+    if (said) return clipTitle(said, max);
   }
   return "";
+}
+
+/**
+ * What a session DID, for the sessions that contain nothing anyone typed.
+ *
+ * Six of 82 live main-thread sessions have no human text at all — a rescue
+ * sweep that is 82 steps of `Bash` and `mcp__emachina__get`, a hook fan-out
+ * carrying one shared instruction. "untitled session" says only that the title
+ * lookup failed; the tool mix says what the session was actually for, and it is
+ * measured rather than invented.
+ *
+ * Deliberately NOT sentence-shaped — `Bash ×34 · Read ×12` cannot be mistaken
+ * for something a person asked for, which is the whole reason a placeholder was
+ * refused here in the first place.
+ *
+ * @returns the top tools by call count, or `""` when the session called none —
+ *   at which point there genuinely is nothing to say.
+ */
+export function activityTitle(
+  toolHistogram: Record<string, number> | undefined,
+  topN = 3,
+): string {
+  const tools = Object.entries(toolHistogram ?? {})
+    .filter(([name, n]) => name && Number(n) > 0)
+    // Count first, then name, so the label is stable across equal counts.
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, topN);
+  if (!tools.length) return "";
+  return tools.map(([name, n]) => `${name} ×${n}`).join(" · ");
 }

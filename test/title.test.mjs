@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { sessionTitle, isNoiseStep, clipTitle } from "../dist/store/title.js";
+import { activityTitle, sessionTitle, isNoiseStep, clipTitle } from "../dist/store/title.js";
 
 // Every rejection test is paired with a positive twin: an empty title is also
 // what an inert fixture produces, so a bare negative assertion cannot tell
@@ -168,4 +168,88 @@ test("an injected rules/CLAUDE.md file is configuration, not an ask", () => {
   // Twin: prose that merely opens with those words is still an ask, which is
   // why this is a pattern on an absolute path rather than a bare prefix.
   assert.equal(isNoiseStep("Contents of the report should be summarised"), false);
+});
+
+// -- shapes measured on the 82 live main-thread sessions --------------------
+
+test("the cancel marker is the harness narrating, not the user", () => {
+  assert.equal(isNoiseStep("[Request interrupted by user]"), true);
+  // Twin: this is the real shape from claude:7d1305b6, where the marker sat
+  // between two genuine messages and used to win the title outright.
+  assert.equal(
+    sessionTitle([
+      "[Request interrupted by user] ",
+      "you should be searching in the filesystem as well",
+    ]),
+    "you should be searching in the filesystem as well",
+  );
+});
+
+test("the output-style banner is skipped for any style name", () => {
+  assert.equal(isNoiseStep("Learning output style is active. Remember to follow…"), true);
+  assert.equal(isNoiseStep("Explanatory output style is active. Remember to follow…"), true);
+  // Matched on the frame, so a style that did not exist when this was written
+  // is skipped too.
+  assert.equal(isNoiseStep("Socratic Tutor output style is active. Remember…"), true);
+  // Twin: prose about output styles is still an ask.
+  assert.equal(isNoiseStep("the output style is active but wrong, please fix"), false);
+});
+
+test("a fetched web page echoed back is not an ask", () => {
+  assert.equal(isNoiseStep(" Web page content: --- > ## Documentation Index"), true);
+  // Twin: the prefix carries the colon, so prose that merely opens with those
+  // words is untouched.
+  assert.equal(isNoiseStep("Web page content is missing from the report"), false);
+  // Twin: the skip does not swallow a following ask.
+  assert.equal(
+    sessionTitle(["Web page content: --- > ## Docs", "summarise that page"]),
+    "summarise that page",
+  );
+});
+
+test("a mid-turn interjection titles a session that has nothing else", () => {
+  const aside =
+    "The user sent a new message while you were working: are you checking the messages?\n\n" +
+    "This is how Claude Code surfaces messages the user sends mid-turn — within the running turn.";
+  // Pass 1 still prefers a standalone ask, so the aside does NOT win here.
+  assert.equal(sessionTitle([aside, "rewrite the parser"]), "rewrite the parser");
+  // Pass 2: with no standalone ask, the user's own words beat an empty row —
+  // and the explanation addressed to the model is stripped off.
+  assert.equal(sessionTitle([aside]), "are you checking the messages?");
+  // It is still noise for pass 1, which is what makes the ordering above hold.
+  assert.equal(isNoiseStep(aside), true);
+});
+
+test("a role-assignment prompt is clipped to the clause naming the job", () => {
+  assert.equal(
+    sessionTitle([
+      "You are an INDEPENDENT REVIEWER for PR #390 in the repo at /Users/sp/Documents/git/eMachina (GitHub: x/y)",
+    ]),
+    "You are an INDEPENDENT REVIEWER for PR #390 in the repo at…",
+  );
+  assert.equal(
+    sessionTitle(["You are summarizing a Claude Code session for a daily memory log. Read the conversation…"]),
+    "You are summarizing a Claude Code session for a daily memory log.",
+  );
+  // An ordinary ask is untouched by the clipping — it only applies to the
+  // role frame, so a normal sentence keeps everything up to the 120-char clip.
+  assert.equal(
+    sessionTitle(["Fix the login bug. It fails on empty passwords."]),
+    "Fix the login bug. It fails on empty passwords.",
+  );
+  // A role prompt with no break is returned whole rather than truncated away.
+  assert.equal(sessionTitle(["You are a careful reviewer"]), "You are a careful reviewer");
+});
+
+test("activityTitle names the tool mix, ordered by count then name", () => {
+  assert.equal(
+    activityTitle({ Read: 12, Bash: 34, Grep: 9, Edit: 1 }),
+    "Bash ×34 · Read ×12 · Grep ×9",
+  );
+  // Ties break on name so the label is stable between reads.
+  assert.equal(activityTitle({ Zed: 5, Ack: 5 }, 2), "Ack ×5 · Zed ×5");
+  // Nothing to say is still nothing to say — no invented placeholder.
+  assert.equal(activityTitle({}), "");
+  assert.equal(activityTitle({ Bash: 0 }), "");
+  assert.equal(activityTitle(undefined), "");
 });
