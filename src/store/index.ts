@@ -2318,13 +2318,26 @@ export class Store {
     return { indexedTotal: total?.n ?? 0, claudeSessionId, ownerSessionId, conversationHookCount };
   }
 
-  /** Build the Flow graph for one session (steps + hooks + requests). */
+  /**
+   * Build the Flow graph for one session (steps + hooks + requests).
+   *
+   * Hooks are read conversation-scoped so a non-owner group is not starved by
+   * the ownership election, then bounded to this session's own window. Both
+   * halves are load-bearing: without the first a sibling group's Flow has no
+   * hooks at all, and without the second it has ALL of them. A conversation
+   * can span 24 hours across 48 groups while one of those groups covers 0.0
+   * seconds, and `deriveFlow` deliberately drains every hook it is handed —
+   * so an unbounded read turned a 7-node graph into a 7,911-node, 5 MB one and
+   * asserted that events hours outside the window happened inside it.
+   */
   sessionFlow(sessionId: string): FlowGraph {
+    const session = this.getSession(sessionId);
+    const slack = 600; // same ±10 min the hook time join allows for lagging calls
+    const lo = session && session.startedAt > 0 ? session.startedAt - slack : -Infinity;
+    const hi = session && session.endedAt > 0 ? session.endedAt + slack : Infinity;
     return deriveFlow({
       steps: this.listSteps(sessionId),
-      // Conversation-scoped, not owner-scoped: Flow describes what happened
-      // during THIS session, and a non-owner group still fired hooks.
-      hooks: this.listHooksForConversation(sessionId),
+      hooks: this.listHooksForConversation(sessionId).filter((h) => h.ts >= lo && h.ts <= hi),
       requests: this.listRequests(sessionId),
     });
   }

@@ -1112,32 +1112,59 @@ test("only one wire session owns a conversation's hooks", () => {
   }
 });
 
-test("an older schema drops the watermark so closed logs are re-stamped", () => {
+test("bumping past schema 8 re-stamps a closed log with the majority uuid", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-schema-"));
   try {
     const claudeDir = path.join(dir, "proj", ".claude-trace");
     fs.mkdirSync(claudeDir, { recursive: true });
-    fs.copyFileSync(
-      path.join(TRAJ_FIX, "claude-tooluse.jsonl"),
+    const minority = "cccccccc-0000-0000-0000-000000000000";
+    const majority = "dddddddd-0000-0000-0000-000000000000";
+    const base = fs
+      .readFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), "utf-8")
+      .trim()
+      .split("\n");
+    const stamp = (line, uuid) => {
+      const p = JSON.parse(line);
+      p.request.headers = { ...(p.request.headers || {}), "x-claude-code-session-id": uuid };
+      return JSON.stringify(p);
+    };
+    fs.writeFileSync(
       path.join(claudeDir, "claude.jsonl"),
+      [stamp(base[0], minority), stamp(base[1], majority), stamp(base[1], majority)].join("\n") +
+        "\n",
     );
+
     const dbPath = path.join(dir, "index.db");
     let s = new Store(dbPath);
     s.indexPaths([path.join(dir, "proj")]);
-    assert.ok(s.listSessions({}).length >= 1);
-    // `claude_session_id` is written only inside indexFile, which returns early
-    // when a log's content hash is unchanged. So a stamping change reaches a
-    // closed log ONLY through the schema-version wipe — without it the old
-    // value survives forever, which is the whole reason SCHEMA_VERSION moved.
-    s.db.prepare("UPDATE meta SET value = '1' WHERE key = 'schema_version'").run();
+    const sessionId = s.listSessions({ agent: "claude" })[0].sessionId;
+    // Simulate a database written by the OLD build: schema 8, and the stamp the
+    // old first-seen rule would have produced. The log never changes again, and
+    // `indexFile` returns early on an unchanged content hash — so nothing but a
+    // version bump can ever correct it. Seed 8 specifically: seeding some other
+    // number tests the pre-existing wipe rather than this bump.
+    s.db.prepare("UPDATE sessions SET claude_session_id = ?").run(minority);
+    s.db.prepare("UPDATE meta SET value = '8' WHERE key = 'schema_version'").run();
     s.close();
 
     s = new Store(dbPath);
-    const files = s.db.prepare("SELECT count(*) AS n FROM files").get();
-    assert.equal(files.n, 0, "stale watermark dropped, so the next index re-parses");
+    assert.equal(
+      s.db.prepare("SELECT count(*) AS n FROM files").get().n,
+      0,
+      "schema 8 is stale, so the watermark is dropped and the log re-parses",
+    );
     const res = s.indexPaths([path.join(dir, "proj")]);
-    assert.ok(res.filesIndexed >= 1, "the log is re-indexed rather than skipped");
-    assert.ok(s.listSessions({}).length >= 1, "and the sessions come back");
+    assert.ok(res.filesIndexed >= 1, "re-indexed rather than skipped");
+    assert.equal(
+      s.claudeSessionId(sessionId),
+      majority,
+      "the closed log picks up majority stamping — the whole point of the bump",
+    );
+    assert.equal(
+      s.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value,
+      "9",
+      "and the database records the version that did it",
+    );
     s.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -1287,6 +1314,45 @@ test("Flow and compaction triggers read the conversation, not just the elected o
       flow.nodes.some((n) => n.kind === "hook"),
       "sibling's Flow graph still carries the conversation's hook nodes",
     );
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Flow is bounded to the session window, not the whole conversation", () => {
+  const uuid = "eeeeeeee-0000-0000-0000-000000000000";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-flowbound-", uuid);
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    // Same conversation, but a day past this session's window. A conversation
+    // can span 24 hours across 48 groups while one group covers 0.0 seconds,
+    // and deriveFlow drains every hook it is handed — so reading the whole
+    // conversation unbounded turned a 7-node graph into a 7,911-node, 5 MB one
+    // and claimed events hours outside the window happened inside it.
+    const far = (session.startedAt + 86400) * 1000;
+    writeHookLog(
+      hooksDir,
+      "far.jsonl",
+      Array.from({ length: 50 }, (_, i) =>
+        hookEvent({
+          session_id: uuid,
+          ts: new Date(far + i * 1000).toISOString(),
+          event: "PreToolUse",
+          hook_name: "far",
+        }),
+      ),
+    );
+    // ...and one inside the window, which must survive.
+    writeHookLog(hooksDir, "near.jsonl", [hookEvent({ session_id: uuid, hook_name: "near" })]);
+    s.indexHooks(hooksDir);
+
+    // The pane still lists the conversation's hooks — the bound is Flow's.
+    assert.equal(s.listHooksForSession(session.sessionId).length, 51);
+
+    const hookNodes = s.sessionFlow(session.sessionId).nodes.filter((n) => n.kind === "hook");
+    assert.equal(hookNodes.length, 1, "only the in-window hook becomes a flow node");
   } finally {
     s.close();
     fs.rmSync(dir, { recursive: true, force: true });
