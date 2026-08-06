@@ -286,6 +286,73 @@ test("GET /api/sessions honors substring filters", async () => {
   assert.equal(none.count, 0);
 });
 
+test("GET /api/sessions?q filters the same list instead of replacing it", async () => {
+  const all = JSON.parse((await get("/api/sessions")).text);
+  const hit = JSON.parse((await get("/api/sessions?q=foo.txt")).text);
+
+  assert.ok(hit.count >= 1, "expected at least one session mentioning foo.txt");
+  assert.ok(
+    hit.count < all.count,
+    `a query must narrow the list (${hit.count} of ${all.count})`,
+  );
+
+  // Same row shape as the unqueried list — this is what lets one table serve
+  // both, so a missing column here is the regression the feature exists to stop.
+  for (const key of [
+    "sessionId",
+    "agent",
+    "model",
+    "projectCwd",
+    "startedAt",
+    "durationMs",
+    "turns",
+    "totalInTokens",
+    "totalOutTokens",
+    "cacheRead",
+    "errorCount",
+    "costUsd",
+  ]) {
+    assert.ok(key in hit.sessions[0], `queried session should expose '${key}'`);
+  }
+
+  // …plus the evidence for the match, which only a query produces.
+  const m = hit.sessions[0].match;
+  assert.ok(m, "a queried session should carry its match");
+  assert.ok(m.hits >= 1, "match should count the matching steps");
+  assert.equal(typeof m.stepIndex, "number");
+  assert.match(m.snippet, /\[/, "snippet should carry highlight markers");
+  assert.ok(
+    !("match" in all.sessions[0]),
+    "an unqueried session must not carry a match",
+  );
+
+  const miss = JSON.parse((await get("/api/sessions?q=zzznosuchterm")).text);
+  assert.equal(miss.count, 0);
+});
+
+test("GET /api/sessions?q still honors sort, order and other filters", async () => {
+  const desc = JSON.parse(
+    (await get("/api/sessions?q=foo.txt&sort=started_at&order=desc")).text,
+  );
+  const asc = JSON.parse(
+    (await get("/api/sessions?q=foo.txt&sort=started_at&order=asc")).text,
+  );
+  assert.equal(desc.count, asc.count);
+  assert.deepEqual(
+    desc.sessions.map((s) => s.sessionId),
+    asc.sessions.map((s) => s.sessionId).reverse(),
+    "reversing the order must reverse the same rows, not fetch different ones",
+  );
+  const starts = desc.sessions.map((s) => s.startedAt);
+  assert.deepEqual(starts, [...starts].sort((a, b) => b - a));
+
+  // A query composes with the structured filters rather than displacing them.
+  const both = JSON.parse(
+    (await get("/api/sessions?q=foo.txt&agent=doesnotexist")).text,
+  );
+  assert.equal(both.count, 0);
+});
+
 test("GET /api/search returns a hit for a known term", async () => {
   const r = await get("/api/search?q=foo.txt");
   assert.equal(r.status, 200);

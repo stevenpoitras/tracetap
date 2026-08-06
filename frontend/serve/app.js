@@ -2256,6 +2256,10 @@
 
   function sessionParams() {
     var p = new URLSearchParams();
+    // The query is a FILTER like any other, so it rides with every re-query —
+    // including the ones a sort click makes. Sorting a search result used to be
+    // impossible because search had its own endpoint and its own table.
+    if (sess.q) p.set("q", sess.q);
     if (sess.agent) p.set("agent", sess.agent);
     if (sess.model) p.set("model", sess.model);
     if (sess.project) p.set("project", sess.project);
@@ -2265,7 +2269,6 @@
 
   function loadSessionData() {
     if (!document.getElementById("rows")) return;
-    if (sess.q) return loadSearchHits();
     renderSessionHead();
     var p = sessionParams();
     p.set("sort", sess.sort);
@@ -2273,12 +2276,31 @@
     fetchJSON("/api/sessions?" + p)
       .then(function (data) {
         var meta = document.getElementById("meta");
-        if (meta)
-          meta.textContent =
-            data.count + " session" + (data.count === 1 ? "" : "s");
+        if (meta) meta.textContent = sessionMetaText(data);
         renderSessionRows(data.sessions);
       })
       .catch(fail);
+  }
+
+  // "83 sessions" unqueried; "12 sessions · 214 hits for “mcp”" under a query.
+  // The session count leads either way — it is the same list being counted, and
+  // saying so is what makes the query read as a filter rather than a mode.
+  function sessionMetaText(data) {
+    var base = data.count + " session" + (data.count === 1 ? "" : "s");
+    if (!sess.q) return base;
+    var hits = (data.sessions || []).reduce(function (n, s) {
+      return n + ((s.match && s.match.hits) || 0);
+    }, 0);
+    return (
+      base +
+      " · " +
+      hits +
+      " hit" +
+      (hits === 1 ? "" : "s") +
+      " for “" +
+      sess.q +
+      "”"
+    );
   }
 
   function renderSessionHead() {
@@ -2332,8 +2354,9 @@
     if (!sessions.length) {
       rows.innerHTML = "";
       empty.style.display = "block";
-      empty.innerHTML =
-        "No indexed sessions. Capture with <code>tracetap claude|codex|gemini</code>, then run <code>tracetap index</code>.";
+      empty.innerHTML = sess.q
+        ? "No sessions match “" + esc(sess.q) + "”."
+        : "No indexed sessions. Capture with <code>tracetap claude|codex|gemini</code>, then run <code>tracetap index</code>.";
       return;
     }
     empty.style.display = "none";
@@ -2342,12 +2365,16 @@
         return (
           '<tr class="click" data-id="' +
           esc(s.sessionId) +
-          '">' +
+          '"' +
+          (s.match ? ' data-step="' + s.match.stepIndex + '"' : "") +
+          ">" +
           '<td class="s-title"><span class="s-ask">' +
           esc(s.title || "untitled session") +
           '</span><span class="s-meta">' +
           esc(s.model || "—") +
-          "</span></td>" +
+          "</span>" +
+          matchLine(s.match) +
+          "</td>" +
           '<td class="dim" title="' +
           esc(s.projectCwd) +
           '">' +
@@ -2386,84 +2413,27 @@
       .join("");
     rows.querySelectorAll("tr[data-id]").forEach(function (tr) {
       tr.addEventListener("click", function () {
+        // Under a query the row knows which step matched, so the click lands on
+        // the evidence rather than at the top of a 300-step transcript.
+        var step = tr.getAttribute("data-step");
         location.hash =
-          "#session/" + encodeURIComponent(tr.getAttribute("data-id"));
+          "#session/" +
+          encodeURIComponent(tr.getAttribute("data-id")) +
+          (step ? "/step-" + step : "");
       });
     });
   }
 
-  function loadSearchHits() {
-    var p = sessionParams();
-    p.set("q", sess.q);
-    p.set("limit", "50");
-    fetchJSON("/api/search?" + p)
-      .then(function (data) {
-        var meta = document.getElementById("meta");
-        if (meta)
-          meta.textContent =
-            data.count +
-            " hit" +
-            (data.count === 1 ? "" : "s") +
-            " for “" +
-            sess.q +
-            "”";
-        var head = document.getElementById("head");
-        head.innerHTML =
-          "<th>Session</th><th>Model</th><th>Match</th><th>When</th>";
-        var rows = document.getElementById("rows");
-        var empty = document.getElementById("empty");
-        if (!data.hits.length) {
-          rows.innerHTML = "";
-          empty.style.display = "block";
-          empty.textContent = "No matches.";
-          return;
-        }
-        empty.style.display = "none";
-        rows.innerHTML = data.hits
-          .map(function (h) {
-            var snip = esc(h.snippet).replace(/\[([^\]]*)\]/g, "<b>$1</b>");
-            return (
-              '<tr class="click" data-id="' +
-              esc(h.sessionId) +
-              '" data-step="' +
-              h.stepIndex +
-              '">' +
-              "<td>" +
-              agentPill(h.agent) +
-              ' <span class="pill">#' +
-              h.stepIndex +
-              "</span>" +
-              (h.errored ? ' <span class="pill err">errored</span>' : "") +
-              "</td>" +
-              "<td>" +
-              esc(h.model) +
-              "</td>" +
-              '<td><div class="snippet">' +
-              snip +
-              "</div>" +
-              (h.toolName
-                ? '<div class="hash">↳ ' + esc(h.toolName) + "</div>"
-                : "") +
-              "</td>" +
-              '<td class="dim">' +
-              fmtTime(h.startedAt) +
-              "</td>" +
-              "</tr>"
-            );
-          })
-          .join("");
-        rows.querySelectorAll("tr[data-id]").forEach(function (tr) {
-          tr.addEventListener("click", function () {
-            // Deep-link straight to the matching transcript step.
-            location.hash =
-              "#session/" +
-              encodeURIComponent(tr.getAttribute("data-id")) +
-              "/step-" +
-              tr.getAttribute("data-step");
-          });
-        });
-      })
-      .catch(fail);
+  // The match evidence, folded into the SESSION cell. Deliberately NOT its own
+  // column: a column that is empty whenever the box is empty would make the
+  // table's shape depend on the query, which is the thing being fixed here.
+  function matchLine(m) {
+    if (!m || !m.snippet) return "";
+    var snip = esc(m.snippet).replace(/\[([^\]]*)\]/g, "<b>$1</b>");
+    var hits =
+      m.hits > 1 ? '<span class="pill">' + m.hits + " hits</span> " : "";
+    var where = m.toolName ? '<span class="hash">↳ ' + esc(m.toolName) + "</span> " : "";
+    return '<span class="s-match">' + hits + where + snip + "</span>";
   }
 
   // -------------------------------------------------------- session detail
