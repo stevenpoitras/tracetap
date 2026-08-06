@@ -6870,7 +6870,10 @@
     else if (e.key === "Enter" && focusedRow()) {
       e.preventDefault();
       activateCursor();
-    } else if (e.key >= "1" && e.key <= "6")
+    } else if (e.key >= "1" && e.key <= "9" && Number(e.key) <= TABS.length)
+      // Bound comes from TABS, not a literal. Folding #usage into analytics
+      // left this reading `<= "6"` against five tabs, so 6 navigated to
+      // "#undefined" and dropped you on a dead route.
       location.hash = "#" + TABS[Number(e.key) - 1];
     else if (e.key === "?") toggleHelp();
     else if (e.key === "Escape") {
