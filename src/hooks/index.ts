@@ -12,6 +12,7 @@ export {
   outcomeFor,
 } from "./tap";
 export { runHooksCli, installSnippet, runHooksInstall, runHooksStatus } from "./cli";
+export type { InstallOptions } from "./cli";
 export {
   discoverHooks,
   findHookFiles,
@@ -24,4 +25,4 @@ export {
   trackSettings,
   uninstallTracking,
 } from "./configure";
-export type { TrackMode, TrackResult, UninstallResult } from "./configure";
+export type { TrackMode, TrackOptions, TrackResult, UninstallResult } from "./configure";

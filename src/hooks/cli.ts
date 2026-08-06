@@ -30,15 +30,22 @@ SUBCOMMANDS:
   discover [path] [--json]
                     Scan a repo for hooks.json / settings hooks and list them.
 
-  track [path] [--all | --ids <id,id>] [--mode inject|settings] [--yes]
+  track [path] [--all | --ids <id,id>] [--mode inject|settings] [--full] [--yes]
                     Wrap selected discovered hooks through \`tracetap hooks tap\`.
                     Default mode=inject rewrites the source hooks.json (single
-                    fire, full returned payload). settings mode merges into
-                    ~/.claude/settings.json (can double-fire with plugins).
+                    fire, and the hook's full returned stdout is captured).
+                    settings mode merges into ~/.claude/settings.json (can
+                    double-fire with plugins). --full also records what each
+                    hook was *given* — see \`install --full\` below.
                     Without --all/--ids/--yes, prompts interactively.
 
-  install           Install generic observe-only taps into ~/.claude/settings.json
+  install [--full]  Install generic observe-only taps into ~/.claude/settings.json
                     (events fire with empty allow — good baseline visibility).
+                    --full adds --full to every installed tap, storing the whole
+                    hook stdin (prompt text, tool inputs, file contents) in the
+                    log. Off by default: that is the payload the observatory
+                    shows, but it is also the most sensitive thing tracetap can
+                    write to disk. Opt in when you need it.
 
   uninstall [--restore [path]]
                     Remove tracetap tap wrappers from ~/.claude/settings.json.
@@ -61,7 +68,10 @@ IMPORTANT:
   settings / plugin hooks.json until you run \`tracetap hooks uninstall\`.
 
 ENV:
-  TRACETAP_HOOK_FULL=1   Include full stdin payload on each event
+  TRACETAP_HOOK_FULL=1   Include full stdin payload on each event. Global
+                         equivalent of --full; set at install/track time it is
+                         also baked into the commands they write, so capture
+                         survives shells that never export it.
   TRACETAP_HOOKS_DIR     Override ~/.tracetap/hooks
 `;
 
@@ -69,79 +79,95 @@ function hooksDir(): string {
   return process.env.TRACETAP_HOOKS_DIR?.trim() || defaultHooksDir();
 }
 
+/**
+ * True when full-payload capture was asked for, by flag or by env.
+ *
+ * The env var already forces payload capture at tap runtime (see tap.ts), so a
+ * writer that ignored it here would emit commands that behave one way in the
+ * installing shell and another way under Claude Code. Folding it in keeps the
+ * two spellings of the same request identical.
+ */
+function wantsFullPayload(flag: boolean): boolean {
+  if (flag) return true;
+  const env = process.env.TRACETAP_HOOK_FULL;
+  return env === "1" || env === "true";
+}
+
 function settingsPath(): string {
   return path.join(os.homedir(), ".claude", "settings.json");
 }
 
-/** Suggested UserPromptSubmit + Stop tap wrappers (non-destructive install). */
-export function installSnippet(tracetapBin = "tracetap"): object {
-  return {
-    hooks: {
-      UserPromptSubmit: [
-        {
-          hooks: [
-            {
-              type: "command",
-              command: `${tracetapBin} hooks tap --name posture-observe --event UserPromptSubmit -- true`,
-              timeout: 10,
-            },
-          ],
-        },
-      ],
-      PreToolUse: [
-        {
-          hooks: [
-            {
-              type: "command",
-              command: `${tracetapBin} hooks tap --name pre-tool-observe --event PreToolUse -- true`,
-              timeout: 10,
-            },
-          ],
-        },
-      ],
-      PostToolUse: [
-        {
-          hooks: [
-            {
-              type: "command",
-              command: `${tracetapBin} hooks tap --name post-tool-observe --event PostToolUse -- true`,
-              timeout: 10,
-            },
-          ],
-        },
-      ],
-      Stop: [
-        {
-          hooks: [
-            {
-              type: "command",
-              command: `${tracetapBin} hooks tap --name stop-observe --event Stop -- true`,
-              timeout: 10,
-            },
-          ],
-        },
-      ],
-    },
-  };
+/** Events installed by `hooks install`, with the tap label used for each. */
+const INSTALL_TAPS: ReadonlyArray<{ event: string; name: string }> = [
+  { event: "UserPromptSubmit", name: "posture-observe" },
+  { event: "PreToolUse", name: "pre-tool-observe" },
+  { event: "PostToolUse", name: "post-tool-observe" },
+  { event: "Stop", name: "stop-observe" },
+  // Compaction is the one context event the wire cannot explain on its own: the
+  // request bodies show that items vanished, never why. PreCompact carries the
+  // trigger (Claude Code matches it as `manual` vs `auto`), which is the
+  // difference between "the user typed /compact" and "the harness hit a limit".
+  { event: "PreCompact", name: "pre-compact-observe" },
+  { event: "PostCompact", name: "post-compact-observe" },
+];
+
+export interface InstallOptions {
+  /**
+   * Emit `--full` on every installed tap so the whole hook stdin is stored.
+   *
+   * Opt-in, not default. These taps wrap the no-op `true`, so stdin is the only
+   * payload they can record — but that stdin is prompt text, tool inputs and
+   * file contents, written unredacted into a shared local store that outlives
+   * `tracetap serve`. A baseline install anyone can run should not silently
+   * start archiving that; the user asks for it with --full (or the env var).
+   */
+  full?: boolean;
 }
 
-function deepMergeHooks(target: any, source: any): any {
+/** Suggested observe-only tap wrappers (non-destructive install). */
+export function installSnippet(tracetapBin = "tracetap", opts: InstallOptions = {}): object {
+  const full = opts.full ? " --full" : "";
+  const hooks: Record<string, unknown> = {};
+  for (const { event, name } of INSTALL_TAPS) {
+    hooks[event] = [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: `${tracetapBin} hooks tap --name ${name} --event ${event}${full} -- true`,
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+  }
+  return { hooks };
+}
+
+function deepMergeHooks(target: any, source: any): { merged: any; addedEvents: string[] } {
   const out = { ...(target || {}) };
   const th = { ...(out.hooks || {}) };
   const sh = source.hooks || {};
+  const addedEvents: string[] = [];
   for (const [event, matchers] of Object.entries(sh)) {
     const existing = Array.isArray(th[event]) ? [...th[event]] : [];
     const incoming = Array.isArray(matchers) ? matchers : [];
+    // Scoped to this event's own hook list: a tap on another event (or the
+    // marker string in a permissions entry) must not block this one.
     const already = JSON.stringify(existing).includes(MARKER);
-    if (!already) existing.push(...incoming);
+    if (!already) {
+      existing.push(...incoming);
+      addedEvents.push(event);
+    }
     th[event] = existing;
   }
   out.hooks = th;
-  return out;
+  return { merged: out, addedEvents };
 }
 
-export function runHooksInstall(): void {
-  const snippet = installSnippet();
+export function runHooksInstall(opts: InstallOptions = {}): void {
+  const full = wantsFullPayload(opts.full === true);
+  const snippet = installSnippet("tracetap", { full });
   const sp = settingsPath();
   let existing: any = {};
   if (fs.existsSync(sp)) {
@@ -153,20 +179,39 @@ export function runHooksInstall(): void {
       return;
     }
   }
-  if (JSON.stringify(existing).includes(MARKER)) {
-    console.log(`Already installed in ${sp} (found "${MARKER}").`);
+  // Merge per event, never per file: a whole-file marker check would read a
+  // tracked hook (or a permissions entry naming the tap) as "installed" and
+  // silently skip everything — including taps added since the last install,
+  // like PreCompact/PostCompact.
+  const { merged, addedEvents } = deepMergeHooks(existing, snippet);
+  if (!addedEvents.length) {
+    console.log(`Already installed in ${sp} (every tap event carries "${MARKER}").`);
+    const hasFull = /tracetap hooks tap[^"]*--full/.test(JSON.stringify(existing));
+    if (full && !hasFull) {
+      console.log(
+        `Note: existing taps do not carry --full. Run \`tracetap hooks uninstall\` then \`tracetap hooks install --full\` to switch on payload capture.`,
+      );
+    }
     console.log(`Tip: run \`tracetap hooks discover\` then \`tracetap hooks track\` to wrap real repo hooks.`);
     return;
   }
-  const merged = deepMergeHooks(existing, snippet);
   try {
     ensureDir(path.dirname(sp));
     if (fs.existsSync(sp) && !fs.existsSync(sp + ".tracetap.bak")) {
       fs.copyFileSync(sp, sp + ".tracetap.bak");
     }
     fs.writeFileSync(sp, JSON.stringify(merged, null, 2) + "\n", "utf-8");
-    console.log(`Merged observe hooks into ${sp}`);
+    console.log(
+      addedEvents.length === INSTALL_TAPS.length
+        ? `Merged observe hooks into ${sp}`
+        : `Merged observe hooks into ${sp} (added ${addedEvents.join(", ")}; other events already tapped)`,
+    );
     console.log(`Hook events will append under ${hooksDir()}`);
+    console.log(
+      full
+        ? `payload:   full stdin stored on every event (--full) — includes prompt text and tool inputs`
+        : `payload:   metadata only — re-install with --full to store each hook's stdin`,
+    );
     console.log(`These persist after \`tracetap serve\` stops — use \`tracetap hooks uninstall\` to remove.`);
   } catch (err) {
     console.error(`Could not write ${sp}: ${(err as Error).message}`);
@@ -197,7 +242,10 @@ export function runHooksStatus(): void {
   let settingsHit = false;
   if (fs.existsSync(sp)) {
     try {
-      settingsHit = fs.readFileSync(sp, "utf-8").includes(MARKER);
+      // Scoped to the hooks section: the marker can also appear elsewhere in
+      // settings.json (e.g. a permissions allowlist entry), which is not an install.
+      const parsed = JSON.parse(fs.readFileSync(sp, "utf-8"));
+      settingsHit = JSON.stringify(parsed?.hooks ?? {}).includes(MARKER);
     } catch {
       /* ignore */
     }
@@ -281,7 +329,12 @@ export async function runHooksCli(argv: string[]): Promise<void> {
     return;
   }
   if (sub === "install") {
-    runHooksInstall();
+    let full = false;
+    for (let i = 1; i < argv.length; i++) {
+      if (argv[i] === "--full") full = true;
+      else throw new Error(`Unknown install option '${argv[i]}'`);
+    }
+    runHooksInstall({ full });
     return;
   }
   if (sub === "status") {
@@ -324,6 +377,7 @@ export async function runHooksCli(argv: string[]): Promise<void> {
     console.log(
       `uninstall: removed ${res.removedCommands} tap command(s); settings cleared=${res.settingsCleared}`,
     );
+    for (const e of res.errors) console.error(`  error: ${e} — taps may still be installed`);
     if (res.filesRestored.length) {
       console.log(`restored:`);
       for (const f of res.filesRestored) console.log(`  ${f}`);
@@ -356,6 +410,7 @@ export async function runHooksCli(argv: string[]): Promise<void> {
     let mode: "inject" | "settings" = "inject";
     let all = false;
     let yes = false;
+    let full = false;
     let ids: string[] | null = null;
     for (let i = 1; i < argv.length; i++) {
       const a = argv[i];
@@ -363,7 +418,8 @@ export async function runHooksCli(argv: string[]): Promise<void> {
         const m = argv[++i];
         if (m !== "inject" && m !== "settings") throw new Error("--mode must be inject|settings");
         mode = m;
-      } else if (a === "--all") all = true;
+      } else if (a === "--full") full = true;
+      else if (a === "--all") all = true;
       else if (a === "--yes" || a === "-y") yes = true;
       else if (a === "--ids") {
         ids = (argv[++i] || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -393,9 +449,15 @@ export async function runHooksCli(argv: string[]): Promise<void> {
       console.log("Nothing selected.");
       return;
     }
-    console.log(`Tracking ${selected.length} hook(s) via mode=${mode}…`);
+    const trackFull = wantsFullPayload(full);
+    console.log(
+      `Tracking ${selected.length} hook(s) via mode=${mode}${trackFull ? " (--full: storing hook stdin)" : ""}…`,
+    );
+    const opts = { full: trackFull };
     const res =
-      mode === "inject" ? trackInject(selected) : trackSettings(selected);
+      mode === "inject"
+        ? trackInject(selected, "tracetap", opts)
+        : trackSettings(selected, "tracetap", opts);
     console.log(`tracked=${res.tracked} skipped=${res.skipped}`);
     for (const f of res.files) console.log(`  wrote ${f}`);
     for (const w of res.warnings) console.log(`  warn: ${w}`);

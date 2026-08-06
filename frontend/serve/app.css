@@ -1492,18 +1492,6 @@ h1 {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
-/* A 1px outline vanishes on a 12px-wide gradient bar, so the selected call was
-   effectively unmarked — you could read the panel but not see which bar it
-   described. Give the bar a filled state instead of an edge. */
-.ct-bar.selected {
-  outline: none;
-  background: linear-gradient(180deg, var(--accent), rgba(127, 143, 255, 0.35));
-  box-shadow: 0 0 0 1px var(--accent), 0 0 10px rgba(127, 143, 255, 0.5);
-  z-index: 3;
-}
-.ct-bar.selected .ct-seq {
-  color: var(--bright);
-}
 .inspector-back {
   background: transparent;
   border: 0;
@@ -1777,10 +1765,10 @@ h1 {
   pointer-events: none;
   transition: opacity 120ms ease-out;
 }
-/* The call the composition below is describing. The bar already had a
+/* The call the composition below is describing. The column already had a
    `.selected` state for the inspector; this is a separate question — which
-   call the TABLE is showing — and they are not always the same bar. */
-.ct-bar.current {
+   call the TABLE is showing — and they are not always the same column. */
+.ct-col.current {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
   z-index: 2;
@@ -1920,14 +1908,15 @@ h1 {
   text-align: left;
   background: var(--surface);
 }
-/* Shaded to its own share of the context — the fill stops at --share, so what
-   is eating the window is visible without reading the number.
+/* Segment rows used to ALSO be `.payload-hotspot` — a generic affordance
+   declared later in this file with `display:block`, a transparent background, a
+   dashed border and zero padding, which at equal specificity silently won and
+   flattened these rows into running text. They no longer carry that class (the
+   payload opens in place, not in a hover popover), but the row keeps stating
+   its own box explicitly rather than inheriting one from elsewhere.
 
-   These rows used to also carry `.payload-hotspot`, a generic affordance whose
-   display:block rules had equal specificity and came later in the file, so it
-   silently won and flattened the grid into running text. Both the class and
-   the override it needed are gone now: a shared class that has to be
-   re-defeated at every call site is the duplication it was meant to remove. */
+   Shaded to its own share of the context — the fill stops at --share, so what
+   is eating the window is visible without reading the number. */
 .xray-seg {
   display: grid;
   padding: 0 var(--sp-3);
@@ -1963,7 +1952,7 @@ h1 {
   color: var(--dim);
 }
 .xray-seg-n {
-  color: var(--fg);
+  color: var(--text);
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
@@ -2548,37 +2537,162 @@ button.xray-row[aria-pressed="true"] .xray-row-label {
   cursor: help;
   margin-left: 8px;
 }
-.ct-bar {
+/* The column is the hit target, the bar inside it is the value. Height encodes
+   prompt tokens and bottoms out near 3px, so making the bar itself the button
+   gave most calls a click target too small to hit. `align-self: stretch`
+   overrides the container's flex-end so every column is full height. */
+.ct-col {
   flex: 1 0 14px;
   min-width: 12px;
   max-width: 28px;
-  background: linear-gradient(180deg, rgba(127, 143, 255, 0.7), rgba(127, 143, 255, 0.2));
-  border: 0;
-  border-radius: 3px 3px 0 0;
-  cursor: pointer;
+  align-self: stretch;
   position: relative;
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  padding: 0;
+  cursor: pointer;
   color: var(--dim);
   font-size: var(--fs-100);
   padding: 0;
 }
-.ct-bar:hover { outline: 1px solid var(--accent); }
-.ct-bar.compact {
+.ct-col:hover { background: rgba(127, 143, 255, 0.12); }
+/* Compaction columns are marked on the FULL height of the column, not just on
+   the bar: with the compaction list gone this chart is the only place they can
+   be found, and an amber bar tip is invisible on a call whose bar is 4px tall.
+   Declared before `.selected` so selection still wins the background. */
+.ct-col.compact {
+  background: rgba(251, 191, 36, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(251, 191, 36, 0.35);
+}
+.ct-col.compact:hover { background: rgba(251, 191, 36, 0.22); }
+.ct-col:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+}
+.ct-col.selected {
+  background: rgba(127, 143, 255, 0.2);
+  outline: 1px solid var(--accent);
+}
+.ct-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  min-height: 3px;
+  background: linear-gradient(180deg, rgba(127, 143, 255, 0.7), rgba(127, 143, 255, 0.2));
+  border-radius: 3px 3px 0 0;
+  pointer-events: none;
+}
+.ct-col:hover .ct-bar { background: linear-gradient(180deg, rgba(127, 143, 255, 0.95), rgba(127, 143, 255, 0.4)); }
+.ct-col.compact .ct-bar {
   background: linear-gradient(180deg, rgba(251, 191, 36, 0.85), rgba(251, 191, 36, 0.25));
 }
-.ct-bar.errored { box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.6); }
+.ct-col.errored .ct-bar { box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.6); }
+.ct-col.selected .ct-bar { background: linear-gradient(180deg, var(--accent), rgba(127, 143, 255, 0.45)); }
+.ct-col.selected.compact .ct-bar { background: linear-gradient(180deg, var(--amber), rgba(251, 191, 36, 0.45)); }
 .ct-seq {
   position: absolute;
   bottom: 2px;
   left: 50%;
   transform: translateX(-50%);
   font-size: var(--fs-100);
+  pointer-events: none;
 }
+.ct-col.selected .ct-seq { color: var(--bright); }
+/* Pinned to the top of the COLUMN, so every compaction marker sits on the same
+   line and the set reads as a row of ticks. A solid chip with a dark glyph, not
+   amber-on-transparent — a compaction column's bar is itself amber, and the old
+   bar-anchored glyph disappeared into it whenever the bar was tall. */
 .ct-compact {
   position: absolute;
-  top: -12px;
+  top: 1px;
   left: 50%;
   transform: translateX(-50%);
+  padding: 0 2px;
+  border-radius: 2px;
+  background: var(--amber);
+  color: var(--bg);
+  font-size: 8px;
+  line-height: 11px;
+  pointer-events: none;
+}
+/* -- compaction stepper ---------------------------------------------------
+   Replaces the left-hand compaction list. The list held two useful things — how
+   many compactions there are, and a way to walk them — and cost a whole column
+   to do it. This is those two things in one line of chrome; the timeline's amber
+   ticks above carry the "where are they" job. Amber throughout, so the control
+   and the marks it walks read as the same thing. */
+.xray-comp-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.xray-comp-label {
+  font-family: var(--font-chrome);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
   color: var(--amber);
+}
+.comp-step {
+  padding: 3px 7px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--mid);
+  font-family: var(--font-data);
+  font-size: 11px;
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.comp-step:hover {
+  border-color: var(--amber);
+  color: var(--bright);
+}
+.comp-step:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.comp-pos {
+  min-width: 52px;
+  text-align: center;
+}
+/* Lit only while the detail is actually showing a compaction, so the readout
+   doubles as "you are on one" / "you are between them". */
+.comp-pos.on {
+  color: var(--amber);
+  border-color: rgba(251, 191, 36, 0.45);
+}
+
+/* -- x-ray layout ---------------------------------------------------------
+   One column now. The detail was an `aside` beside a list; with the list gone it
+   spans the pane, so the sticky + 70vh scroller it inherited from .flow-detail
+   would be a second scrollbar around the whole page's worth of content. */
+.xray-layout {
+  display: block;
+}
+.xray-detail-full {
+  position: static;
+  max-height: none;
+  overflow: visible;
+}
+/* The totals ride on the right of the head; on a narrow pane they wrap under
+   it instead of squeezing the seq label. */
+#xray-view .flow-detail-head { flex-wrap: wrap; }
+.xray-head-note {
+  margin-left: auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.xray-head-sub {
+  margin: -4px 0 10px;
+  font-size: 11px;
+}
+.pill.compaction-pill {
+  color: var(--amber);
+  border-color: rgba(251, 191, 36, 0.45);
 }
 button.xray-seg {
   color: inherit;
@@ -2587,12 +2701,74 @@ button.xray-seg {
      sized in px against the 12px set on .xray-seg. */
   font-family: inherit;
 }
+/* The left rule is the bucket's, and it stays the bucket's on hover — otherwise
+   the one row you are pointing at is the one row whose colour you cannot read. */
 button.xray-seg:hover {
   border-color: var(--accent);
+  border-left-color: rgb(var(--bkt));
 }
 button.xray-seg:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+
+/* -- compaction efficacy --------------------------------------------------
+   Rendered only when the timeline carries `compaction.efficacy`. 12 of 13
+   compactions in a real session read NET NEGATIVE, so this is the ordinary
+   case, not an alarm: the verdict word takes the colour and a 2px left rule
+   carries it into the margin. No red fill, no red border box — a panel that
+   shouts on almost every compaction is a panel you stop reading. */
+.ceff {
+  margin: 0 0 14px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.ceff-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.ceff-title,
+.ceff-verdict {
+  font-family: var(--font-chrome);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.ceff-title { color: var(--dim); }
+.ceff-verdict {
+  margin-left: auto;
+  color: var(--mid);
+}
+.ceff-negative { border-left: 2px solid rgba(248, 113, 113, 0.55); }
+.ceff-marginal { border-left: 2px solid rgba(251, 191, 36, 0.55); }
+.ceff-positive { border-left: 2px solid rgba(74, 222, 128, 0.55); }
+.ceff-negative .ceff-verdict { color: var(--err); }
+.ceff-marginal .ceff-verdict { color: var(--warn); }
+.ceff-positive .ceff-verdict { color: var(--ok); }
+.ceff-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 12px;
+}
+/* label | value, so the four figures line up as a column of facts rather than
+   a sentence you have to parse. */
+.ceff-row {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+}
+.ceff-k { color: var(--dim); }
+.ceff-v { font-variant-numeric: tabular-nums; }
+.ceff-why {
+  margin-top: 6px;
+  font-size: 11px;
 }
 
 /* A pane the server could not build. Distinct from .empty-pane, which means

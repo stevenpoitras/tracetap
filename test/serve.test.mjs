@@ -10,6 +10,7 @@ import { Store } from "../dist/store/index.js";
 import {
     auditIndexedFiles,
     clearAuditMemo,
+    clearXrayMemo,
     handleRequest,
     parseServeArgs,
     reportPathFor,
@@ -460,6 +461,57 @@ test("GET /api/session/<id>/context/<seq> returns Context X-Ray with delta", asy
   assert.equal(missing.status, 404);
 });
 
+test("GET /api/session/<id>/context/<seq> is memoized until the source log changes", async () => {
+  const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
+  // Must be the session backed by `claudeSource` — this test invalidates the
+  // memo by touching that file's mtime, and the dead-tool/variant synthetics
+  // are claude sessions too, so a positional [0] can pick a session whose
+  // signature the touch never moves.
+  const id = list.sessions.find((s) =>
+    s.sourcePath.endsWith("claude.jsonl"),
+  ).sessionId;
+  const url = (seq) => "/api/session/" + encodeURIComponent(id) + "/context/" + seq;
+
+  // Every X-Ray costs one read + parse of the whole source JSONL, so what has
+  // to be asserted is how often that happens — not that the route answers 200.
+  clearXrayMemo();
+  const build = Store.prototype.sessionContextXrayWindow;
+  let builds = 0;
+  store.sessionContextXrayWindow = function (...args) {
+    builds += 1;
+    return build.apply(this, args);
+  };
+  const before = fs.statSync(claudeSource);
+  try {
+    const first = await get(url(0));
+    assert.equal(first.status, 200);
+    assert.equal(builds, 1, "cold call reads the source log once");
+
+    const second = await get(url(0));
+    assert.equal(second.status, 200);
+    assert.equal(builds, 1, "identical repeat must not recompute");
+    assert.equal(second.text, first.text, "cached payload is byte-identical");
+
+    // Neighbouring calls come out of that same parse, so stepping through the
+    // X-Ray pane does not pay for the file again.
+    const next = await get(url(1));
+    assert.equal(next.status, 200);
+    assert.equal(JSON.parse(next.text).seq, 1);
+    assert.equal(builds, 1, "neighbouring seq is served from the warmed window");
+
+    // A log that grew or was rewritten must not be answered from the memo.
+    const later = new Date(before.mtimeMs + 60_000);
+    fs.utimesSync(claudeSource, later, later);
+    const afterTouch = await get(url(0));
+    assert.equal(afterTouch.status, 200);
+    assert.equal(builds, 2, "changed source log invalidates the memo");
+  } finally {
+    delete store.sessionContextXrayWindow;
+    fs.utimesSync(claudeSource, before.atime, before.mtime);
+    clearXrayMemo();
+  }
+});
+
 test("GET /api/usage aggregates priced buckets", async () => {
   const r = await get("/api/usage?granularity=daily&timezone=UTC");
   assert.equal(r.status, 200);
@@ -633,6 +685,172 @@ test("audit scans are cached per file and survive a new process", async () => {
     assert.equal(fresh.pairsScanned, baseline.pairsScanned);
   } finally {
     fs.renameSync(moved, claudeSource);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Cross-session isolation (loadSessionPairs + the time-window hook join)
+// ---------------------------------------------------------------------------
+
+/** Fresh store with one indexed claude wire session in its own tmp dir. */
+function makeClaudeStore(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const claudeDir = path.join(dir, "proj", ".claude-trace");
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const source = path.join(claudeDir, "claude.jsonl");
+  fs.copyFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), source);
+  const s = new Store(path.join(dir, "index.db"));
+  s.indexPaths([path.join(dir, "proj")]);
+  const session = s.listSessions({ agent: "claude" })[0];
+  return { dir, store: s, source, session };
+}
+
+/** One hook-tap JSONL event, timed inside the claude fixture's window. */
+function hookEvent(overrides) {
+  return {
+    v: 1,
+    ts: "2023-11-14T22:13:19.000Z",
+    session_id: "hook-a",
+    event: "UserPromptSubmit",
+    hook_name: "h",
+    duration_ms: 1,
+    decision: null,
+    stdin_digest: "c".repeat(64),
+    stdin_preview: {},
+    stdout_preview: { chars: 0 },
+    outcome: "ok",
+    exit_code: 0,
+    ...overrides,
+  };
+}
+
+function writeHookLog(dir, name, events) {
+  fs.writeFileSync(
+    path.join(dir, name),
+    events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+  );
+}
+
+test("rewritten source log stops serving bodies instead of serving another session's", () => {
+  const { dir, store: s, source, session } = makeClaudeStore("tracetap-rewrite-");
+  try {
+    // Baseline: the indexed session's bodies are readable from its source.
+    assert.ok(s.getRawPair(session.sessionId, 0), "pair 0 expected before rewrite");
+    assert.ok(s.sessionContextXray(session.sessionId, 0), "xray expected before rewrite");
+
+    // Rewrite the log in place with a DIFFERENT conversation (system prompt
+    // change flips the conversation key) — the db row still points here, but
+    // the content no longer holds this session.
+    const rewritten = fs
+      .readFileSync(source, "utf-8")
+      .replaceAll("You are Claude Code.", "You are a different agent now.");
+    fs.writeFileSync(source, rewritten);
+
+    // No groups[0] fallback: the other conversation's bodies must NOT be
+    // served under the stale session id.
+    assert.equal(s.getRawPair(session.sessionId, 0), null);
+    assert.equal(s.sessionContextXray(session.sessionId, 0), null);
+    assert.deepEqual(s.sessionContextXrayWindow(session.sessionId, 0, 2), []);
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hook time join drops events whose cwd identifies a different session", () => {
+  const { dir, store: s, session } = makeClaudeStore("tracetap-hookcwd-");
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    writeHookLog(hooksDir, "hook-a.jsonl", [
+      hookEvent({
+        session_id: "hook-a",
+        stdin_preview: { cwd: session.projectCwd + "/" }, // trailing slash still matches
+        payload: { prompt: "mine-full-payload" },
+      }),
+    ]);
+    writeHookLog(hooksDir, "hook-b.jsonl", [
+      hookEvent({
+        session_id: "hook-b",
+        ts: "2023-11-14T22:13:20.000Z",
+        stdin_preview: { cwd: "/somewhere/else/entirely" },
+        payload: { prompt: "OTHER-SESSION-SECRET" },
+      }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    const rows = s.listHooksForSession(session.sessionId);
+    assert.ok(rows.length >= 1, "same-cwd hook events expected");
+    assert.ok(rows.every((r) => r.sessionId === "hook-a"), "conflicting-cwd session excluded");
+    // Sole surviving hook session => unambiguous, full payload kept.
+    assert.equal(rows[0].payload.prompt, "mine-full-payload");
+    assert.ok(!JSON.stringify(rows).includes("OTHER-SESSION-SECRET"));
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous hook time join withholds full payloads from every candidate", () => {
+  const { dir, store: s, session } = makeClaudeStore("tracetap-hookambig-");
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    // Two concurrent hook sessions, neither carrying a cwd identity: the join
+    // cannot tell which belongs to the wire session.
+    writeHookLog(hooksDir, "hook-a.jsonl", [
+      hookEvent({ session_id: "hook-a", payload: { prompt: "A-full-prompt" } }),
+    ]);
+    writeHookLog(hooksDir, "hook-b.jsonl", [
+      hookEvent({
+        session_id: "hook-b",
+        ts: "2023-11-14T22:13:20.000Z",
+        payload: { prompt: "B-full-prompt" },
+      }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    const rows = s.listHooksForSession(session.sessionId);
+    // Timeline keeps its shape (both sessions' events listed)...
+    assert.deepEqual(new Set(rows.map((r) => r.sessionId)), new Set(["hook-a", "hook-b"]));
+    // ...but no full payload can be attributed, so none is served.
+    assert.ok(rows.every((r) => r.payload === null), "payloads withheld when unattributable");
+    const text = JSON.stringify(rows);
+    assert.ok(!text.includes("A-full-prompt"));
+    assert.ok(!text.includes("B-full-prompt"));
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("exact hook session_id match disables the time join entirely", () => {
+  const { dir, store: s, session } = makeClaudeStore("tracetap-hookexact-");
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    // A hook log whose session_id IS the wire session id (exact identity),
+    // plus a concurrent foreign session inside the time window.
+    writeHookLog(hooksDir, "exact.jsonl", [
+      hookEvent({ session_id: session.sessionId, payload: { prompt: "exact-full" } }),
+    ]);
+    writeHookLog(hooksDir, "hook-b.jsonl", [
+      hookEvent({
+        session_id: "hook-b",
+        ts: "2023-11-14T22:13:20.000Z",
+        payload: { prompt: "FOREIGN-full" },
+      }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    const rows = s.listHooksForSession(session.sessionId);
+    assert.ok(rows.length >= 1);
+    assert.ok(rows.every((r) => r.sessionId === session.sessionId), "only exact-id rows served");
+    assert.equal(rows[0].payload.prompt, "exact-full", "exact identity keeps its payload");
+    assert.ok(!JSON.stringify(rows).includes("FOREIGN-full"));
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

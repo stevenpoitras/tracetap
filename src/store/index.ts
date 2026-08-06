@@ -18,10 +18,14 @@ import type { FlowGraph } from "../flow/derive";
 import { buildContextXray } from "../context/xray";
 import type { ContextXray } from "../context/xray";
 import type { AuditFileScan } from "../audit";
-import { buildContextTimeline } from "../context/timeline";
+import { buildContextTimeline, findCompactions } from "../context/timeline";
 import { compactionsForSession } from "../context/compaction";
 import type { CompactionRecord } from "../context/compaction";
-import type { ContextMetrics, ContextTimeline } from "../context/timeline";
+import type {
+  CompactionTrigger,
+  ContextMetrics,
+  ContextTimeline,
+} from "../context/timeline";
 import { toolsetFromBody } from "../context/tooltax";
 import { identifyRequest, spawnIndex } from "../trajectory/agent-identity";
 import type { AgentSpawn, IdentityPair } from "../trajectory/agent-identity";
@@ -127,7 +131,7 @@ export interface IndexResult {
 }
 
 export interface SessionListFilters {
-  /** Exactly this session id. Used by {@link Store.getSession}. */
+  /** Exactly this session id — the single-row lookup {@link Store.getSession} uses. */
   sessionId?: string;
   /**
    * Substring (case-insensitive) matched against the harness family ("claude")
@@ -360,6 +364,15 @@ const SORTABLE_COLUMNS = new Set([
 ]);
 
 const SCHEMA_VERSION = 8;
+
+/**
+ * How long after a `PreCompact` hook its compacted call may arrive, and how far
+ * the wire timestamp may run ahead of the hook's. Compaction itself can take
+ * seconds on a large transcript; the slack absorbs clock skew between the hook
+ * process and the proxy.
+ */
+const COMPACT_HOOK_WINDOW_SEC = 120;
+const COMPACT_HOOK_SLACK_SEC = 5;
 
 // ---------------------------------------------------------------------------
 // Paths / discovery
@@ -1456,9 +1469,12 @@ export class Store {
   /**
    * Look up a single indexed session by id, or null when absent.
    *
-   * Filtered in SQL rather than listing everything and finding the row: each
-   * summary now costs a title scan and a cast rollup, so the discarded 85 rows
-   * of an 86-session index were 85 wasted scans on every detail page load.
+   * Filtered in SQL rather than listing everything and picking the row out in
+   * JS, which cost ~110ms on a real index: the per-row `turns`/`errorCount`
+   * subqueries are counts over the whole FTS table, and each summary also costs
+   * a title scan and a cast rollup — so the discarded 85 rows of an 86-session
+   * index were 85 wasted scans on every detail page load, and nearly every
+   * session route calls this at least once.
    */
   getSession(sessionId: string): SessionSummary | null {
     return this.listSessions({ sessionId })[0] ?? null;
@@ -1957,6 +1973,16 @@ export class Store {
    * Hooks for a wire session: exact `session_id` match OR time-overlap with the
    * session window (±10 min slack). Wire conversation keys rarely equal Claude's
    * hook session_id, so time correlation is the practical bridge.
+   *
+   * The time join is fenced so it cannot serve another session's data:
+   * - When any exact `session_id` row exists, the wire id IS the hook session
+   *   id, so the join is skipped outright — it could only add foreign rows.
+   * - A hook event that carries a `cwd` identity conflicting with this
+   *   session's project cwd belongs to a different session and is dropped.
+   * - When more than one hook session survives in the window, none can be
+   *   attributed with certainty, so full `payload` bodies (--full stdin: prompt
+   *   text, tool inputs) are withheld from all of them — the timeline keeps its
+   *   shape, but another session's payloads are never served under this one.
    */
   listHooksForSession(sessionId: string): HookRow[] {
     const session = this.getSession(sessionId);
@@ -1970,7 +1996,7 @@ export class Store {
       .all(sessionId) as any[];
 
     let byTime: any[] = [];
-    if (session) {
+    if (session && !byId.length) {
       const slack = 600; // 10 minutes — long tool calls can lag the wire window
       const start = session.startedAt > 0 ? session.startedAt - slack : 0;
       const end = session.endedAt > 0 ? session.endedAt + slack : Number.MAX_SAFE_INTEGER;
@@ -1986,14 +2012,22 @@ export class Store {
         .all(start, end) as any[];
     }
 
-    const seen = new Set<number>();
-    const rows: HookRow[] = [];
-    for (const r of [...byId, ...byTime]) {
-      const id = Number(r.id);
-      if (seen.has(id)) continue;
-      seen.add(id);
-      rows.push(hookRowFromDb(r));
+    const rows: HookRow[] = byId.map(hookRowFromDb);
+    const sessionCwd = normalizeCwd(session?.projectCwd);
+    const timeRows: HookRow[] = [];
+    for (const r of byTime) {
+      const row = hookRowFromDb(r);
+      // The tap records Claude's cwd in the stdin preview; a mismatch with the
+      // wire session's project is positive identity for a DIFFERENT session.
+      const hookCwd = normalizeCwd((row.stdinPreview as any)?.cwd);
+      if (hookCwd && sessionCwd && hookCwd !== sessionCwd) continue;
+      timeRows.push(row);
     }
+    const hookSessions = new Set(timeRows.map((r) => r.sessionId));
+    if (hookSessions.size > 1) {
+      for (const row of timeRows) row.payload = null;
+    }
+    rows.push(...timeRows);
     rows.sort((a, b) => a.ts - b.ts || a.id - b.id);
     return rows;
   }
@@ -2008,10 +2042,19 @@ export class Store {
   }
 
   /**
-   * Load the RawPair at `seq` for a session from its source JSONL (on disk).
-   * Returns null when the source file is missing or seq is out of range.
+   * Every RawPair of one session, from ONE read+parse of its source JSONL.
+   *
+   * The source log is the expensive input on every body-reading path: capture
+   * files run to hundreds of MB, and reading + `JSON.parse`ing one is ~0.4s per
+   * 100MB. Callers that need more than a single pair must go through here so
+   * they pay that once, not once per pair.
+   *
+   * Returns null when the source file is missing or unreadable, or when its
+   * current content no longer contains this session — a log rewritten or
+   * rotated in place between index passes holds a *different* conversation,
+   * and serving its pairs under this session id would cross-wire bodies.
    */
-  getRawPair(sessionId: string, seq: number): RawPair | null {
+  private loadSessionPairs(sessionId: string): RawPair[] | null {
     const session = this.getSession(sessionId);
     if (!session?.sourcePath) return null;
     let content: string;
@@ -2021,30 +2064,82 @@ export class Store {
       return null;
     }
     const pairs = parsePairs(content);
-    // Pairs in the file may span multiple conversation groups; filter to this session.
+    // Pairs in the file may span multiple conversation groups; filter to this
+    // session. No fallback: the grouping is deterministic over content, so a
+    // miss means the file no longer holds this conversation — answer null (the
+    // routes 404) rather than another session's bodies.
     const groups = groupPairs(pairs);
-    const group = groups.find((g) => g.sessionId === sessionId) ?? groups[0];
-    if (!group) return null;
-    return group.pairs[seq] ?? null;
+    const group = groups.find((g) => g.sessionId === sessionId);
+    return group ? group.pairs : null;
+  }
+
+  /**
+   * Load the RawPair at `seq` for a session from its source JSONL (on disk).
+   * Returns null when the source file is missing or seq is out of range.
+   */
+  getRawPair(sessionId: string, seq: number): RawPair | null {
+    return this.loadSessionPairs(sessionId)?.[seq] ?? null;
+  }
+
+  /**
+   * A cheap validity token for anything derived from a session's source JSONL:
+   * the resolved path plus the file's mtime and size. Memoizing callers key on
+   * it so an appended, rewritten or rotated log misses instead of serving a
+   * stale view. Empty string when the session or its file is gone.
+   *
+   * Deliberately NOT the db mtime signature the SSE poller uses: the index is
+   * rewritten every re-index pass (~30s) whether or not any log changed, and
+   * every X-Ray input — bodies, and the `promptHash` recorded from them — is a
+   * function of the source file alone.
+   */
+  sessionSourceSignature(sessionId: string): string {
+    const session = this.getSession(sessionId);
+    if (!session?.sourcePath) return "";
+    try {
+      const st = fs.statSync(session.sourcePath);
+      return `${session.sourcePath}:${st.mtimeMs}:${st.size}`;
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Context X-Rays for `seq` and up to `radius` calls either side of it, in
+   * ascending seq order. Empty when the source is unreadable or `seq` is out
+   * of range.
+   *
+   * The window exists because the cost here is the file, not the X-Ray: reading
+   * and parsing a 96MB capture log is ~0.5s while building one X-Ray from the
+   * parsed pairs is ~6ms. One parse therefore yields a whole neighbourhood of
+   * views almost for free, and stepping through a session pays the read once
+   * rather than once per call.
+   */
+  sessionContextXrayWindow(sessionId: string, seq: number, radius = 0): ContextXray[] {
+    const pairs = this.loadSessionPairs(sessionId);
+    if (!pairs?.[seq]) return [];
+    // One request row per pair, seq === pair index (see insertRequests), so the
+    // previous call is simply pairs[i - 1].
+    const promptHashes = new Map(this.listRequests(sessionId).map((r) => [r.seq, r.promptHash]));
+    const from = Math.max(0, seq - radius);
+    const to = Math.min(pairs.length - 1, seq + radius);
+    const out: ContextXray[] = [];
+    for (let i = from; i <= to; i++) {
+      if (!pairs[i]) continue;
+      out.push(
+        buildContextXray({
+          seq: i,
+          pair: pairs[i],
+          promptHash: promptHashes.get(i) ?? "",
+          prev: i > 0 && pairs[i - 1] ? { seq: i - 1, pair: pairs[i - 1] } : undefined,
+        }),
+      );
+    }
+    return out;
   }
 
   /** Context X-Ray for one API call, with delta vs the previous call when present. */
   sessionContextXray(sessionId: string, seq: number): ContextXray | null {
-    const requests = this.listRequests(sessionId);
-    const pair = this.getRawPair(sessionId, seq);
-    if (!pair) return null;
-    const req = requests.find((r) => r.seq === seq);
-    const prevReq = requests.filter((r) => r.seq < seq).sort((a, b) => b.seq - a.seq)[0];
-    const prevPair = prevReq ? this.getRawPair(sessionId, prevReq.seq) : null;
-    return buildContextXray({
-      seq,
-      pair,
-      promptHash: req?.promptHash ?? "",
-      prev:
-        prevReq && prevPair
-          ? { seq: prevReq.seq, pair: prevPair }
-          : undefined,
-    });
+    return this.sessionContextXrayWindow(sessionId, seq, 0)[0] ?? null;
   }
 
   /**
@@ -2146,22 +2241,82 @@ export class Store {
     return out;
   }
 
+  /**
+   * seq → what triggered the compaction at that seq, from `PreCompact` hooks.
+   *
+   * `PreCompact` is the only source that can tell `manual` (the user typed
+   * /compact) from `auto` (the harness hit its limit) — the harness puts that
+   * word in the hook payload's `trigger`. Nothing on the wire carries it: a
+   * compaction looks identical either way from the request body, so a seq with
+   * no matching hook is left out entirely rather than guessed at, and the
+   * timeline reports it as `inferred` / `unknown`.
+   *
+   * Correlation is by time, since compaction happens immediately before the
+   * call that carries the shrunken transcript.
+   */
+  private compactionTriggers(
+    sessionId: string,
+    compactionTimes: { seq: number; ts: number }[],
+  ): Map<number, CompactionTrigger> {
+    const out = new Map<number, CompactionTrigger>();
+    if (!compactionTimes.length) return out;
+    const pre = this.listHooksForSession(sessionId)
+      .filter((h) => h.event === "PreCompact")
+      .sort((a, b) => a.ts - b.ts);
+    if (!pre.length) return out;
+
+    const claimed = new Set<number>();
+    for (const c of compactionTimes) {
+      let best: (typeof pre)[number] | null = null;
+      let bestGap = Infinity;
+      for (const h of pre) {
+        if (claimed.has(h.id)) continue;
+        // The hook fires before the compacted call, so only look backwards.
+        const gap = c.ts - h.ts;
+        if (gap < -COMPACT_HOOK_SLACK_SEC || gap > COMPACT_HOOK_WINDOW_SEC) continue;
+        if (Math.abs(gap) < bestGap) {
+          bestGap = Math.abs(gap);
+          best = h;
+        }
+      }
+      if (!best) continue;
+      claimed.add(best.id);
+      const raw = (best.payload as any)?.trigger ?? (best.stdinPreview as any)?.trigger;
+      const kind = raw === "manual" || raw === "auto" ? raw : "unknown";
+      out.set(c.seq, { kind, source: "hook", hookTs: best.ts });
+    }
+    return out;
+  }
+
   sessionContextTimeline(sessionId: string): ContextTimeline {
     const requests = this.listRequests(sessionId);
     const precomputedBySeq = this.contextMetricsFor(sessionId);
     // Only read bodies for calls the index run could not segment — normally
     // none. Before this, every call was read back and re-parsed on every load,
-    // which dominated the session endpoint's latency.
+    // which dominated the session endpoint's latency. When there IS a gap, the
+    // source is read once for all of them, not once per gap.
     const pairsBySeq = new Map<number, RawPair>();
-    for (const r of requests) {
-      if (precomputedBySeq.has(r.seq)) continue;
-      const pair = this.getRawPair(sessionId, r.seq);
-      if (pair) pairsBySeq.set(r.seq, pair);
+    const gaps = requests.filter((r) => !precomputedBySeq.has(r.seq));
+    if (gaps.length) {
+      const pairs = this.loadSessionPairs(sessionId);
+      for (const r of gaps) {
+        const pair = pairs?.[r.seq];
+        if (pair) pairsBySeq.set(r.seq, pair);
+      }
     }
+    const tsBySeq = new Map(requests.map((r) => [r.seq, r.ts] as const));
+    const triggersBySeq = this.compactionTriggers(
+      sessionId,
+      findCompactions([...requests].sort((a, b) => a.seq - b.seq)).map((c) => ({
+        seq: c.seq,
+        ts: tsBySeq.get(c.seq) ?? 0,
+      })),
+    );
     return buildContextTimeline({
       requests,
       precomputedBySeq,
       pairsBySeq,
+      triggersBySeq,
       xrayFor: (seq, pair, promptHash) => {
         const x = buildContextXray({
           seq,
@@ -2201,6 +2356,16 @@ function contextMetricsForPair(
   } catch {
     return null;
   }
+}
+
+/**
+ * A comparable form of a working-directory identity: trailing separators
+ * stripped so `/a/b/` and `/a/b` compare equal. Empty string when absent —
+ * callers treat empty as "carries no identity" and never match on it.
+ */
+function normalizeCwd(cwd: unknown): string {
+  if (typeof cwd !== "string" || !cwd.trim()) return "";
+  return cwd.replace(/[\\/]+$/, "") || "/";
 }
 
 function hookRowFromDb(r: any): HookRow {

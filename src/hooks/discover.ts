@@ -54,7 +54,12 @@ function suggestedName(command: string, event: string, i: number): string {
 
 function resolveCommand(command: string, pluginRoot: string | null): string {
   if (!pluginRoot) return command;
-  return command.split("${CLAUDE_PLUGIN_ROOT}").join(pluginRoot);
+  // The resolved string gets spliced into a shell command (settings-mode
+  // tracking), so quote the substituted path: a directory name carrying shell
+  // metacharacters would otherwise break out of the command — breakage for a
+  // path with spaces, injection for a crafted one. shellQuote leaves plain
+  // paths bare, so the common case is byte-identical to the raw join.
+  return command.split("${CLAUDE_PLUGIN_ROOT}").join(shellQuote(pluginRoot));
 }
 
 function walkUpFind(start: string, relParts: string[]): string | null {
@@ -150,15 +155,62 @@ export function discoverHooks(root = process.cwd()): DiscoverResult {
   return { root: absRoot, sources, hooks };
 }
 
-/** Wrap a shell command so it is observed by tracetap hook-tap. */
+/**
+ * Wrap a shell command so it is observed by tracetap hook-tap.
+ *
+ * `full` adds `--full`, which stores the whole hook stdin object on each event.
+ * It is off by default: stdin carries prompt text and tool inputs, and the log
+ * is a shared local store. The wrapper always captures what the hook *returns*
+ * on stdout — `--full` is only about what it was *given*.
+ */
 export function wrapCommand(
   command: string,
-  opts: { name: string; event: string; tracetapBin?: string },
+  opts: { name: string; event: string; tracetapBin?: string; full?: boolean },
 ): string {
   if (command.includes(MARKER)) return command;
   const bin = opts.tracetapBin || "tracetap";
-  // Use -- so the original command (with quotes) is preserved as argv via shell.
-  return `${bin} hooks tap --name ${shellQuote(opts.name)} --event ${shellQuote(opts.event)} -- ${command}`;
+  const full = opts.full ? " --full" : "";
+  // The tap runs the argv after -- with spawnSync(shell:false), but Claude
+  // Code executes hook commands through a shell, so hook definitions routinely
+  // use shell syntax: env-assignment prefixes (`FOO=1 node x.mjs`), `cd … &&`,
+  // pipes, builtins. Handing those to the tap raw either ENOENTs on the first
+  // word or lets the OUTER shell split the line so the tap wraps only its
+  // first stage. Route them through `sh -c` as one quoted argument: the outer
+  // shell passes the whole original through intact, and the tap's child sh
+  // gives it exactly the semantics it had before wrapping — parseDecision
+  // still sees what Claude Code would have seen.
+  const wrapped = needsShell(command) ? `sh -c ${shellQuote(command)}` : command;
+  return `${bin} hooks tap --name ${shellQuote(opts.name)} --event ${shellQuote(opts.event)}${full} -- ${wrapped}`;
+}
+
+/**
+ * Invert wrapCommand: recover the original hook command from a wrapped one.
+ * Returns null when the command is not a tap wrapper (or is unrecognizable).
+ */
+export function unwrapCommand(command: string): string | null {
+  if (!command.includes(MARKER)) return null;
+  const sep = command.indexOf(" -- ");
+  if (sep < 0) return null;
+  let original = command.slice(sep + 4);
+  // Undo the sh -c routing wrapCommand adds for shell-syntax commands.
+  const m = /^sh -c '([\s\S]*)'$/.exec(original);
+  if (m) original = m[1].split(`'\\''`).join(`'`);
+  return original;
+}
+
+const SHELL_META = /[|&;<>()`$\\"'*?\[\]{}~#\n]/;
+// First-word shell builtins that spawnSync(shell:false) cannot exec directly.
+const SHELL_BUILTINS = new Set([
+  "cd", "exec", "eval", "source", ".", "exit", "set", "export", "unset",
+  "trap", "wait", "umask", "ulimit",
+]);
+
+/** True when a hook command relies on shell parsing to run correctly. */
+function needsShell(command: string): boolean {
+  if (SHELL_META.test(command)) return true;
+  const first = command.trim().split(/\s+/)[0] || "";
+  if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(first)) return true; // env-assignment prefix
+  return SHELL_BUILTINS.has(first);
 }
 
 function shellQuote(s: string): string {
@@ -166,4 +218,4 @@ function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-export { MARKER };
+export { MARKER, CANDIDATE_FILES };

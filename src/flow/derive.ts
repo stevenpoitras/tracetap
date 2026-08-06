@@ -136,7 +136,11 @@ export function deriveFlow(opts: {
 
   for (const step of opts.steps) {
     const req = reqByStep.get(step.stepIndex);
-    if (req) flushHooksBefore(req.ts || undefined);
+    // ts === 0 means "unknown" (see RequestRow.ts), not epoch: an unknown
+    // timestamp must not flush anything — passing undefined here would hit
+    // flushHooksBefore's drain-everything sentinel and dump the whole hook
+    // lane before this step.
+    if (req && req.ts > 0) flushHooksBefore(req.ts);
 
     if (step.role === "user" || step.role === "system") {
       const id = `step-${step.stepIndex}`;

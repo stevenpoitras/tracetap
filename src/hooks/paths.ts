@@ -24,6 +24,6 @@ export function sanitizeSessionId(sessionId: string): string {
   return s.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 180);
 }
 
-export function ensureDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true });
+export function ensureDir(dir: string, mode?: number): void {
+  fs.mkdirSync(dir, { recursive: true, mode });
 }
