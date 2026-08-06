@@ -15,6 +15,20 @@ export function buildStdinPreview(stdin: unknown): Record<string, unknown> {
   }
   const o = stdin as Record<string, unknown>;
   const out: Record<string, unknown> = {};
+  // The first group is context; the second is JOIN KEYS, and they are the whole
+  // reason a hook event can ever be attributed to anything. Claude Code hands
+  // them to us on stdin and they are cheap identifiers, not payload:
+  //
+  //   tool_use_id  the `toolu_…` of the tool call this hook gated or observed —
+  //                the exact key that pairs PreToolUse with its tool call and
+  //                with the matching PostToolUse.
+  //   prompt_id    shared by every hook fired during one user turn, which is
+  //                what partitions a flat hook stream into turns.
+  //   agent_id     which subagent fired this, so lanes stop being guessed from
+  //                tool names.
+  //
+  // These are dropped at CAPTURE time, so a reindex can never recover them for
+  // events already on disk. Anything omitted here is unattributable forever.
   const copyKeys = [
     "session_id",
     "transcript_path",
@@ -24,6 +38,11 @@ export function buildStdinPreview(stdin: unknown): Record<string, unknown> {
     "tool_name",
     "stop_hook_active",
     "trigger",
+    "tool_use_id",
+    "prompt_id",
+    "agent_id",
+    "agent_type",
+    "source",
   ];
   for (const k of copyKeys) {
     if (o[k] !== undefined) out[k] = o[k];
