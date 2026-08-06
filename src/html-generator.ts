@@ -3,6 +3,7 @@ import * as path from "path";
 import { RawPair, ClaudeData, HTMLGenerationData } from "./types";
 import { injectSummaryBanner } from "./summary";
 import { analyzeLog, injectStatsStrip } from "./analytics";
+import { parseJsonlFile } from "./jsonl";
 
 const BUNDLE_MARKER = "__CLAUDE_LOGGER_BUNDLE_REPLACEMENT_UNIQUE_9487__";
 const DATA_MARKER = "__CLAUDE_LOGGER_DATA_REPLACEMENT_UNIQUE_9487__";
@@ -99,17 +100,7 @@ export class HTMLGenerator {
       throw new Error(`File '${jsonlFile}' not found.`);
     }
 
-    const pairs: RawPair[] = [];
-    const lines = fs.readFileSync(jsonlFile, "utf-8").split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      try {
-        pairs.push(JSON.parse(line) as RawPair);
-      } catch {
-        // Skip invalid lines silently
-      }
-    }
+    const { records: pairs } = parseJsonlFile<RawPair>(jsonlFile);
     if (pairs.length === 0) {
       throw new Error(`No valid data found in '${jsonlFile}'.`);
     }

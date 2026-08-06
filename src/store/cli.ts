@@ -104,6 +104,11 @@ export async function runIndex(argv: string[]): Promise<void> {
         `${c.dim}${result.filesSkipped} unchanged${c.reset} ` +
         `(${result.sessions} sessions, ${result.steps} steps)`,
     );
+    // Named, not counted: a log that fails to index looks exactly like one with
+    // nothing new in it, so the path and the reason are the whole point.
+    for (const f of result.failures) {
+      console.log(`  ${c.yellow}failed${c.reset} ${f.sourcePath}${c.dim} — ${f.error}${c.reset}`);
+    }
     try {
       const hooks = store.indexHooks();
       if (hooks.filesIndexed + hooks.filesSkipped > 0) {

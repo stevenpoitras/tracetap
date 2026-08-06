@@ -4,6 +4,7 @@ import type { RawPair } from "./types";
 import { buildTrajectories } from "./trajectory";
 import type { Step, ToolCall, Trajectory } from "./trajectory";
 import { analyzeLog } from "./analytics";
+import { parseJsonlFile } from "./jsonl";
 
 /**
  * Self-contained HTML viewer for imported Devin sessions.
@@ -39,16 +40,7 @@ export class DevinHTMLGenerator {
     includeAllRequests = true,
   ): Promise<string> {
     if (!fs.existsSync(jsonlFile)) throw new Error(`File '${jsonlFile}' not found.`);
-    const pairs: RawPair[] = [];
-    for (const rawLine of fs.readFileSync(jsonlFile, "utf-8").split("\n")) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      try {
-        pairs.push(JSON.parse(line) as RawPair);
-      } catch {
-        // skip malformed lines
-      }
-    }
+    const { records: pairs } = parseJsonlFile<RawPair>(jsonlFile);
     if (pairs.length === 0) throw new Error(`No valid data found in '${jsonlFile}'.`);
     const out = outputFile || jsonlFile.replace(/\.jsonl$/, ".html");
     await this.generateHTML(pairs, out, { includeAllRequests });

@@ -3,6 +3,7 @@ import * as path from "path";
 import { RawPair, ClaudeData } from "./types";
 import { injectSummaryBanner } from "./summary";
 import { analyzeLog, injectStatsStrip } from "./analytics";
+import { parseJsonlFile } from "./jsonl";
 
 // Markers in frontend/codex-template.html replaced at generation time.
 const DATA_MARKER = "__CODEX_DATA__";
@@ -84,17 +85,7 @@ export class CodexHTMLGenerator {
       throw new Error(`File '${jsonlFile}' not found.`);
     }
 
-    const pairs: RawPair[] = [];
-    const lines = fs.readFileSync(jsonlFile, "utf-8").split("\n");
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      try {
-        pairs.push(JSON.parse(line) as RawPair);
-      } catch {
-        // Skip invalid lines silently
-      }
-    }
+    const { records: pairs } = parseJsonlFile<RawPair>(jsonlFile);
     if (pairs.length === 0) {
       throw new Error(`No valid data found in '${jsonlFile}'.`);
     }

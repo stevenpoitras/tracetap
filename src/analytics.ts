@@ -3,6 +3,7 @@ import * as path from "path";
 import type { RawPair } from "./types";
 import { buildTrajectories } from "./trajectory";
 import type { Trajectory } from "./trajectory";
+import { parseJsonlFile } from "./jsonl";
 
 /**
  * Per-trajectory token / cost analytics (the `--stats` feature).
@@ -303,16 +304,7 @@ function readPairsFromJsonl(jsonlFile: string): RawPair[] {
   if (!fs.existsSync(jsonlFile)) {
     throw new Error(`File '${jsonlFile}' not found.`);
   }
-  const pairs: RawPair[] = [];
-  for (const rawLine of fs.readFileSync(jsonlFile, "utf-8").split("\n")) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    try {
-      pairs.push(JSON.parse(line) as RawPair);
-    } catch {
-      // Skip invalid lines silently.
-    }
-  }
+  const { records: pairs } = parseJsonlFile<RawPair>(jsonlFile);
   if (pairs.length === 0) {
     throw new Error(`No valid data found in '${jsonlFile}'.`);
   }

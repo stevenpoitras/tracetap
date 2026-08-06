@@ -45,6 +45,21 @@ function adapterFor(pair: RawPair): AgentAdapter | null {
 }
 
 /**
+ * The conversation id {@link groupPairs} would file this pair under, or null
+ * when no adapter recognizes it.
+ *
+ * Exposed so a caller that wants ONE conversation out of a multi-conversation
+ * log can test each pair as it is parsed and drop the rest, instead of building
+ * every group to throw all but one away. On a live 888 MB capture holding 40
+ * conversations that is the difference between peak memory scaling with the
+ * file and scaling with the answer.
+ */
+export function conversationIdOf(pair: RawPair): string | null {
+  const adapter = adapterFor(pair);
+  return adapter ? adapter.conversationKey(pair) : null;
+}
+
+/**
  * One conversation's worth of captured pairs: the adapter that recognized
  * them, the stable session id (conversation grouping key), and the pairs in
  * capture order. Exposed so consumers that need per-PAIR detail (the store's
