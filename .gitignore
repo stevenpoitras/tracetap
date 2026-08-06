@@ -1,6 +1,15 @@
 node_modules
 /dist
-.claude-trace
-.devin-trace
 *.tgz
 .DS_Store
+
+# Capture output — every dir in TRACE_DIRS (src/store/index.ts)
+.claude-trace
+.codex-trace
+.gemini-trace
+.devin-trace
+
+# Local agent working state, not repo content
+.cursor/
+.harvest/
+.knowledge/
