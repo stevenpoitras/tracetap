@@ -410,7 +410,12 @@ const SORTABLE_COLUMNS = new Set([
   "cost_usd",
 ]);
 
-const SCHEMA_VERSION = 8;
+// 9: `claude_session_id` is stamped by majority rather than first-seen. That
+// value is written only inside indexFile, which returns early when a log's
+// content hash is unchanged, so a closed log keeps its old stamp forever
+// without this bump — and the stamp is now the primary hook join key, not just
+// the compaction-transcript key it used to be.
+const SCHEMA_VERSION = 9;
 
 /**
  * How long after a `PreCompact` hook its compacted call may arrive, and how far
@@ -2139,6 +2144,12 @@ export class Store {
    * reach them, and "unreachable" is a worse answer than "shown on the earliest
    * group of the conversation they belong to".
    *
+   * `session_id` is the final sort key so that case stays deterministic:
+   * `started_at` is a whole-second timestamp, and a parallel Task fan-out
+   * spawns several subagent groups inside one second. With both other keys
+   * tied, SQLite's row order is unspecified, so a reindex could silently move
+   * a conversation's hooks from one group to another.
+   *
    * This is a presentation rule, so it belongs only to the pane path. Consumers
    * that need the conversation's whole hook stream regardless of which group is
    * being viewed use `listHooksForConversation`.
@@ -2151,7 +2162,8 @@ export class Store {
          WHERE s.claude_session_id = ?
          ORDER BY (SELECT count(*) FROM requests r
                     WHERE r.session_id = s.session_id AND r.is_subagent = 0) DESC,
-                  s.started_at ASC
+                  s.started_at ASC,
+                  s.session_id ASC
          LIMIT 1`,
       )
       .get(claudeSessionId) as { id?: string } | undefined;

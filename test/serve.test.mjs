@@ -1112,6 +1112,80 @@ test("only one wire session owns a conversation's hooks", () => {
   }
 });
 
+test("an older schema drops the watermark so closed logs are re-stamped", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-schema-"));
+  try {
+    const claudeDir = path.join(dir, "proj", ".claude-trace");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.copyFileSync(
+      path.join(TRAJ_FIX, "claude-tooluse.jsonl"),
+      path.join(claudeDir, "claude.jsonl"),
+    );
+    const dbPath = path.join(dir, "index.db");
+    let s = new Store(dbPath);
+    s.indexPaths([path.join(dir, "proj")]);
+    assert.ok(s.listSessions({}).length >= 1);
+    // `claude_session_id` is written only inside indexFile, which returns early
+    // when a log's content hash is unchanged. So a stamping change reaches a
+    // closed log ONLY through the schema-version wipe — without it the old
+    // value survives forever, which is the whole reason SCHEMA_VERSION moved.
+    s.db.prepare("UPDATE meta SET value = '1' WHERE key = 'schema_version'").run();
+    s.close();
+
+    s = new Store(dbPath);
+    const files = s.db.prepare("SELECT count(*) AS n FROM files").get();
+    assert.equal(files.n, 0, "stale watermark dropped, so the next index re-parses");
+    const res = s.indexPaths([path.join(dir, "proj")]);
+    assert.ok(res.filesIndexed >= 1, "the log is re-indexed rather than skipped");
+    assert.ok(s.listSessions({}).length >= 1, "and the sessions come back");
+    s.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a subagent-only conversation still elects an owner, deterministically", () => {
+  const uuid = "22222222-2222-2222-2222-222222222222";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-hooksub-", uuid);
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    writeHookLog(hooksDir, "real.jsonl", [hookEvent({ session_id: uuid })]);
+    s.indexHooks(hooksDir);
+
+    // Every group of this conversation is subagent traffic. Electing nobody
+    // would strand the hooks where no pane can reach them.
+    s.db.prepare("UPDATE requests SET is_subagent = 1 WHERE session_id = ?").run(session.sessionId);
+    assert.equal(
+      s.listHooksForSession(session.sessionId).length,
+      1,
+      "hooks stay reachable when no group has main-thread traffic",
+    );
+
+    // A sibling sharing started_at to the second — what a parallel Task fan-out
+    // produces. With both other sort keys tied the winner must still be fixed,
+    // or a reindex silently moves the conversation's hooks between groups.
+    s.db
+      .prepare(
+        `INSERT INTO sessions(session_id, agent, project_cwd, started_at, ended_at,
+                              source_path, content_hash, claude_session_id)
+         SELECT 'claude:aaaa', agent, project_cwd, started_at, ended_at,
+                source_path, content_hash, claude_session_id
+         FROM sessions WHERE session_id = ?`,
+      )
+      .run(session.sessionId);
+    const first = s.listHooksForSession("claude:aaaa").length;
+    for (let i = 0; i < 5; i++) {
+      assert.equal(s.listHooksForSession("claude:aaaa").length, first, "election is stable");
+    }
+    // 'claude:aaaa' sorts before the fixture's 'claude:<hex>' id, so it wins.
+    assert.equal(first, 1, "the lowest session_id breaks a full tie");
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("claude_session_id is stamped by majority, not by whichever header arrived first", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-stamp-"));
   try {

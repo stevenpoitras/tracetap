@@ -11,6 +11,9 @@
   var hooksShowObserveOnly = false;
   var hooksForPane = [];
   var hooksMetaForPane = null;
+  // The hooks list and its meta are isolated sections, so either can fail
+  // alone. A blank list from a THROWN section is not evidence of anything.
+  var hooksSectionFailed = false;
 
   var INSPECTOR_EMPTY =
     '<div class="dim inspector-empty">Select a row to inspect its payload</div>';
@@ -2541,6 +2544,7 @@
     hooksMetaForPane = data.hooksMeta
       ? Object.assign({}, data.hooksMeta, { selfId: (data.session || {}).sessionId })
       : null;
+    hooksSectionFailed = !!(data.sectionErrors && data.sectionErrors.hooks);
     var flow = data.flow || { nodes: [], edges: [] };
     var siblings = data.siblings || [];
     stepsForPane = steps;
@@ -3396,11 +3400,11 @@
       // the taps are installed and the rows are indexed sends them in circles.
       var m = hooksMetaForPane;
       var why;
-      if (!m) {
-        // paneSection() returns null when the section threw. Without this the
-        // `!indexedTotal` branch below would fire and print the install advice
-        // this rewrite exists to delete — asserting a cause from a load failure.
-        why = "Could not determine why — the hook summary failed to load. Reload the page.";
+      if (!m || hooksSectionFailed) {
+        // paneSection() returns null when a section throws, and the list and its
+        // meta fail independently. Either way the emptiness is a load failure,
+        // not a finding — every branch below would assert a cause from it.
+        why = "Could not determine why — the hook data failed to load. Reload the page.";
       } else if (!m.indexedTotal) {
         why =
           "No hooks are indexed at all. Run <code>tracetap hooks install</code>, then " +
