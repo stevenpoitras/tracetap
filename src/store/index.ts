@@ -1,5 +1,5 @@
 import * as fs from "fs";
-import { sessionTitle } from "./title.js";
+import { activityTitle, sessionTitle } from "./title.js";
 import { hashFile, parseJsonlFile } from "../jsonl.js";
 import * as os from "os";
 import * as path from "path";
@@ -1584,7 +1584,9 @@ export class Store {
         cacheCreation: Number(r.cacheCreation ?? 0),
         costUsd: r.costUsd == null ? null : Number(r.costUsd),
         toolHistogram,
-        title: titles.get(String(r.sessionId)) ?? "",
+        // Falls back to what the session DID when nothing was typed in it —
+        // see activityTitle. Still "" when it also called no tools.
+        title: titles.get(String(r.sessionId)) || activityTitle(toolHistogram),
         agentCast: casts.get(String(r.sessionId))?.cast ?? [],
         unnamedAgentCalls: casts.get(String(r.sessionId))?.unnamed ?? 0,
         sourcePath: String(r.sourcePath ?? ""),
