@@ -47,6 +47,35 @@ test("buildStdinPreview still drops bulk and secret-prone payload", () => {
   assert.equal(out.tool_response, undefined, "tool output is not an identifier");
 });
 
+test("widening the allowlist did not let the sensitive neighbours through", () => {
+  // The fence is the list itself — nothing caps or sanitizes a key once it is
+  // on it. So the property worth pinning is which keys are NOT on it. These all
+  // travel on the same hook stdin as the join keys, and session_title in
+  // particular is a summary of the user's ask, present on SessionStart and
+  // UserPromptSubmit.
+  const out = buildStdinPreview({
+    session_id: "s1",
+    hook_event_name: "SessionStart",
+    tool_use_id: "toolu_keepme",
+    session_title: "Rotate the production database credentials",
+    compact_summary: "s".repeat(4000),
+    custom_instructions: "c".repeat(4000),
+    error_details: "e".repeat(4000),
+    message: "m".repeat(4000),
+  });
+  assert.equal(out.tool_use_id, "toolu_keepme", "the join key still lands");
+  for (const k of [
+    "session_title",
+    "compact_summary",
+    "custom_instructions",
+    "error_details",
+    "message",
+  ]) {
+    assert.ok(!(k in out), `${k} must stay outside the redaction fence`);
+  }
+  assert.ok(!JSON.stringify(out).includes("production database"));
+});
+
 test("absent join keys stay absent rather than becoming null", () => {
   // The allowlist copies only keys that are actually present, so a harness that
   // does not send them leaves no empty columns behind for consumers to guess at.

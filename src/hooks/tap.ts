@@ -26,9 +26,25 @@ export function buildStdinPreview(stdin: unknown): Record<string, unknown> {
   //                what partitions a flat hook stream into turns.
   //   agent_id     which subagent fired this, so lanes stop being guessed from
   //                tool names.
+  //   agent_type   that subagent's label ("Explore", "claude"), which names the
+  //                lane agent_id only identifies.
+  //   source       why a SessionStart fired — a closed enum of startup, resume,
+  //                clear, compact, fork. Not a join key; it is here because it
+  //                is the only wire-side witness to a session's provenance, and
+  //                it is bounded to those five literals.
+  //
+  // Every key on this list is an opaque identifier or a bounded literal, which
+  // is the bar for entering it: this allowlist is the redaction fence for hook
+  // stdin, and these events are indexed and rendered WITHOUT --redact-bodies.
+  // Measured against real captures, the longest of these is 36 chars. Their
+  // sensitive neighbours — session_title, prompt, tool_response,
+  // last_assistant_message, compact_summary, custom_instructions — stay off it.
   //
   // These are dropped at CAPTURE time, so a reindex can never recover them for
-  // events already on disk. Anything omitted here is unattributable forever.
+  // events already on disk. Anything omitted here is unattributable forever,
+  // which also means the corpus is mixed-shape: events captured before this
+  // will never carry these keys, and a consumer must read absence as "captured
+  // earlier", never as "no subagent".
   const copyKeys = [
     "session_id",
     "transcript_path",
