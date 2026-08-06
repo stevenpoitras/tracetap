@@ -104,6 +104,18 @@ export async function runIndex(argv: string[]): Promise<void> {
         `${c.dim}${result.filesSkipped} unchanged${c.reset} ` +
         `(${result.sessions} sessions, ${result.steps} steps)`,
     );
+    try {
+      const hooks = store.indexHooks();
+      if (hooks.filesIndexed + hooks.filesSkipped > 0) {
+        console.log(
+          `  hooks: ${c.green}${hooks.filesIndexed} indexed${c.reset}, ` +
+            `${c.dim}${hooks.filesSkipped} unchanged${c.reset} ` +
+            `(${hooks.events} events)`,
+        );
+      }
+    } catch {
+      /* optional */
+    }
   } finally {
     store.close();
   }

@@ -1,13 +1,20 @@
-import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as http from "node:http";
+import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { Store } from "../dist/store/index.js";
-import { handleRequest, parseServeArgs, reportPathFor } from "../dist/store/serve.js";
+import {
+    auditIndexedFiles,
+    clearAuditMemo,
+    clearXrayMemo,
+    handleRequest,
+    parseServeArgs,
+    reportPathFor,
+} from "../dist/store/serve.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -23,19 +30,67 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-serve-"));
   const claudeDir = path.join(tmp, "proj", ".claude-trace");
   const codexDir = path.join(tmp, "proj", ".codex-trace");
+  const hooksDir = path.join(tmp, "hooks");
   fs.mkdirSync(claudeDir, { recursive: true });
   fs.mkdirSync(codexDir, { recursive: true });
+  fs.mkdirSync(hooksDir, { recursive: true });
   claudeSource = path.join(claudeDir, "claude.jsonl");
   fs.copyFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), claudeSource);
-  fs.copyFileSync(path.join(TRAJ_FIX, "codex-tooluse.jsonl"), path.join(codexDir, "codex.jsonl"));
+  fs.copyFileSync(
+    path.join(TRAJ_FIX, "codex-tooluse.jsonl"),
+    path.join(codexDir, "codex.jsonl"),
+  );
+
+  // Hook events timed to overlap the claude fixture (timestamps ~1700000000).
+  const hookLines = [
+    {
+      v: 1,
+      ts: "2023-11-14T22:13:19.000Z",
+      session_id: "hook-sess-demo",
+      event: "UserPromptSubmit",
+      hook_name: "posture",
+      duration_ms: 3,
+      decision: null,
+      stdin_digest: "a".repeat(64),
+      stdin_preview: {
+        session_id: "hook-sess-demo",
+        hook_event_name: "UserPromptSubmit",
+      },
+      stdout_preview: { chars: 0 },
+      outcome: "ok",
+      exit_code: 0,
+    },
+    {
+      v: 1,
+      ts: "2023-11-14T22:13:21.000Z",
+      session_id: "hook-sess-demo",
+      event: "PreToolUse",
+      hook_name: "pre-tool",
+      duration_ms: 5,
+      decision: "allow",
+      stdin_digest: "b".repeat(64),
+      stdin_preview: { tool_name: "Read", session_id: "hook-sess-demo" },
+      stdout_preview: { decision: "allow" },
+      outcome: "ok",
+      exit_code: 0,
+    },
+  ];
+  fs.writeFileSync(
+    path.join(hooksDir, "hook-sess-demo.jsonl"),
+    hookLines.map((e) => JSON.stringify(e)).join("\n") + "\n",
+  );
 
   const dbPath = path.join(tmp, "index.db");
   store = new Store(dbPath);
   store.indexPaths([path.join(tmp, "proj")]);
+  store.indexHooks(hooksDir);
 
   // Write a sibling HTML report for the claude session so the report route
   // can serve real bytes for a known session.
-  fs.writeFileSync(reportPathFor(path.resolve(claudeSource)), "<html><body>claude report</body></html>");
+  fs.writeFileSync(
+    reportPathFor(path.resolve(claudeSource)),
+    "<html><body>claude report</body></html>",
+  );
 
   server = http.createServer((req, res) => handleRequest(store, req, res));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -53,11 +108,22 @@ after(async () => {
 async function get(p) {
   const res = await fetch(baseUrl + p);
   const text = await res.text();
-  return { status: res.status, contentType: res.headers.get("content-type") || "", text };
+  return {
+    status: res.status,
+    contentType: res.headers.get("content-type") || "",
+    text,
+  };
 }
 
 test("parseServeArgs parses port/host/db and rejects junk", () => {
-  const o = parseServeArgs(["--port", "4123", "--host", "0.0.0.0", "--db", "/tmp/x.db"]);
+  const o = parseServeArgs([
+    "--port",
+    "4123",
+    "--host",
+    "0.0.0.0",
+    "--db",
+    "/tmp/x.db",
+  ]);
   assert.equal(o.port, 4123);
   assert.equal(o.host, "0.0.0.0");
   assert.equal(o.dbPath, "/tmp/x.db");
@@ -85,7 +151,10 @@ test("GET / returns a self-contained HTML page", async () => {
   // are progressive enhancement with ui-monospace fallbacks — page works offline.)
   assert.match(r.text, /<style>/);
   assert.match(r.text, /\/api\/sessions/);
-  assert.ok(!/<script[^>]+src=/.test(r.text), "page must not load external scripts");
+  assert.ok(
+    !/<script[^>]+src=/.test(r.text),
+    "page must not load external scripts",
+  );
 });
 
 test("GET /api/sessions returns the seeded sessions", async () => {
@@ -98,7 +167,18 @@ test("GET /api/sessions returns the seeded sessions", async () => {
   const agents = body.sessions.map((s) => s.agent).sort();
   assert.deepEqual(agents, ["claude", "codex"]);
   // documented shape
-  for (const key of ["sessionId", "agent", "model", "startedAt", "durationMs", "totalInTokens", "totalOutTokens", "costUsd", "toolHistogram", "sourcePath"]) {
+  for (const key of [
+    "sessionId",
+    "agent",
+    "model",
+    "startedAt",
+    "durationMs",
+    "totalInTokens",
+    "totalOutTokens",
+    "costUsd",
+    "toolHistogram",
+    "sourcePath",
+  ]) {
     assert.ok(key in body.sessions[0], `session should expose '${key}'`);
   }
 });
@@ -121,7 +201,11 @@ test("GET /api/search returns a hit for a known term", async () => {
   assert.equal(body.query, "foo.txt");
   assert.ok(body.count >= 1, "expected at least one hit for foo.txt");
   assert.ok(body.hits[0].sessionId);
-  assert.match(body.hits[0].snippet, /\[/, "snippet should carry highlight markers");
+  assert.match(
+    body.hits[0].snippet,
+    /\[/,
+    "snippet should carry highlight markers",
+  );
 
   // empty query -> empty result, no error.
   const empty = JSON.parse((await get("/api/search?q=")).text);
@@ -181,7 +265,7 @@ test("GET /api/meta reports db counts and price source", async () => {
   assert.ok(["litellm", "litellm-cache", "builtin"].includes(body.priceSource));
 });
 
-test("GET /api/session/<id> returns transcript, requests, compactions", async () => {
+test("GET /api/session/<id> returns transcript, requests, hooks, flow, compactions", async () => {
   const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
   const id = list.sessions[0].sessionId;
   const r = await get("/api/session/" + encodeURIComponent(id));
@@ -192,10 +276,136 @@ test("GET /api/session/<id> returns transcript, requests, compactions", async ()
   assert.ok(body.requests.length >= 2, "per-pair wire rows expected");
   assert.equal(body.requests[0].seq, 0);
   assert.ok(Array.isArray(body.compactions));
+  assert.ok(Array.isArray(body.hooks), "hooks array expected");
+  assert.ok(body.hooks.length >= 2, "time-correlated hook events expected");
+  assert.ok(body.flow && Array.isArray(body.flow.nodes));
+  assert.ok(body.flow.nodes.length >= 3);
+  // The timeline is deliberately NOT here: building it can require reading every
+  // request body in the session, so it moved to its own endpoint rather than
+  // stalling all four panes.
+  assert.equal(body.contextTimeline, undefined, "timeline must not block the session load");
   assert.equal(typeof body.reportAvailable, "boolean");
 
   const missing = await get("/api/session/nope");
   assert.equal(missing.status, 404);
+});
+
+test("GET /api/session/<id>/timeline serves the context timeline separately", async () => {
+  const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
+  const id = list.sessions[0].sessionId;
+  const r = await get("/api/session/" + encodeURIComponent(id) + "/timeline");
+  assert.equal(r.status, 200);
+  const tl = JSON.parse(r.text);
+  assert.ok(Array.isArray(tl.points));
+  assert.ok(tl.points.length >= 1);
+  assert.equal(typeof tl.compactionCount, "number");
+  assert.equal(typeof tl.peakPromptTokens, "number");
+  // Every point carries composition, whether precomputed at index time or
+  // recovered by the fallback — the pane renders off these numbers.
+  assert.ok(tl.points.every((p) => typeof p.approxTokens === "number"));
+
+  const missing = await get("/api/session/nope/timeline");
+  assert.equal(missing.status, 404);
+});
+
+test("flow node detail is previewed in the graph and fetched per node", async () => {
+  const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
+  const id = list.sessions[0].sessionId;
+  const body = JSON.parse((await get("/api/session/" + encodeURIComponent(id))).text);
+
+  // Whatever the fixture's payload sizes, no node may carry both forms, and a
+  // trimmed node must say how much was withheld so the UI can label it.
+  for (const n of body.flow.nodes) {
+    assert.ok(!(n.detail && n.detailPreview), "node " + n.id + " carries both detail and preview");
+    if (n.detailPreview) {
+      assert.equal(typeof n.detailChars, "number");
+      assert.ok(n.detailChars > n.detailPreview.length);
+    }
+  }
+
+  const withDetail = body.flow.nodes.find((n) => n.detail || n.detailPreview);
+  if (withDetail) {
+    const r = await get(
+      "/api/session/" + encodeURIComponent(id) + "/flow/" + encodeURIComponent(withDetail.id),
+    );
+    assert.equal(r.status, 200);
+    const full = JSON.parse(r.text);
+    assert.equal(full.id, withDetail.id);
+    assert.ok(full.detail, "per-node endpoint returns the untrimmed detail");
+  }
+
+  const missing = await get("/api/session/" + encodeURIComponent(id) + "/flow/no-such-node");
+  assert.equal(missing.status, 404);
+});
+
+test("GET /api/session/<id>/context/<seq> returns Context X-Ray with delta", async () => {
+  const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
+  const id = list.sessions[0].sessionId;
+  const r0 = await get("/api/session/" + encodeURIComponent(id) + "/context/0");
+  assert.equal(r0.status, 200);
+  const x0 = JSON.parse(r0.text);
+  assert.equal(x0.seq, 0);
+  assert.ok(Array.isArray(x0.buckets));
+  assert.ok(x0.buckets.length >= 1);
+  assert.ok(Array.isArray(x0.segments));
+
+  const r1 = await get("/api/session/" + encodeURIComponent(id) + "/context/1");
+  assert.equal(r1.status, 200);
+  const x1 = JSON.parse(r1.text);
+  assert.equal(x1.seq, 1);
+  assert.ok(x1.delta, "second call should include delta vs prior");
+  assert.equal(x1.delta.prevSeq, 0);
+  assert.ok(typeof x1.delta.newCount === "number");
+
+  const missing = await get(
+    "/api/session/" + encodeURIComponent(id) + "/context/99",
+  );
+  assert.equal(missing.status, 404);
+});
+
+test("GET /api/session/<id>/context/<seq> is memoized until the source log changes", async () => {
+  const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
+  const id = list.sessions[0].sessionId;
+  const url = (seq) => "/api/session/" + encodeURIComponent(id) + "/context/" + seq;
+
+  // Every X-Ray costs one read + parse of the whole source JSONL, so what has
+  // to be asserted is how often that happens — not that the route answers 200.
+  clearXrayMemo();
+  const build = Store.prototype.sessionContextXrayWindow;
+  let builds = 0;
+  store.sessionContextXrayWindow = function (...args) {
+    builds += 1;
+    return build.apply(this, args);
+  };
+  const before = fs.statSync(claudeSource);
+  try {
+    const first = await get(url(0));
+    assert.equal(first.status, 200);
+    assert.equal(builds, 1, "cold call reads the source log once");
+
+    const second = await get(url(0));
+    assert.equal(second.status, 200);
+    assert.equal(builds, 1, "identical repeat must not recompute");
+    assert.equal(second.text, first.text, "cached payload is byte-identical");
+
+    // Neighbouring calls come out of that same parse, so stepping through the
+    // X-Ray pane does not pay for the file again.
+    const next = await get(url(1));
+    assert.equal(next.status, 200);
+    assert.equal(JSON.parse(next.text).seq, 1);
+    assert.equal(builds, 1, "neighbouring seq is served from the warmed window");
+
+    // A log that grew or was rewritten must not be answered from the memo.
+    const later = new Date(before.mtimeMs + 60_000);
+    fs.utimesSync(claudeSource, later, later);
+    const afterTouch = await get(url(0));
+    assert.equal(afterTouch.status, 200);
+    assert.equal(builds, 2, "changed source log invalidates the memo");
+  } finally {
+    delete store.sessionContextXrayWindow;
+    fs.utimesSync(claudeSource, before.atime, before.mtime);
+    clearXrayMemo();
+  }
 });
 
 test("GET /api/usage aggregates priced buckets", async () => {
@@ -207,7 +417,9 @@ test("GET /api/usage aggregates priced buckets", async () => {
   assert.ok(body.totals.events >= 2);
   assert.ok(body.totals.costUsd > 0, "fixture models are priced");
 
-  const breakdown = JSON.parse((await get("/api/usage?granularity=total&breakdown=1")).text);
+  const breakdown = JSON.parse(
+    (await get("/api/usage?granularity=total&breakdown=1")).text,
+  );
   assert.ok(breakdown.rows.length >= 2, "per-model rows expected");
   assert.ok(breakdown.rows.every((row) => row.group));
 });
@@ -249,7 +461,9 @@ test("GET /api/prompts + /api/prompt/<hash> expose the registry", async () => {
   assert.equal(first.promptHash.length, 64);
   assert.ok(first.requestCount >= 1);
 
-  const detail = JSON.parse((await get("/api/prompt/" + first.promptHash.slice(0, 10))).text);
+  const detail = JSON.parse(
+    (await get("/api/prompt/" + first.promptHash.slice(0, 10))).text,
+  );
   assert.equal(detail.promptHash, first.promptHash);
   assert.ok(detail.content.length > 0);
   assert.ok(Array.isArray(detail.sessionIds) && detail.sessionIds.length >= 1);
@@ -280,4 +494,210 @@ test("GET /api/audit scans indexed source files (memoized)", async () => {
   assert.ok(report.redactCheck, "serve audit always includes redact-check");
   const strict = JSON.parse((await get("/api/audit?mode=strict")).text);
   assert.equal(strict.mode, "strict");
+});
+
+test("audit scans are cached per file and survive a new process", async () => {
+  const baseline = JSON.parse((await get("/api/audit")).text);
+  assert.ok(baseline.filesScanned >= 1);
+
+  const cached = store.db
+    .prepare("SELECT source_path, content_hash, mode FROM audit_scans WHERE mode = 'standard'")
+    .all();
+  assert.equal(
+    cached.length,
+    baseline.filesScanned,
+    "one cached scan row per scanned file, not one per report",
+  );
+  const hashes = store.db
+    .prepare("SELECT source_path AS p, content_hash AS h FROM files")
+    .all();
+  for (const row of cached) {
+    const f = hashes.find((x) => x.p === row.source_path);
+    assert.ok(f, "cached scan references an indexed file");
+    assert.equal(row.content_hash, f.h, "cache is keyed on the file's indexed content hash");
+  }
+
+  // The point of persisting: a fresh process must not rescan. Prove it by
+  // making the log unreadable — a rescan would silently drop it from the
+  // report, a cache hit keeps it.
+  const moved = claudeSource + ".moved";
+  fs.renameSync(claudeSource, moved);
+  clearAuditMemo(); // drop the in-process layer so SQLite is what answers
+  try {
+    const fresh = await auditIndexedFiles(store, "standard");
+    assert.equal(
+      fresh.filesScanned,
+      baseline.filesScanned,
+      "unreadable-but-cached file still counted — it was not rescanned",
+    );
+    assert.equal(fresh.pairsScanned, baseline.pairsScanned);
+  } finally {
+    fs.renameSync(moved, claudeSource);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Cross-session isolation (loadSessionPairs + the time-window hook join)
+// ---------------------------------------------------------------------------
+
+/** Fresh store with one indexed claude wire session in its own tmp dir. */
+function makeClaudeStore(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const claudeDir = path.join(dir, "proj", ".claude-trace");
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const source = path.join(claudeDir, "claude.jsonl");
+  fs.copyFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), source);
+  const s = new Store(path.join(dir, "index.db"));
+  s.indexPaths([path.join(dir, "proj")]);
+  const session = s.listSessions({ agent: "claude" })[0];
+  return { dir, store: s, source, session };
+}
+
+/** One hook-tap JSONL event, timed inside the claude fixture's window. */
+function hookEvent(overrides) {
+  return {
+    v: 1,
+    ts: "2023-11-14T22:13:19.000Z",
+    session_id: "hook-a",
+    event: "UserPromptSubmit",
+    hook_name: "h",
+    duration_ms: 1,
+    decision: null,
+    stdin_digest: "c".repeat(64),
+    stdin_preview: {},
+    stdout_preview: { chars: 0 },
+    outcome: "ok",
+    exit_code: 0,
+    ...overrides,
+  };
+}
+
+function writeHookLog(dir, name, events) {
+  fs.writeFileSync(
+    path.join(dir, name),
+    events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+  );
+}
+
+test("rewritten source log stops serving bodies instead of serving another session's", () => {
+  const { dir, store: s, source, session } = makeClaudeStore("tracetap-rewrite-");
+  try {
+    // Baseline: the indexed session's bodies are readable from its source.
+    assert.ok(s.getRawPair(session.sessionId, 0), "pair 0 expected before rewrite");
+    assert.ok(s.sessionContextXray(session.sessionId, 0), "xray expected before rewrite");
+
+    // Rewrite the log in place with a DIFFERENT conversation (system prompt
+    // change flips the conversation key) — the db row still points here, but
+    // the content no longer holds this session.
+    const rewritten = fs
+      .readFileSync(source, "utf-8")
+      .replaceAll("You are Claude Code.", "You are a different agent now.");
+    fs.writeFileSync(source, rewritten);
+
+    // No groups[0] fallback: the other conversation's bodies must NOT be
+    // served under the stale session id.
+    assert.equal(s.getRawPair(session.sessionId, 0), null);
+    assert.equal(s.sessionContextXray(session.sessionId, 0), null);
+    assert.deepEqual(s.sessionContextXrayWindow(session.sessionId, 0, 2), []);
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hook time join drops events whose cwd identifies a different session", () => {
+  const { dir, store: s, session } = makeClaudeStore("tracetap-hookcwd-");
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    writeHookLog(hooksDir, "hook-a.jsonl", [
+      hookEvent({
+        session_id: "hook-a",
+        stdin_preview: { cwd: session.projectCwd + "/" }, // trailing slash still matches
+        payload: { prompt: "mine-full-payload" },
+      }),
+    ]);
+    writeHookLog(hooksDir, "hook-b.jsonl", [
+      hookEvent({
+        session_id: "hook-b",
+        ts: "2023-11-14T22:13:20.000Z",
+        stdin_preview: { cwd: "/somewhere/else/entirely" },
+        payload: { prompt: "OTHER-SESSION-SECRET" },
+      }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    const rows = s.listHooksForSession(session.sessionId);
+    assert.ok(rows.length >= 1, "same-cwd hook events expected");
+    assert.ok(rows.every((r) => r.sessionId === "hook-a"), "conflicting-cwd session excluded");
+    // Sole surviving hook session => unambiguous, full payload kept.
+    assert.equal(rows[0].payload.prompt, "mine-full-payload");
+    assert.ok(!JSON.stringify(rows).includes("OTHER-SESSION-SECRET"));
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous hook time join withholds full payloads from every candidate", () => {
+  const { dir, store: s, session } = makeClaudeStore("tracetap-hookambig-");
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    // Two concurrent hook sessions, neither carrying a cwd identity: the join
+    // cannot tell which belongs to the wire session.
+    writeHookLog(hooksDir, "hook-a.jsonl", [
+      hookEvent({ session_id: "hook-a", payload: { prompt: "A-full-prompt" } }),
+    ]);
+    writeHookLog(hooksDir, "hook-b.jsonl", [
+      hookEvent({
+        session_id: "hook-b",
+        ts: "2023-11-14T22:13:20.000Z",
+        payload: { prompt: "B-full-prompt" },
+      }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    const rows = s.listHooksForSession(session.sessionId);
+    // Timeline keeps its shape (both sessions' events listed)...
+    assert.deepEqual(new Set(rows.map((r) => r.sessionId)), new Set(["hook-a", "hook-b"]));
+    // ...but no full payload can be attributed, so none is served.
+    assert.ok(rows.every((r) => r.payload === null), "payloads withheld when unattributable");
+    const text = JSON.stringify(rows);
+    assert.ok(!text.includes("A-full-prompt"));
+    assert.ok(!text.includes("B-full-prompt"));
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("exact hook session_id match disables the time join entirely", () => {
+  const { dir, store: s, session } = makeClaudeStore("tracetap-hookexact-");
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    // A hook log whose session_id IS the wire session id (exact identity),
+    // plus a concurrent foreign session inside the time window.
+    writeHookLog(hooksDir, "exact.jsonl", [
+      hookEvent({ session_id: session.sessionId, payload: { prompt: "exact-full" } }),
+    ]);
+    writeHookLog(hooksDir, "hook-b.jsonl", [
+      hookEvent({
+        session_id: "hook-b",
+        ts: "2023-11-14T22:13:20.000Z",
+        payload: { prompt: "FOREIGN-full" },
+      }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    const rows = s.listHooksForSession(session.sessionId);
+    assert.ok(rows.length >= 1);
+    assert.ok(rows.every((r) => r.sessionId === session.sessionId), "only exact-id rows served");
+    assert.equal(rows[0].payload.prompt, "exact-full", "exact identity keeps its payload");
+    assert.ok(!JSON.stringify(rows).includes("FOREIGN-full"));
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

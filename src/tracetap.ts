@@ -72,6 +72,11 @@ ${colors.yellow}COMMANDS:${colors.reset}
                               search · filter · live-tail · diff · ATIF export
   serve [--port <n>]          Launch a local dashboard (browser UI) over every
                               indexed session (--host/--db; default :4000)
+  hooks <tap|install|status|discover|track|uninstall>
+                              Capture Claude Code hook events into
+                              ~/.tracetap/hooks for Flow / Hooks / Context X-Ray
+                              (discover/track wrap repo hooks; uninstall cleans up —
+                              stopping serve does NOT remove hooks)
 
 ${colors.yellow}EXAMPLES:${colors.reset}
   tracetap claude                                  # interactive Claude Code, logged
@@ -139,6 +144,11 @@ async function main(): Promise<void> {
   if (argv[0] === "serve") {
     const { runServe } = await import("./store/serve");
     await runServe(argv.slice(1));
+    return;
+  }
+  if (argv[0] === "hooks") {
+    const { runHooksCli } = await import("./hooks/cli");
+    await runHooksCli(argv.slice(1));
     return;
   }
 

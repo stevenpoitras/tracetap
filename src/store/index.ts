@@ -9,6 +9,20 @@ import { buildTrajectory, groupPairs } from "../trajectory";
 import type { PairGroup, Trajectory, Step } from "../trajectory";
 import { analyze, costForMetrics, priceFor } from "../analytics";
 import type { PriceTable } from "../analytics";
+import type { HookEvent, HookRow } from "../hooks/types";
+import { HOOK_EVENT_VERSION } from "../hooks/types";
+import { defaultHooksDir } from "../hooks/paths";
+import { deriveFlow } from "../flow/derive";
+import type { FlowGraph } from "../flow/derive";
+import { buildContextXray } from "../context/xray";
+import type { ContextXray } from "../context/xray";
+import type { AuditFileScan } from "../audit";
+import { buildContextTimeline, findCompactions } from "../context/timeline";
+import type {
+  CompactionTrigger,
+  ContextMetrics,
+  ContextTimeline,
+} from "../context/timeline";
 
 /**
  * Local cross-session trace store + search.
@@ -110,6 +124,8 @@ export interface IndexResult {
 }
 
 export interface SessionListFilters {
+  /** Exactly this session id — the single-row lookup {@link Store.getSession} uses. */
+  sessionId?: string;
   /** Substring (case-insensitive) the session agent name must contain. */
   agent?: string;
   /** Substring (case-insensitive) the session model id must contain. */
@@ -272,7 +288,16 @@ const SORTABLE_COLUMNS = new Set([
   "cost_usd",
 ]);
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 5;
+
+/**
+ * How long after a `PreCompact` hook its compacted call may arrive, and how far
+ * the wire timestamp may run ahead of the hook's. Compaction itself can take
+ * seconds on a large transcript; the slack absorbs clock skew between the hook
+ * process and the proxy.
+ */
+const COMPACT_HOOK_WINDOW_SEC = 120;
+const COMPACT_HOOK_SLACK_SEC = 5;
 
 // ---------------------------------------------------------------------------
 // Paths / discovery
@@ -468,6 +493,9 @@ export class Store {
         DROP TABLE IF EXISTS requests;
         DROP TABLE IF EXISTS usage_events;
         DROP TABLE IF EXISTS prompts;
+        DROP TABLE IF EXISTS hooks;
+        DROP TABLE IF EXISTS hook_files;
+        DROP TABLE IF EXISTS audit_scans;
       `);
     }
 
@@ -530,7 +558,13 @@ export class Store {
         transcript_items INTEGER NOT NULL DEFAULT 0,
         prompt_hash      TEXT NOT NULL DEFAULT '',
         agent_step_index INTEGER,
-        source_path      TEXT NOT NULL
+        source_path      TEXT NOT NULL,
+        -- Context composition, computed once here rather than on every read.
+        -- Rebuilding it at serve time meant re-reading and re-segmenting every
+        -- request body in the session; see sessionContextTimeline.
+        ctx_total_chars  INTEGER,
+        ctx_total_tokens INTEGER,
+        ctx_buckets_json TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id, seq);
       CREATE INDEX IF NOT EXISTS idx_requests_ts      ON requests(ts);
@@ -560,6 +594,48 @@ export class Store {
         first_seen  REAL,
         last_seen   REAL
       );
+      -- One cached secret-scan per (log, content, detector mode). Scanning is
+      -- linear in log bytes and wire logs run to hundreds of MB, so a file whose
+      -- content hash is unchanged must never be rescanned — the same watermark
+      -- contract indexFile uses, applied to the audit.
+      CREATE TABLE IF NOT EXISTS audit_scans (
+        source_path   TEXT NOT NULL,
+        content_hash  TEXT NOT NULL,
+        mode          TEXT NOT NULL,
+        redact_check  INTEGER NOT NULL,
+        pairs_scanned INTEGER NOT NULL,
+        standard_masked INTEGER NOT NULL,
+        strict_masked INTEGER NOT NULL,
+        occurrences_json TEXT NOT NULL,
+        scanned_at    TEXT NOT NULL,
+        PRIMARY KEY (source_path, content_hash, mode, redact_check)
+      );
+      CREATE TABLE IF NOT EXISTS hook_files (
+        source_path  TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        mtime_ms     INTEGER NOT NULL,
+        size         INTEGER NOT NULL,
+        indexed_at   TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS hooks (
+        id              INTEGER PRIMARY KEY,
+        session_id      TEXT NOT NULL,
+        ts              REAL NOT NULL,
+        event           TEXT NOT NULL,
+        hook_name       TEXT NOT NULL DEFAULT '',
+        duration_ms     INTEGER,
+        decision        TEXT,
+        stdin_digest    TEXT NOT NULL DEFAULT '',
+        stdin_preview   TEXT NOT NULL DEFAULT '{}',
+        stdout_preview  TEXT,
+        outcome         TEXT,
+        exit_code       INTEGER,
+        payload_json    TEXT,
+        source_path     TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_hooks_session ON hooks(session_id, ts);
+      CREATE INDEX IF NOT EXISTS idx_hooks_ts ON hooks(ts);
+      CREATE INDEX IF NOT EXISTS idx_hooks_source ON hooks(source_path);
     `);
     this.db
       .prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
@@ -722,8 +798,9 @@ export class Store {
          session_id, seq, ts, model, status, duration_ms, ttft_ms,
          prompt_tokens, completion_tokens, cache_read, cache_creation,
          reasoning_tokens, stop_reason, errored, transcript_items,
-         prompt_hash, agent_step_index, source_path
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         prompt_hash, agent_step_index, source_path,
+         ctx_total_chars, ctx_total_tokens, ctx_buckets_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const upsertPrompt = this.db.prepare(
       `INSERT INTO prompts(prompt_hash, agent, content, first_seen, last_seen)
@@ -773,6 +850,10 @@ export class Store {
       const u = resp.usage;
       const producedStep = resp.items.length > 0 || resp.usage != null;
       const agentStepIndex = producedStep ? (agentSteps[agentCursor++]?.index ?? null) : null;
+      // Segment the prompt once, here. Doing it lazily meant every dashboard
+      // load re-read and re-parsed every body in the session. A body that will
+      // not segment is stored as NULL, and the read path falls back for it.
+      const ctx = contextMetricsForPair(seq, pair, promptHash);
       ins.run(
         group.sessionId,
         seq,
@@ -792,6 +873,9 @@ export class Store {
         promptHash,
         agentStepIndex,
         sourcePath,
+        ctx?.totalChars ?? null,
+        ctx?.totalApproxTokens ?? null,
+        ctx ? JSON.stringify(ctx.buckets) : null,
       );
     });
   }
@@ -852,6 +936,12 @@ export class Store {
       else filesIndexed += 1;
       sessions += res.sessions;
       steps += res.steps;
+    }
+    // Also fold in the hook sidecar (idempotent).
+    try {
+      this.indexHooks();
+    } catch {
+      /* hooks dir may be absent */
     }
     return { files: results, filesIndexed, filesSkipped, sessions, steps };
   }
@@ -982,6 +1072,10 @@ export class Store {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
 
+    if (filters.sessionId) {
+      where.push("s.session_id = @sessionId");
+      params.sessionId = filters.sessionId;
+    }
     if (filters.agent) {
       where.push("lower(s.agent) LIKE '%' || lower(@agent) || '%'");
       params.agent = filters.agent;
@@ -1092,10 +1186,15 @@ export class Store {
     });
   }
 
-  /** Look up a single indexed session by id, or null when absent. */
+  /**
+   * Look up a single indexed session by id, or null when absent.
+   *
+   * Filtered in SQL. Listing every session and picking one out in JS cost ~110ms
+   * on a real index — the per-row `turns`/`errorCount` subqueries are counts over
+   * the whole FTS table — and nearly every session route calls this at least once.
+   */
   getSession(sessionId: string): SessionSummary | null {
-    const rows = this.listSessions();
-    return rows.find((s) => s.sessionId === sessionId) ?? null;
+    return this.listSessions({ sessionId })[0] ?? null;
   }
 
   // -- transcript ------------------------------------------------------------
@@ -1295,6 +1394,544 @@ export class Store {
       sessionIds: sessionRows.map((s) => String(s.session_id)),
     };
   }
+
+  // -- hooks sidecar ---------------------------------------------------------
+
+  /**
+   * Index hook JSONL files under a directory (default: `~/.tracetap/hooks`).
+   * Watermarked like wire logs — unchanged files are skipped.
+   */
+  indexHooks(hooksDir?: string): { filesIndexed: number; filesSkipped: number; events: number } {
+    const dir = hooksDir && hooksDir.trim() ? hooksDir : defaultHooksDir();
+    let filesIndexed = 0;
+    let filesSkipped = 0;
+    let events = 0;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return { filesIndexed, filesSkipped, events };
+    }
+    for (const e of entries) {
+      if (!e.isFile() || !e.name.endsWith(".jsonl")) continue;
+      const sourcePath = path.resolve(dir, e.name);
+      try {
+        const res = this.indexHookFile(sourcePath);
+        if (res.skipped) filesSkipped += 1;
+        else {
+          filesIndexed += 1;
+          events += res.events;
+        }
+      } catch {
+        continue;
+      }
+    }
+    return { filesIndexed, filesSkipped, events };
+  }
+
+  indexHookFile(jsonlPath: string): { sourcePath: string; skipped: boolean; events: number } {
+    const sourcePath = path.resolve(jsonlPath);
+    const st = fs.statSync(sourcePath);
+    const content = fs.readFileSync(sourcePath, "utf-8");
+    const contentHash = crypto.createHash("sha256").update(content).digest("hex");
+    const prior = this.db
+      .prepare("SELECT content_hash FROM hook_files WHERE source_path = ?")
+      .get(sourcePath) as { content_hash: string } | undefined;
+    if (prior && prior.content_hash === contentHash) {
+      return { sourcePath, skipped: true, events: 0 };
+    }
+
+    const events: HookEvent[] = [];
+    for (const raw of content.split("\n")) {
+      const line = raw.trim();
+      if (!line) continue;
+      try {
+        const ev = JSON.parse(line) as HookEvent;
+        if (ev && (ev.v === HOOK_EVENT_VERSION || ev.v === 1) && ev.session_id && ev.event) {
+          events.push(ev);
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    const run = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM hooks WHERE source_path = ?").run(sourcePath);
+      const ins = this.db.prepare(
+        `INSERT INTO hooks(
+           session_id, ts, event, hook_name, duration_ms, decision,
+           stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
+           payload_json, source_path
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const ev of events) {
+        const ts = Date.parse(ev.ts) / 1000;
+        ins.run(
+          ev.session_id,
+          Number.isFinite(ts) ? ts : 0,
+          ev.event,
+          ev.hook_name ?? "",
+          ev.duration_ms ?? null,
+          ev.decision ?? null,
+          ev.stdin_digest ?? "",
+          JSON.stringify(ev.stdin_preview ?? {}),
+          ev.stdout_preview != null ? JSON.stringify(ev.stdout_preview) : null,
+          ev.outcome ?? null,
+          ev.exit_code ?? null,
+          ev.payload !== undefined ? JSON.stringify(ev.payload) : null,
+          sourcePath,
+        );
+      }
+      this.db
+        .prepare(
+          `INSERT OR REPLACE INTO hook_files(source_path, content_hash, mtime_ms, size, indexed_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(sourcePath, contentHash, Math.round(st.mtimeMs), st.size, new Date().toISOString());
+    });
+    run();
+    return { sourcePath, skipped: false, events: events.length };
+  }
+
+  /**
+   * Hooks for a wire session: exact `session_id` match OR time-overlap with the
+   * session window (±10 min slack). Wire conversation keys rarely equal Claude's
+   * hook session_id, so time correlation is the practical bridge.
+   *
+   * The time join is fenced so it cannot serve another session's data:
+   * - When any exact `session_id` row exists, the wire id IS the hook session
+   *   id, so the join is skipped outright — it could only add foreign rows.
+   * - A hook event that carries a `cwd` identity conflicting with this
+   *   session's project cwd belongs to a different session and is dropped.
+   * - When more than one hook session survives in the window, none can be
+   *   attributed with certainty, so full `payload` bodies (--full stdin: prompt
+   *   text, tool inputs) are withheld from all of them — the timeline keeps its
+   *   shape, but another session's payloads are never served under this one.
+   */
+  listHooksForSession(sessionId: string): HookRow[] {
+    const session = this.getSession(sessionId);
+    const byId = this.db
+      .prepare(
+        `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
+                stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
+                payload_json, source_path
+         FROM hooks WHERE session_id = ? ORDER BY ts, id`,
+      )
+      .all(sessionId) as any[];
+
+    let byTime: any[] = [];
+    if (session && !byId.length) {
+      const slack = 600; // 10 minutes — long tool calls can lag the wire window
+      const start = session.startedAt > 0 ? session.startedAt - slack : 0;
+      const end = session.endedAt > 0 ? session.endedAt + slack : Number.MAX_SAFE_INTEGER;
+      byTime = this.db
+        .prepare(
+          `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
+                  stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
+                  payload_json, source_path
+           FROM hooks
+           WHERE ts >= ? AND ts <= ?
+           ORDER BY ts, id`,
+        )
+        .all(start, end) as any[];
+    }
+
+    const rows: HookRow[] = byId.map(hookRowFromDb);
+    const sessionCwd = normalizeCwd(session?.projectCwd);
+    const timeRows: HookRow[] = [];
+    for (const r of byTime) {
+      const row = hookRowFromDb(r);
+      // The tap records Claude's cwd in the stdin preview; a mismatch with the
+      // wire session's project is positive identity for a DIFFERENT session.
+      const hookCwd = normalizeCwd((row.stdinPreview as any)?.cwd);
+      if (hookCwd && sessionCwd && hookCwd !== sessionCwd) continue;
+      timeRows.push(row);
+    }
+    const hookSessions = new Set(timeRows.map((r) => r.sessionId));
+    if (hookSessions.size > 1) {
+      for (const row of timeRows) row.payload = null;
+    }
+    rows.push(...timeRows);
+    rows.sort((a, b) => a.ts - b.ts || a.id - b.id);
+    return rows;
+  }
+
+  /** Build the Flow graph for one session (steps + hooks + requests). */
+  sessionFlow(sessionId: string): FlowGraph {
+    return deriveFlow({
+      steps: this.listSteps(sessionId),
+      hooks: this.listHooksForSession(sessionId),
+      requests: this.listRequests(sessionId),
+    });
+  }
+
+  /**
+   * Every RawPair of one session, from ONE read+parse of its source JSONL.
+   *
+   * The source log is the expensive input on every body-reading path: capture
+   * files run to hundreds of MB, and reading + `JSON.parse`ing one is ~0.4s per
+   * 100MB. Callers that need more than a single pair must go through here so
+   * they pay that once, not once per pair.
+   *
+   * Returns null when the source file is missing or unreadable, or when its
+   * current content no longer contains this session — a log rewritten or
+   * rotated in place between index passes holds a *different* conversation,
+   * and serving its pairs under this session id would cross-wire bodies.
+   */
+  private loadSessionPairs(sessionId: string): RawPair[] | null {
+    const session = this.getSession(sessionId);
+    if (!session?.sourcePath) return null;
+    let content: string;
+    try {
+      content = fs.readFileSync(session.sourcePath, "utf-8");
+    } catch {
+      return null;
+    }
+    const pairs = parsePairs(content);
+    // Pairs in the file may span multiple conversation groups; filter to this
+    // session. No fallback: the grouping is deterministic over content, so a
+    // miss means the file no longer holds this conversation — answer null (the
+    // routes 404) rather than another session's bodies.
+    const groups = groupPairs(pairs);
+    const group = groups.find((g) => g.sessionId === sessionId);
+    return group ? group.pairs : null;
+  }
+
+  /**
+   * Load the RawPair at `seq` for a session from its source JSONL (on disk).
+   * Returns null when the source file is missing or seq is out of range.
+   */
+  getRawPair(sessionId: string, seq: number): RawPair | null {
+    return this.loadSessionPairs(sessionId)?.[seq] ?? null;
+  }
+
+  /**
+   * A cheap validity token for anything derived from a session's source JSONL:
+   * the resolved path plus the file's mtime and size. Memoizing callers key on
+   * it so an appended, rewritten or rotated log misses instead of serving a
+   * stale view. Empty string when the session or its file is gone.
+   *
+   * Deliberately NOT the db mtime signature the SSE poller uses: the index is
+   * rewritten every re-index pass (~30s) whether or not any log changed, and
+   * every X-Ray input — bodies, and the `promptHash` recorded from them — is a
+   * function of the source file alone.
+   */
+  sessionSourceSignature(sessionId: string): string {
+    const session = this.getSession(sessionId);
+    if (!session?.sourcePath) return "";
+    try {
+      const st = fs.statSync(session.sourcePath);
+      return `${session.sourcePath}:${st.mtimeMs}:${st.size}`;
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Context X-Rays for `seq` and up to `radius` calls either side of it, in
+   * ascending seq order. Empty when the source is unreadable or `seq` is out
+   * of range.
+   *
+   * The window exists because the cost here is the file, not the X-Ray: reading
+   * and parsing a 96MB capture log is ~0.5s while building one X-Ray from the
+   * parsed pairs is ~6ms. One parse therefore yields a whole neighbourhood of
+   * views almost for free, and stepping through a session pays the read once
+   * rather than once per call.
+   */
+  sessionContextXrayWindow(sessionId: string, seq: number, radius = 0): ContextXray[] {
+    const pairs = this.loadSessionPairs(sessionId);
+    if (!pairs?.[seq]) return [];
+    // One request row per pair, seq === pair index (see insertRequests), so the
+    // previous call is simply pairs[i - 1].
+    const promptHashes = new Map(this.listRequests(sessionId).map((r) => [r.seq, r.promptHash]));
+    const from = Math.max(0, seq - radius);
+    const to = Math.min(pairs.length - 1, seq + radius);
+    const out: ContextXray[] = [];
+    for (let i = from; i <= to; i++) {
+      if (!pairs[i]) continue;
+      out.push(
+        buildContextXray({
+          seq: i,
+          pair: pairs[i],
+          promptHash: promptHashes.get(i) ?? "",
+          prev: i > 0 && pairs[i - 1] ? { seq: i - 1, pair: pairs[i - 1] } : undefined,
+        }),
+      );
+    }
+    return out;
+  }
+
+  /** Context X-Ray for one API call, with delta vs the previous call when present. */
+  sessionContextXray(sessionId: string, seq: number): ContextXray | null {
+    return this.sessionContextXrayWindow(sessionId, seq, 0)[0] ?? null;
+  }
+
+  /**
+   * Context-size timeline across API calls, with compaction pre/post markers.
+   * Reads source JSONL when present so approx tokens / buckets are real.
+   */
+  /**
+   * A previously cached secret-scan for one log, or null on a miss.
+   *
+   * Keyed on the file's content hash, so an edited or rotated log misses and is
+   * rescanned. Rows for superseded hashes are harmless — {@link putAuditScan}
+   * clears them on write.
+   */
+  getAuditScan(
+    sourcePath: string,
+    contentHash: string,
+    mode: string,
+    redactCheck: boolean,
+  ): AuditFileScan | null {
+    const row = this.db
+      .prepare(
+        `SELECT pairs_scanned, standard_masked, strict_masked, occurrences_json
+           FROM audit_scans
+          WHERE source_path = ? AND content_hash = ? AND mode = ? AND redact_check = ?`,
+      )
+      .get(sourcePath, contentHash, mode, redactCheck ? 1 : 0) as any;
+    if (!row) return null;
+    try {
+      return {
+        path: sourcePath,
+        pairsScanned: Number(row.pairs_scanned ?? 0),
+        standardMasked: Number(row.standard_masked ?? 0),
+        strictMasked: Number(row.strict_masked ?? 0),
+        occurrences: JSON.parse(String(row.occurrences_json || "[]")),
+      };
+    } catch {
+      return null; // corrupt row — treat as a miss and rescan
+    }
+  }
+
+  putAuditScan(
+    scan: AuditFileScan,
+    contentHash: string,
+    mode: string,
+    redactCheck: boolean,
+  ): void {
+    // Drop stale hashes for this file so the table tracks the log, not its history.
+    this.db
+      .prepare("DELETE FROM audit_scans WHERE source_path = ? AND mode = ? AND redact_check = ?")
+      .run(scan.path, mode, redactCheck ? 1 : 0);
+    this.db
+      .prepare(
+        `INSERT INTO audit_scans(
+           source_path, content_hash, mode, redact_check,
+           pairs_scanned, standard_masked, strict_masked, occurrences_json, scanned_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        scan.path,
+        contentHash,
+        mode,
+        redactCheck ? 1 : 0,
+        scan.pairsScanned,
+        scan.standardMasked,
+        scan.strictMasked,
+        JSON.stringify(scan.occurrences),
+        new Date().toISOString(),
+      );
+  }
+
+  /**
+   * Context composition per call, as recorded at index time.
+   *
+   * Deliberately its own narrow query rather than extra fields on
+   * {@link listRequests}: the bucket JSON is only wanted by the timeline, and
+   * `requests` is sent to the dashboard on every session load.
+   */
+  private contextMetricsFor(sessionId: string): Map<number, ContextMetrics> {
+    const out = new Map<number, ContextMetrics>();
+    const rows = this.db
+      .prepare(
+        `SELECT seq, ctx_total_chars, ctx_total_tokens, ctx_buckets_json
+           FROM requests WHERE session_id = ? AND ctx_total_tokens IS NOT NULL`,
+      )
+      .all(sessionId) as any[];
+    for (const r of rows) {
+      let buckets: Record<string, number> = {};
+      try {
+        buckets = JSON.parse(String(r.ctx_buckets_json || "{}"));
+      } catch {
+        continue; // a corrupt row falls back to live computation below
+      }
+      out.set(Number(r.seq), {
+        totalChars: Number(r.ctx_total_chars ?? 0),
+        totalApproxTokens: Number(r.ctx_total_tokens ?? 0),
+        buckets,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * seq → what triggered the compaction at that seq, from `PreCompact` hooks.
+   *
+   * `PreCompact` is the only source that can tell `manual` (the user typed
+   * /compact) from `auto` (the harness hit its limit) — the harness puts that
+   * word in the hook payload's `trigger`. Nothing on the wire carries it: a
+   * compaction looks identical either way from the request body, so a seq with
+   * no matching hook is left out entirely rather than guessed at, and the
+   * timeline reports it as `inferred` / `unknown`.
+   *
+   * Correlation is by time, since compaction happens immediately before the
+   * call that carries the shrunken transcript.
+   */
+  private compactionTriggers(
+    sessionId: string,
+    compactionTimes: { seq: number; ts: number }[],
+  ): Map<number, CompactionTrigger> {
+    const out = new Map<number, CompactionTrigger>();
+    if (!compactionTimes.length) return out;
+    const pre = this.listHooksForSession(sessionId)
+      .filter((h) => h.event === "PreCompact")
+      .sort((a, b) => a.ts - b.ts);
+    if (!pre.length) return out;
+
+    const claimed = new Set<number>();
+    for (const c of compactionTimes) {
+      let best: (typeof pre)[number] | null = null;
+      let bestGap = Infinity;
+      for (const h of pre) {
+        if (claimed.has(h.id)) continue;
+        // The hook fires before the compacted call, so only look backwards.
+        const gap = c.ts - h.ts;
+        if (gap < -COMPACT_HOOK_SLACK_SEC || gap > COMPACT_HOOK_WINDOW_SEC) continue;
+        if (Math.abs(gap) < bestGap) {
+          bestGap = Math.abs(gap);
+          best = h;
+        }
+      }
+      if (!best) continue;
+      claimed.add(best.id);
+      const raw = (best.payload as any)?.trigger ?? (best.stdinPreview as any)?.trigger;
+      const kind = raw === "manual" || raw === "auto" ? raw : "unknown";
+      out.set(c.seq, { kind, source: "hook", hookTs: best.ts });
+    }
+    return out;
+  }
+
+  sessionContextTimeline(sessionId: string): ContextTimeline {
+    const requests = this.listRequests(sessionId);
+    const precomputedBySeq = this.contextMetricsFor(sessionId);
+    // Only read bodies for calls the index run could not segment — normally
+    // none. Before this, every call was read back and re-parsed on every load,
+    // which dominated the session endpoint's latency. When there IS a gap, the
+    // source is read once for all of them, not once per gap.
+    const pairsBySeq = new Map<number, RawPair>();
+    const gaps = requests.filter((r) => !precomputedBySeq.has(r.seq));
+    if (gaps.length) {
+      const pairs = this.loadSessionPairs(sessionId);
+      for (const r of gaps) {
+        const pair = pairs?.[r.seq];
+        if (pair) pairsBySeq.set(r.seq, pair);
+      }
+    }
+    const tsBySeq = new Map(requests.map((r) => [r.seq, r.ts] as const));
+    const triggersBySeq = this.compactionTriggers(
+      sessionId,
+      findCompactions([...requests].sort((a, b) => a.seq - b.seq)).map((c) => ({
+        seq: c.seq,
+        ts: tsBySeq.get(c.seq) ?? 0,
+      })),
+    );
+    return buildContextTimeline({
+      requests,
+      precomputedBySeq,
+      pairsBySeq,
+      triggersBySeq,
+      xrayFor: (seq, pair, promptHash) => {
+        const x = buildContextXray({
+          seq,
+          pair: pair as RawPair,
+          promptHash,
+        });
+        return {
+          totalChars: x.totalChars,
+          totalApproxTokens: x.totalApproxTokens,
+          buckets: x.buckets.map((b) => ({ bucket: b.bucket, approxTokens: b.approxTokens })),
+        };
+      },
+    });
+  }
+}
+
+/**
+ * Context composition for one captured pair, or null when the body cannot be
+ * segmented (no request body, or an unrecognized shape). Never throws: a single
+ * unparseable pair must not fail the whole index run.
+ */
+function contextMetricsForPair(
+  seq: number,
+  pair: RawPair,
+  promptHash: string,
+): ContextMetrics | null {
+  try {
+    const x = buildContextXray({ seq, pair, promptHash });
+    if (!x || !x.buckets.length) return null;
+    const buckets: Record<string, number> = {};
+    for (const b of x.buckets) buckets[b.bucket] = b.approxTokens;
+    return {
+      totalChars: x.totalChars,
+      totalApproxTokens: x.totalApproxTokens,
+      buckets,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A comparable form of a working-directory identity: trailing separators
+ * stripped so `/a/b/` and `/a/b` compare equal. Empty string when absent —
+ * callers treat empty as "carries no identity" and never match on it.
+ */
+function normalizeCwd(cwd: unknown): string {
+  if (typeof cwd !== "string" || !cwd.trim()) return "";
+  return cwd.replace(/[\\/]+$/, "") || "/";
+}
+
+function hookRowFromDb(r: any): HookRow {
+  let stdinPreview: Record<string, unknown> = {};
+  let stdoutPreview: Record<string, unknown> | null = null;
+  let payload: unknown | null = null;
+  try {
+    stdinPreview = JSON.parse(String(r.stdin_preview || "{}"));
+  } catch {
+    stdinPreview = {};
+  }
+  if (r.stdout_preview) {
+    try {
+      stdoutPreview = JSON.parse(String(r.stdout_preview));
+    } catch {
+      stdoutPreview = { raw: String(r.stdout_preview) };
+    }
+  }
+  if (r.payload_json) {
+    try {
+      payload = JSON.parse(String(r.payload_json));
+    } catch {
+      payload = null;
+    }
+  }
+  const decision = r.decision === "block" || r.decision === "allow" ? r.decision : null;
+  return {
+    id: Number(r.id),
+    sessionId: String(r.session_id),
+    ts: Number(r.ts ?? 0),
+    event: String(r.event ?? ""),
+    hookName: String(r.hook_name ?? ""),
+    durationMs: r.duration_ms == null ? null : Number(r.duration_ms),
+    decision,
+    stdinDigest: String(r.stdin_digest ?? ""),
+    stdinPreview,
+    stdoutPreview,
+    outcome: r.outcome ?? null,
+    exitCode: r.exit_code == null ? null : Number(r.exit_code),
+    payload,
+    sourcePath: String(r.source_path ?? ""),
+  };
 }
 
 function sha256Hex(text: string): string {

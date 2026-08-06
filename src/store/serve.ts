@@ -9,8 +9,11 @@ import type { PriceTable } from "../analytics";
 import { loadPrices } from "../pricing";
 import { aggregateUsage, parseWhen } from "../usage";
 import type { Granularity } from "../usage";
-import { auditFilePaths } from "../audit";
-import type { AuditReport } from "../audit";
+import { auditOneFilePath, reportFromScans } from "../audit";
+import type { AuditFileScan, AuditReport } from "../audit";
+import type { FlowGraph } from "../flow/derive";
+import type { ContextTimeline } from "../context/timeline";
+import type { ContextXray } from "../context/xray";
 
 /**
  * `tracetap serve` — the local observatory over the cross-session store.
@@ -353,10 +356,24 @@ const auditMemo = new Map<string, AuditReport>();
 
 /**
  * Run the egress-secret audit over every source file the index knows about.
- * Memoized on (mode + per-file content hashes), so repeat dashboard visits
- * are free until a re-index changes a file.
+ *
+ * Scanning is linear in log bytes, and wire logs are large — hundreds of MB is
+ * ordinary. So the scan is cached PER FILE, in SQLite, keyed on that file's
+ * content hash: capturing a new session rescans only the new log, not every
+ * log. The in-process memo on top of that keeps repeat visits within a run
+ * free; the SQLite layer is what survives a restart.
+ *
+ * Caching the aggregate report instead would not work — one new log changes the
+ * combined key and invalidates everything, which is what made this a 40s+ wait
+ * on every server start.
  */
-async function auditIndexedFiles(
+export function clearAuditMemo(): void {
+  // The in-process memo would mask the persistent layer underneath it, so tests
+  // that assert on caching-across-processes need to drop it first.
+  auditMemo.clear();
+}
+
+export async function auditIndexedFiles(
   store: Store,
   mode: "standard" | "strict",
 ): Promise<AuditReport> {
@@ -367,16 +384,182 @@ async function auditIndexedFiles(
   const hit = auditMemo.get(memoKey);
   if (hit) return hit;
 
-  // Streamed line-by-line — wire logs can be GBs; never load them whole.
-  const report = await auditFilePaths(rows.map((r) => r.p), { mode, redactCheck: true });
+  const scans: AuditFileScan[] = [];
+  for (const r of rows) {
+    const cached = store.getAuditScan(r.p, r.h, mode, true);
+    if (cached) {
+      scans.push(cached);
+      continue;
+    }
+    // Streamed line-by-line — wire logs can be GBs; never load them whole.
+    const scan = await auditOneFilePath(r.p, { mode, redactCheck: true });
+    if (!scan) continue; // moved or deleted since indexing
+    store.putAuditScan(scan, r.h, mode, true);
+    scans.push(scan);
+  }
+
+  const report = reportFromScans(scans, { mode, redactCheck: true });
   auditMemo.clear(); // only the latest index state is worth caching
   auditMemo.set(memoKey, report);
   return report;
 }
 
+/** Cached context timelines for the current index state (see timelineFor). */
+const timelineMemo = new Map<string, ContextTimeline>();
+let timelineMemoSig = "";
+
+/**
+ * A session's context timeline, memoized until the index changes.
+ *
+ * Normally this is a cheap read of composition recorded at index time. It falls
+ * back to reading and segmenting request bodies for any call the index run
+ * could not segment, and that fallback is what the memo protects: it is linear
+ * in the session's wire traffic and would otherwise be repaid on every visit.
+ *
+ * Invalidated on the same db+WAL mtime signal the SSE poller already uses, so a
+ * re-index refreshes the dashboard and this cache together.
+ */
+function timelineFor(store: Store, sessionId: string): ContextTimeline {
+  const sig = dbMtimeSignature(store.dbPath);
+  if (sig !== timelineMemoSig) {
+    timelineMemo.clear(); // only the latest index state is worth caching
+    timelineMemoSig = sig;
+  }
+  const hit = timelineMemo.get(sessionId);
+  if (hit) return hit;
+  const timeline = store.sessionContextTimeline(sessionId);
+  timelineMemo.set(sessionId, timeline);
+  return timeline;
+}
+
+/**
+ * Calls either side of the requested one built from the same file parse. The
+ * X-Ray pane is stepped through call by call, so the neighbours are what gets
+ * asked for next; 12 covers a typical session (27 calls in the capture this was
+ * measured against) in two parses.
+ */
+const XRAY_WARM_RADIUS = 12;
+
+/**
+ * Retained segment text before the least-recently-used X-Ray is evicted. These
+ * payloads are big — ~330k chars (~140KB of JSON) for one call in a real
+ * session — so an unbounded map would grow without limit in a server that runs
+ * for days. 16M chars is ~32MB of UTF-16 text, roughly 48 typical entries:
+ * enough to hold a whole session's worth of stepping, and a bound that shrinks
+ * itself as contexts get bigger.
+ */
+const XRAY_MEMO_MAX_CHARS = 16_000_000;
+
+/** Insertion-ordered = LRU order; see contextXrayFor. */
+const xrayMemo = new Map<string, ContextXray>();
+let xrayMemoChars = 0;
+
+/** Drop every memoized X-Ray (tests, which reuse session ids across stores). */
+export function clearXrayMemo(): void {
+  xrayMemo.clear();
+  xrayMemoChars = 0;
+}
+
+function xrayMemoPut(key: string, xray: ContextXray): void {
+  const prev = xrayMemo.get(key);
+  if (prev) xrayMemoChars -= prev.totalChars;
+  xrayMemo.set(key, xray);
+  xrayMemoChars += xray.totalChars;
+  while (xrayMemoChars > XRAY_MEMO_MAX_CHARS && xrayMemo.size > 1) {
+    const oldest = xrayMemo.keys().next().value as string;
+    xrayMemoChars -= xrayMemo.get(oldest)!.totalChars;
+    xrayMemo.delete(oldest);
+  }
+}
+
+/**
+ * One call's Context X-Ray, memoized per session + seq.
+ *
+ * Uncached this route was seconds, and constant in the size of the *log file*
+ * rather than the answer: every call re-read and re-parsed the whole source
+ * JSONL — twice, once for the call and once for its predecessor — to reach two
+ * pairs out of hundreds. Building the view from parsed pairs is single-digit ms
+ * either side of that. So the fix is two-part: the store now parses once per
+ * request and returns a window of neighbouring calls from it, and this memo
+ * keeps the window until the underlying log changes.
+ *
+ * Keyed on {@link Store.sessionSourceSignature} rather than the db+WAL signal
+ * timelineFor uses: the X-Ray is a pure function of the source log, while the
+ * index is rewritten by the background re-index loop every ~30s, which would
+ * throw the cache away for nothing. A log that grows or is rotated changes its
+ * mtime+size and misses.
+ */
+function contextXrayFor(store: Store, sessionId: string, seq: number): ContextXray | null {
+  const sig = store.sessionSourceSignature(sessionId);
+  const key = `${sessionId} ${sig} ${seq}`;
+  const hit = xrayMemo.get(key);
+  if (hit) {
+    xrayMemo.delete(key); // re-insert to mark most-recently-used
+    xrayMemo.set(key, hit);
+    return hit;
+  }
+  const warmed = store.sessionContextXrayWindow(sessionId, seq, XRAY_WARM_RADIUS);
+  // Neighbours first, so the call actually asked for is the most-recently-used
+  // entry and survives eviction if one window alone exceeds the budget.
+  for (const xray of warmed) {
+    if (xray.seq !== seq) xrayMemoPut(`${sessionId} ${sig} ${xray.seq}`, xray);
+  }
+  const want = warmed.find((x) => x.seq === seq) ?? null;
+  if (want) xrayMemoPut(key, want);
+  return want;
+}
+
+/**
+ * Node detail is the bulk of the flow payload — full message text on every one
+ * of what can be hundreds of nodes, inlined into DOM attributes by the frontend.
+ * Send a preview and let the detail pane fetch the rest for the one node the
+ * user actually clicked.
+ */
+export const FLOW_DETAIL_PREVIEW_CHARS = 400;
+
+export function trimFlowDetail(flow: FlowGraph): FlowGraph {
+  return {
+    ...flow,
+    nodes: flow.nodes.map((n) => {
+      const raw = n.detail == null ? "" : JSON.stringify(n.detail);
+      if (raw.length <= FLOW_DETAIL_PREVIEW_CHARS) return n;
+      // Drop `detail` entirely rather than blanking it: the frontend keys off
+      // its presence to decide whether it must fetch.
+      const { detail: _elided, ...rest } = n;
+      return {
+        ...rest,
+        detailPreview: raw.slice(0, FLOW_DETAIL_PREVIEW_CHARS),
+        detailChars: raw.length,
+      };
+    }),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
+
+/**
+ * Evaluate one pane's data source in isolation.
+ *
+ * The session endpoint feeds four independent panes. Without this, a throw in
+ * any single section (a malformed hook row, a flow graph cycle) returns a 500
+ * and every pane goes blank — including the ones that never needed that data.
+ * On failure the section is `null`, which the frontend already treats as its
+ * empty state, and the reason is reported under `sectionErrors`.
+ */
+function paneSection<T>(
+  errors: Record<string, string>,
+  label: string,
+  load: () => T,
+): T | null {
+  try {
+    return load();
+  } catch (err) {
+    errors[label] = err instanceof Error ? err.message : String(err);
+    return null;
+  }
+}
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -542,7 +725,61 @@ export async function handleRequest(
     }
 
     if (pathname.startsWith("/api/session/")) {
-      const sessionId = decodeURIComponent(pathname.slice("/api/session/".length));
+      // /api/session/<id>/context/<seq>
+      const rest = decodeURIComponent(pathname.slice("/api/session/".length));
+      const contextMatch = rest.match(/^(.*)\/context\/(\d+)$/);
+      if (contextMatch) {
+        const sessionId = contextMatch[1];
+        const seq = Number(contextMatch[2]);
+        const session = store.getSession(sessionId);
+        if (!session) {
+          sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
+          return;
+        }
+        const xray = contextXrayFor(store, sessionId, seq);
+        if (!xray) {
+          sendJson(res, 404, { error: `No request body for session '${sessionId}' seq ${seq}.` });
+          return;
+        }
+        sendJson(res, 200, xray);
+        return;
+      }
+
+      // /api/session/<id>/timeline — fetched when the X-Ray pane opens, not on
+      // every session load, so an un-precomputed session cannot stall the page.
+      const timelineMatch = rest.match(/^(.*)\/timeline$/);
+      if (timelineMatch) {
+        const sessionId = timelineMatch[1];
+        const session = store.getSession(sessionId);
+        if (!session) {
+          sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
+          return;
+        }
+        sendJson(res, 200, timelineFor(store, sessionId));
+        return;
+      }
+
+      // /api/session/<id>/flow/<nodeId> — full detail for one node, since the
+      // graph payload only carries previews.
+      const flowMatch = rest.match(/^(.*)\/flow\/(.+)$/);
+      if (flowMatch) {
+        const sessionId = flowMatch[1];
+        const nodeId = flowMatch[2];
+        const session = store.getSession(sessionId);
+        if (!session) {
+          sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
+          return;
+        }
+        const node = store.sessionFlow(sessionId).nodes.find((n) => n.id === nodeId);
+        if (!node) {
+          sendJson(res, 404, { error: `No flow node '${nodeId}' in session '${sessionId}'.` });
+          return;
+        }
+        sendJson(res, 200, { id: node.id, kind: node.kind, label: node.label, detail: node.detail ?? null });
+        return;
+      }
+
+      const sessionId = rest;
       const session = store.getSession(sessionId);
       if (!session) {
         sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
@@ -550,12 +787,27 @@ export async function handleRequest(
       }
       const steps = store.listSteps(sessionId);
       const requests = store.listRequests(sessionId);
+      // Each of these backs exactly one pane. Isolate them: a throw in any one
+      // degrades its own pane instead of 500-ing the endpoint and darkening all
+      // four — Wire in particular needs none of them.
+      const sectionErrors: Record<string, string> = {};
+      const hooks = paneSection(sectionErrors, "hooks", () =>
+        store.listHooksForSession(sessionId),
+      );
+      const flow = paneSection(sectionErrors, "flow", () =>
+        trimFlowDetail(store.sessionFlow(sessionId)),
+      );
+      // contextTimeline is NOT here: it moved to /api/session/<id>/timeline so
+      // the four panes render without waiting on it.
       sendJson(res, 200, {
         session,
         steps,
         requests,
+        hooks,
+        flow,
         compactions: findCompactions(requests),
         reportAvailable: fs.existsSync(reportPathFor(session.sourcePath)),
+        ...(Object.keys(sectionErrors).length ? { sectionErrors } : {}),
       });
       return;
     }
