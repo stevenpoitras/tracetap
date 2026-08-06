@@ -11,6 +11,198 @@
   var hooksShowObserveOnly = false;
   var hooksForPane = [];
 
+  var INSPECTOR_EMPTY =
+    '<div class="dim inspector-empty">Select a row to inspect its payload</div>';
+
+  /**
+   * The one detail surface, shared by every pane.
+   *
+   * A docked panel rather than a hover popover, and that is a correctness
+   * choice more than a taste one: a popover has to compute its own position,
+   * flip near edges, out-race a hide timer, and win a z-index fight against
+   * every scroll container it floats over. A panel in normal flow has none of
+   * those failure modes, and its text can be selected, copied, and reached
+   * with a keyboard for free.
+   *
+   * Sources register by `data-inspect="<type>:<id>"` and are resolved lazily,
+   * so nothing has to be stringified into a DOM attribute to be inspectable.
+   */
+  var Inspector = (function () {
+    var current = null;
+    var token = 0;
+    /**
+     * Drill-downs only. Selecting a PEER (clicking another row, arrowing to the
+     * next one) replaces the top of the stack; following an action that changes
+     * what you are looking at pushes. Without that distinction, arrowing down a
+     * list of 238 tools would build a 238-deep history nobody wants to unwind.
+     */
+    var stack = [];
+    // Set by an action that navigates: the row it lands on becomes a
+    // drill-down (so `back` returns here) without teaching every caller of
+    // show() about the stack.
+    var pushNext = false;
+
+    function host() {
+      return document.getElementById("inspector");
+    }
+
+    function clear() {
+      var el = host();
+      current = null;
+      stack.length = 0;
+      token += 1;
+      if (el) {
+        el.innerHTML = INSPECTOR_EMPTY;
+        el.classList.remove("open");
+      }
+      document
+        .querySelectorAll("[data-inspect].selected")
+        .forEach(function (n) {
+          n.classList.remove("selected");
+          n.removeAttribute("aria-current");
+        });
+    }
+
+    /**
+     * @param spec {kind,title,body,bodyType,actions,load}
+     *   `load` is an optional promise resolving to the full body; a stale
+     *   response is discarded by comparing the token captured at show() time,
+     *   which is what stops a slow fetch overwriting a newer selection.
+     * @param opts {push} — true when this is a drill-down that `back` should
+     *   return from; omitted for ordinary peer selection.
+     */
+    function show(sourceId, spec, opts) {
+      var doPush = pushNext || (opts && opts.push);
+      pushNext = false;
+      var frame = { id: sourceId, spec: spec };
+      if (doPush && stack.length) stack.push(frame);
+      else stack[stack.length ? stack.length - 1 : 0] = frame;
+      return render(sourceId, spec);
+    }
+
+    /** Make the NEXT show() a drill-down. Cleared whether or not it fires. */
+    function pushOnce() {
+      pushNext = true;
+    }
+    function cancelPush() {
+      pushNext = false;
+    }
+
+    /** Pop one drill-down. Returns false when there is nothing to pop. */
+    function back() {
+      if (stack.length < 2) return false;
+      stack.pop();
+      var top = stack[stack.length - 1];
+      render(top.id, top.spec);
+      return true;
+    }
+
+    function render(sourceId, spec) {
+      var el = host();
+      if (!el) return;
+      current = sourceId;
+      var mine = ++token;
+
+      var head =
+        '<div class="inspector-head">' +
+        (stack.length > 1
+          ? '<button type="button" class="inspector-back" title="Back (Esc)" aria-label="Back">\u2190</button>'
+          : "") +
+        (spec.kind ? '<span class="pill">' + esc(spec.kind) + "</span> " : "") +
+        '<span class="inspector-title">' +
+        esc(spec.title || "") +
+        "</span>" +
+        '<button type="button" class="inspector-close" title="Close (Esc)" aria-label="Close">×</button>' +
+        "</div>";
+
+      var body =
+        '<pre class="payload" id="inspector-body">' +
+        esc(spec.body == null ? "" : String(spec.body)) +
+        "</pre>";
+
+      var note = spec.loadingNote
+        ? '<div class="dim" id="inspector-note">' + esc(spec.loadingNote) + "</div>"
+        : "";
+
+      var actions = (spec.actions || [])
+        .map(function (a, i) {
+          return (
+            '<button type="button" class="btn-xray" data-act="' +
+            i +
+            '">' +
+            esc(a.label) +
+            "</button>"
+          );
+        })
+        .join("");
+
+      el.innerHTML = head + body + note + actions;
+      el.classList.add("open");
+
+      el.querySelector(".inspector-close").addEventListener("click", clear);
+      var backBtn = el.querySelector(".inspector-back");
+      if (backBtn) backBtn.addEventListener("click", back);
+      (spec.actions || []).forEach(function (a, i) {
+        var b = el.querySelector('[data-act="' + i + '"]');
+        if (b) b.addEventListener("click", a.onClick);
+      });
+
+      document
+        .querySelectorAll("[data-inspect].selected")
+        .forEach(function (n) {
+          n.classList.remove("selected");
+          n.removeAttribute("aria-current");
+        });
+      // ALL matches, not the first. A turn id (`ctp:<seq>`) deliberately
+      // appears in more than one view — the X-Ray timeline bar and the turn
+      // spine row — because they are the same turn. Marking only
+      // `querySelector`'s first hit highlighted whichever happened to come
+      // earlier in the DOM, which was routinely in a pane the user was not
+      // looking at, and left the visible one unmarked.
+      document
+        .querySelectorAll('[data-inspect="' + cssEscape(sourceId) + '"]')
+        .forEach(function (src) {
+          src.classList.add("selected");
+          src.setAttribute("aria-current", "true");
+        });
+
+      if (typeof spec.load === "function") {
+        spec.load()
+          .then(function (full) {
+            if (mine !== token) return; // superseded by a newer selection
+            var b = document.getElementById("inspector-body");
+            var n = document.getElementById("inspector-note");
+            if (b) b.textContent = full;
+            if (n) n.remove();
+          })
+          .catch(function (err) {
+            if (mine !== token) return;
+            var n = document.getElementById("inspector-note");
+            if (n) n.textContent = "full payload unavailable — " + (err.message || err);
+          });
+      }
+    }
+
+    return {
+      show: show,
+      pushOnce: pushOnce,
+      cancelPush: cancelPush,
+      back: back,
+      clear: clear,
+      depth: function () {
+        return stack.length;
+      },
+      selected: function () {
+        return current;
+      },
+    };
+  })();
+
+  /** Minimal attribute-selector escaping — ids here are ascii but may hold ':' and '/'. */
+  function cssEscape(s) {
+    return String(s).replace(/["\\]/g, "\\$&");
+  }
+
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
       return {
@@ -146,9 +338,101 @@
             " events";
         }
         if (prices) prices.textContent = "prices: " + m.priceSource;
+        // The page you are reading is re-composed from disk on every request,
+        // so it is always current — the SERVER is not. When they diverge the
+        // symptom is a pane calling an endpoint that does not exist yet, which
+        // reads as a data bug rather than a stale process. Say it plainly.
+        var stale = document.getElementById("sb-stale");
+        if (stale && m.build) {
+          stale.hidden = !m.build.stale;
+          if (m.build.stale && !restarting) {
+            // Say what it DOES, not what is wrong. The old wording ("restart
+            // required") named an action the reader had no way to take from
+            // here, so the obvious response — refresh — could only fail.
+            stale.textContent = "⚠ newer build on disk — click to upgrade";
+            stale.title =
+              "running build " +
+              new Date(m.build.loadedAt).toLocaleString() +
+              "\non disk       " +
+              new Date(m.build.builtAt).toLocaleString() +
+              "\n\nA page refresh cannot fix this: the frontend reloads from " +
+              "disk every request, but compiled server code is frozen at " +
+              "process start.\nClicking relaunches the server and reloads once " +
+              "it is back.";
+          }
+        }
       })
       .catch(function () {});
   }
+
+  /** Set while an upgrade is in flight, so the poller stops rewriting the badge. */
+  var restarting = false;
+
+  /**
+   * Relaunch the server on the newer build, then reload once it answers.
+   *
+   * The server re-execs, so the socket drops mid-flight — the POST is EXPECTED
+   * to fail at the transport level and a rejection here says nothing about
+   * whether the restart took. Only the poll below can tell, and what it waits
+   * for is a CHANGED `loadedAt`: "the server answers" is not enough, because
+   * the old process answers too right up until it exits.
+   */
+  function upgradeServer(btn) {
+    if (restarting) return;
+    restarting = true;
+    var before = null;
+    btn.textContent = "⟳ relaunching…";
+    btn.disabled = true;
+
+    fetchJSON("/api/meta")
+      .then(function (m) {
+        before = m.build ? m.build.loadedAt : null;
+        return fetch("/api/restart", { method: "POST" }).catch(function () {
+          return null; // the connection dying IS the restart happening
+        });
+      })
+      .then(function (res) {
+        // A live 403/409 means the server declined and is still running, so
+        // there is nothing to wait for.
+        if (res && !res.ok && res.status !== 202) {
+          return res.json().then(function (j) {
+            throw new Error(j.error || "restart refused");
+          });
+        }
+        var tries = 0;
+        return new Promise(function (resolve, reject) {
+          (function poll() {
+            if (++tries > 40) return reject(new Error("server did not come back"));
+            fetch("/api/meta")
+              .then(function (r) {
+                return r.json();
+              })
+              .then(function (m) {
+                var now = m.build ? m.build.loadedAt : null;
+                if (now && now !== before) resolve();
+                else setTimeout(poll, 250);
+              })
+              .catch(function () {
+                setTimeout(poll, 250);
+              });
+          })();
+        });
+      })
+      .then(function () {
+        location.reload();
+      })
+      .catch(function (err) {
+        restarting = false;
+        btn.disabled = false;
+        btn.textContent = "⚠ upgrade failed — restart tracetap serve";
+        btn.title = String((err && err.message) || err);
+      });
+  }
+
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest && e.target.closest("#sb-stale");
+    if (btn && !btn.hidden) upgradeServer(btn);
+  });
 
   // ------------------------------------------------------------- svg charts
   /** Vertical column chart. items: [{label, value, title?, warn?}] */
@@ -278,10 +562,20 @@
   function route() {
     var h = location.hash.replace(/^#/, "") || "sessions";
     var m;
-    // session/<id>[/flow|hooks|xray|wire|tools][/step-N]
+    // session/<id>[/<pane>][/step-N]
+    //
+    // The pane list is built from SESSION_PANES rather than spelled out here.
+    // It used to be a literal, so adding a pane silently broke its own URL:
+    // the whole route stopped matching and fell through to the session LIST,
+    // which looks like the pane failed to render rather than like a routing
+    // miss. One list, one place to add to.
     if (
       (m = h.match(
-        /^session\/([^/]+)(?:\/(flow|hooks|xray|wire|tools))?(?:\/step-(\d+))?$/,
+        new RegExp(
+          "^session\\/([^/]+)(?:\\/(" +
+            SESSION_PANES.join("|") +
+            "))?(?:\\/step-(\\d+))?$",
+        ),
       ))
     ) {
       renderSession(
@@ -325,27 +619,9 @@
     );
   }
 
-  // --------------------------------------------------------- wire pane (FIG/waterfall)
+  // ------------------------------------------------------- wire pane (turn spine)
 
   function bindSessionInteractions(reqs, compactSeqs, steps) {
-    var wf = document.getElementById("wf");
-    if (wf) {
-      var bySeq = {};
-      reqs.forEach(function (r) {
-        bySeq[r.seq] = r;
-      });
-      TT.bind(wf, ".wf-row", function (rowEl) {
-        var r = bySeq[rowEl.getAttribute("data-seq")];
-        return r ? wfTooltip(r, compactSeqs[r.seq]) : null;
-      });
-      wf.addEventListener("click", function (e) {
-        var rowEl = e.target.closest(".wf-row");
-        if (!rowEl) return;
-        var step = rowEl.getAttribute("data-step");
-        if (step) flashStep(step);
-      });
-    }
-
     var mm = document.getElementById("minimap");
     if (mm) {
       mm.addEventListener("click", function (e) {
@@ -380,36 +656,6 @@
     }
   }
 
-  function wfTooltip(r, compaction) {
-    var stream = r.durationMs != null && r.ttftMs != null ? r.durationMs - r.ttftMs : null;
-    var h = TT.title("call " + r.seq + (r.model ? " · " + r.model : ""));
-    h += TT.row(
-      "status",
-      r.status == null
-        ? '<span class="warn-text">no response</span>'
-        : r.status >= 400
-          ? '<span class="warn-text">' + r.status + "</span>"
-          : String(r.status),
-    );
-    if (r.ttftMs != null) h += TT.row("ttft", fmtDur(r.ttftMs));
-    if (stream != null) h += TT.row("stream", fmtDur(stream));
-    h += TT.row("total", fmtDur(r.durationMs));
-    h += TT.row("fresh in", fmtTok(r.promptTokens));
-    h += TT.row("cache read", fmtTok(r.cacheRead));
-    if (r.cacheCreation) h += TT.row("cache write", fmtTok(r.cacheCreation));
-    h += TT.row("output", fmtTok(r.completionTokens));
-    if (r.reasoningTokens) h += TT.row("reasoning", fmtTok(r.reasoningTokens));
-    if (r.stopReason) h += TT.row("stop", TT.esc(r.stopReason));
-    h += TT.row("transcript", r.transcriptItems + " items");
-    if (compaction)
-      h += TT.row(
-        "compaction",
-        '<span class="warn-text">' + compaction.from + " → " + compaction.to + " items</span>",
-      );
-    if (r.promptHash) h += TT.row("prompt", r.promptHash.slice(0, 8));
-    if (r.agentStepIndex != null) h += TT.row("step", "#" + r.agentStepIndex + " · click to jump");
-    return h;
-  }
 
   function minimapHtml(steps) {
     if (steps.length < 8) return "";
@@ -445,142 +691,309 @@
     );
   }
 
-  function laneSection(reqs, compactSeqs) {
-    if (!reqs.length) return "";
-    var ctxItems = reqs.map(function (r) {
+
+  // ------------------------------------------------------- turn spine
+  /**
+   * One row per turn, expandable into everything that happened during it.
+   *
+   * The Wire pane showed three parallel views of the same 18 calls — two
+   * summary charts and a waterfall — while the hooks that fired during those
+   * calls lived in another pane and the compactions in a third. Answering
+   * "what happened on turn 13, and what caused it" meant reading four places
+   * and correlating by eye on a `seq` that is not even time-ordered.
+   *
+   * A turn is the unit of work, so it is the row. Its events hang under it.
+   */
+  function buildTurns(reqs, hooks, steps, compactSeqs) {
+    var byStep = {};
+    (steps || []).forEach(function (st) {
+      byStep[st.stepIndex] = st;
+    });
+    return (reqs || []).map(function (r, i) {
+      var next = reqs[i + 1];
+      // Hooks are timestamped, not seq-tagged, so a turn owns the hooks that
+      // fired between its start and the next turn's. Imperfect where turns
+      // interleave across agents — which is why the turn carries its agent
+      // label, so a mis-attributed hook is at least visible as such.
+      var evs = [];
+      var st = r.agentStepIndex != null ? byStep[r.agentStepIndex] : null;
+      if (st && st.toolName) {
+        evs.push({
+          kind: "tool",
+          label: st.toolName,
+          detail: String(st.toolInput || ""),
+          n: (String(st.observation || "").length || 0),
+        });
+      }
+      (hooks || []).forEach(function (h) {
+        if (h.ts < r.ts) return;
+        if (next && h.ts >= next.ts) return;
+        evs.push({
+          kind: "hook",
+          label: (h.event || "hook") + " · " + (h.hookName || ""),
+          detail: JSON.stringify(h.stdoutPreview || {}, null, 2),
+          n: h.durationMs,
+        });
+      });
       var c = compactSeqs[r.seq];
+      if (c) {
+        evs.push({
+          kind: "compaction",
+          label: "compaction " + c.from + " → " + c.to + " items",
+          detail: "",
+          n: c.from - c.to,
+        });
+      }
       return {
-        label: String(r.seq),
-        value: r.transcriptItems,
-        warn: !!c,
-        title:
-          "call " +
-          r.seq +
-          ": " +
-          r.transcriptItems +
-          " transcript items" +
-          (c ? " — COMPACTION (was " + c.from + ")" : ""),
+        seq: r.seq,
+        req: r,
+        agent: r.isSubagent ? r.agentLabel || "subagent (unnamed)" : "main thread",
+        events: evs,
       };
     });
-    var tokItems = reqs.map(function (r) {
-      return {
-        label: String(r.seq),
-        title:
-          "call " +
-          r.seq +
-          ": fresh in " +
-          fmtTok(r.promptTokens) +
-          " · cache read " +
-          fmtTok(r.cacheRead) +
-          " · cache write " +
-          fmtTok(r.cacheCreation) +
-          " · out " +
-          fmtTok(r.completionTokens),
-        parts: [
-          { value: r.cacheRead, color: "var(--cache)" },
-          { value: r.cacheCreation, color: "var(--purple)" },
-          { value: r.promptTokens, color: "var(--accent)" },
-          { value: r.completionTokens, color: "var(--ok)" },
-        ],
-      };
+  }
+
+  /**
+   * Lane index per interval, so overlapping intervals never share a lane.
+   *
+   * This IS the information the waterfall carried and a sorted list cannot:
+   * two bars on one lane are provably sequential, and anything stacked is
+   * provably concurrent. Greedy first-fit over start order, which is optimal
+   * for interval-graph colouring — the lane count it returns is exactly the
+   * maximum number of calls in flight at any instant.
+   *
+   * @param items `[{from, to}]` in render order (NOT required to be sorted).
+   * @returns lane index parallel to `items`.
+   */
+  function packLanes(items) {
+    var order = items
+      .map(function (_, i) { return i; })
+      .sort(function (a, b) { return items[a].from - items[b].from; });
+    var laneEnd = [];
+    var lanes = new Array(items.length);
+    order.forEach(function (i) {
+      var it = items[i];
+      var lane = -1;
+      for (var l = 0; l < laneEnd.length; l++) {
+        if (laneEnd[l] <= it.from) { lane = l; break; }
+      }
+      if (lane < 0) { lane = laneEnd.length; laneEnd.push(0); }
+      laneEnd[lane] = it.to;
+      lanes[i] = lane;
     });
+    return lanes;
+  }
+
+  /**
+   * A request's [start, end) in EPOCH MILLISECONDS.
+   *
+   * `ts` is served in SECONDS (every other reader multiplies it by 1000) while
+   * `durationMs` is milliseconds. Adding them raw stretched every bar ~1000×,
+   * which made all 224 calls of one session overlap and reported "max 224 in
+   * flight" — a unit bug wearing the costume of a finding.
+   */
+  function reqSpanMs(r) {
+    var from = (r.ts || 0) * 1000;
+    return { from: from, to: from + Math.max(0, r.durationMs || 0) };
+  }
+
+  /** Ribbon height budget in px; past it the lanes scroll rather than grow. */
+  var RIBBON_H = 104;
+
+  /**
+   * The time ribbon: every call on a real wall-clock axis, drag to select.
+   *
+   * The turn spine orders by `seq`, which on a session that runs a fleet is not
+   * time order at all — 87 of 223 adjacent pairs ran backwards on the capture
+   * that motivated this. So the spine can show you WHAT ran but never WHEN, or
+   * what ran alongside it. This is the view that answers both, and the brush
+   * over it is the filter that carries the answer back into the spine.
+   *
+   * Height is bounded by dividing RIBBON_H among however many lanes the packer
+   * needs, rather than by capping the lane count: a 30-way fan-out renders as
+   * 30 thin lanes, which is honest, instead of 12 lanes that quietly imply
+   * calls were sequential when they were not.
+   */
+  function timeRibbonHtml(turns) {
+    var items = turns.map(function (t) {
+      return reqSpanMs(t.req);
+    });
+    var t0 = Infinity;
+    var t1 = -Infinity;
+    items.forEach(function (it) {
+      if (it.from < t0) t0 = it.from;
+      if (it.to > t1) t1 = it.to;
+    });
+    if (!isFinite(t0)) return "";
+    // A session whose calls all share one timestamp has no axis to draw on.
+    // Say so rather than dividing by zero and painting 18 full-width bars.
+    var span = t1 - t0;
+    if (span <= 0) {
+      return '<div class="ribbon-note dim">No time span recorded for these ' +
+        turns.length + " calls — range selection unavailable.</div>";
+    }
+    var lanes = packLanes(items);
+    var laneCount = Math.max.apply(null, lanes) + 1;
+    var laneH = Math.max(2, Math.min(11, Math.floor(RIBBON_H / laneCount)));
+
+    var bars = turns
+      .map(function (t, i) {
+        var it = items[i];
+        return (
+          '<span class="ribbon-bar' + (t.req.isSubagent ? " sub" : "") +
+          '" data-ribbon-seq="' + t.seq + '"' +
+          ' data-from="' + it.from + '" data-to="' + it.to + '"' +
+          ' title="#' + t.seq + " · " + esc(t.agent) + " · " +
+          esc(fmtDur(t.req.durationMs)) + '"' +
+          ' style="left:' + (((it.from - t0) / span) * 100).toFixed(3) + "%;width:" +
+          (((it.to - it.from) / span) * 100).toFixed(3) + "%;top:" +
+          lanes[i] * laneH + "px;height:" + Math.max(2, laneH - 1) + 'px"></span>'
+        );
+      })
+      .join("");
+
     return (
-      '<div class="split">' +
-      '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.1</span>Context growth — transcript items per call · amber = mid-task compaction</div>' +
-      columnChart(ctxItems, { height: 110, labels: false }) +
-      "</div>" +
-      '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.2</span>Token flow per call</div>' +
-      stackedChart(tokItems, { height: 110 }) +
-      '<div class="legend">' +
-      '<span><span class="sw" style="background:var(--cache)"></span>cache read</span>' +
-      '<span><span class="sw" style="background:var(--purple)"></span>cache write</span>' +
-      '<span><span class="sw" style="background:var(--accent)"></span>fresh input</span>' +
-      '<span><span class="sw" style="background:var(--ok)"></span>output</span>' +
-      "</div></div></div>"
+      // `.ribbon` caps the visible height and scrolls; `.ribbon-lanes` is the
+      // full-height content, so the budget is enforced instead of merely
+      // intended — a `Math.max(2, …)` floor on lane height silently blew past
+      // it at 224 lanes and rendered a 448px strip.
+      '<div class="ribbon" id="ribbon" data-t0="' + t0 + '" data-t1="' + t1 + '">' +
+      '<div class="ribbon-lanes" style="height:' + laneCount * laneH + 'px">' +
+      bars +
+      '<span class="ribbon-sel" hidden></span>' +
+      "</div></div>" +
+      '<div class="ribbon-axis"><span>0s</span><span>' +
+      esc(fmtDur(span / 2)) + "</span><span>" + esc(fmtDur(span)) + "</span></div>" +
+      // "first start → last finish", spelled out because it does NOT match the
+      // header's duration: the session's `ended_at` is the last call's START,
+      // so a long final call puts the two legitimately minutes apart.
+      '<div class="ribbon-note" id="ribbon-note">' +
+      turns.length + (turns.length === 1 ? " call" : " calls") +
+      " · first start → last finish " + esc(fmtDur(span)) + " · max " +
+      laneCount + " in flight · drag to select a window</div>"
     );
   }
 
-  function waterfall(reqs, compactSeqs) {
-    if (!reqs.length)
-      return '<div class="dim">No wire data (re-index with tracetap ≥ 0.3).</div>';
-    var t0 = Infinity,
-      t1 = -Infinity;
-    reqs.forEach(function (r) {
-      if (r.ts > 0) t0 = Math.min(t0, r.ts);
-      var end = r.ts + (r.durationMs || 0) / 1000;
-      t1 = Math.max(t1, end);
-    });
-    if (!isFinite(t0) || t1 <= t0) {
-      t0 = 0;
-      t1 = 1;
+  /**
+   * The Compactions card, preferring the measurement over the guess.
+   *
+   * Two provenances, never merged. `recorded` is Claude Code's own
+   * `compact_boundary` records — exact pre/post sizes and, uniquely, WHY it
+   * happened. `inferred` is our wire-side detector, which measured 75% false
+   * positives against the live index and cannot recover the trigger at all.
+   *
+   * The recorded set is scoped to the whole Claude Code session, not to this
+   * system-prompt group, so the card says so. It is suppressed on subagent-only
+   * groups: a subagent's context is not what got compacted.
+   */
+  function compactionCard(inferred, recorded) {
+    var recs = (recorded && recorded.records) || [];
+    if (!recs.length || (recorded && recorded.subagentOnly)) {
+      return card(
+        "Compactions",
+        inferred.length + ' <small class="dim">inferred</small>',
+        inferred.length > 0,
+      );
     }
-    var span = t1 - t0;
-    return reqs
-      .map(function (r) {
-        var left = r.ts > 0 ? ((r.ts - t0) / span) * 100 : 0;
-        var durW =
-          r.durationMs != null ? Math.max(0.4, (r.durationMs / 1000 / span) * 100) : 0.6;
-        var ttftW = r.ttftMs != null ? (r.ttftMs / 1000 / span) * 100 : 0;
-        var bars = "";
-        if (ttftW > 0) {
-          bars +=
-            '<div class="wf-bar wait" style="left:' +
-            left.toFixed(2) +
-            "%;width:" +
-            ttftW.toFixed(2) +
-            '%"></div>';
-          bars +=
-            '<div class="wf-bar' +
-            (r.errored ? " errored" : "") +
-            '" style="left:' +
-            (left + ttftW).toFixed(2) +
-            "%;width:" +
-            Math.max(0.3, durW - ttftW).toFixed(2) +
-            '%"></div>';
-        } else {
-          bars +=
-            '<div class="wf-bar' +
-            (r.errored ? " errored" : "") +
-            '" style="left:' +
-            left.toFixed(2) +
-            "%;width:" +
-            durW.toFixed(2) +
-            '%"></div>';
-        }
-        var c = compactSeqs[r.seq];
-        var meta =
-          (r.status == null ? "no response" : r.status) +
-          " · " +
-          fmtDur(r.durationMs) +
-          (r.ttftMs != null ? " · ttft " + fmtDur(r.ttftMs) : "") +
-          " · " +
-          fmtTok(r.completionTokens) +
-          " out" +
-          (r.stopReason ? " · " + esc(r.stopReason) : "");
-        var linked = r.agentStepIndex != null;
+    var byTrigger = {};
+    var dropped = 0;
+    recs.forEach(function (r) {
+      byTrigger[r.trigger] = (byTrigger[r.trigger] || 0) + 1;
+      dropped += r.droppedTokens || 0;
+    });
+    var mix = Object.keys(byTrigger)
+      .sort()
+      .map(function (k) {
+        return byTrigger[k] + " " + k;
+      })
+      .join(" · ");
+    return card(
+      "Compactions",
+      recs.length +
+        ' <small class="dim">' + esc(mix) + "</small>" +
+        '<div class="card-sub">' + fmtTok(dropped) + " dropped · session-wide</div>",
+      recs.length > 0,
+    );
+  }
+
+  function turnSpineHtml(turns) {
+    if (!turns.length) return '<div class="dim">No wire data for this session.</div>';
+    var maxCtx = 1;
+    turns.forEach(function (t) {
+      var c = (t.req.promptTokens || 0) + (t.req.cacheRead || 0) + (t.req.cacheCreation || 0);
+      if (c > maxCtx) maxCtx = c;
+    });
+    var kinds = {};
+    turns.forEach(function (t) {
+      t.events.forEach(function (e) {
+        kinds[e.kind] = (kinds[e.kind] || 0) + 1;
+      });
+    });
+    var filters = Object.keys(kinds)
+      .sort()
+      .map(function (k) {
         return (
-          '<div class="wf-row' +
-          (linked ? " click" : "") +
-          '" data-seq="' +
-          r.seq +
-          '"' +
-          (linked ? ' data-step="' + r.agentStepIndex + '"' : "") +
-          ">" +
-          '<div class="wf-label">' +
-          r.seq +
-          (c ? ' <span class="wf-compact">⇣</span>' : "") +
+          '<button type="button" class="turn-filter" data-turn-filter="' +
+          esc(k) +
+          '" aria-pressed="false">' +
+          esc(k) +
+          " <small>" +
+          kinds[k] +
+          "</small></button>"
+        );
+      })
+      .join("");
+
+    var rows = turns
+      .map(function (t) {
+        var ctx = (t.req.promptTokens || 0) + (t.req.cacheRead || 0) + (t.req.cacheCreation || 0);
+        var evHtml = t.events
+          .map(function (e, j) {
+            return (
+              '<div class="turn-ev ev-' + esc(e.kind) + '" data-ev-kind="' + esc(e.kind) +
+              '" data-inspect="ev:' + t.seq + ":" + j + '" tabindex="0">' +
+              '<span class="ev-kind">' + esc(e.kind) + "</span>" +
+              '<span class="ev-label">' + esc(e.label) + "</span>" +
+              '<span class="ev-n">' + (e.n == null ? "" : esc(String(e.n))) + "</span>" +
+              "</div>"
+            );
+          })
+          .join("");
+        var span = reqSpanMs(t.req);
+        return (
+          // The window predicate reads these off the DOM rather than a parallel
+          // array, so a re-render can never leave the two out of step.
+          '<div class="turn" data-turn="' + t.seq + '" data-from="' + span.from +
+          '" data-to="' + span.to + '">' +
+          '<div class="turn-row" data-inspect="ctp:' + t.seq + '" tabindex="0">' +
+          '<span class="turn-caret" data-expand="' + t.seq + '">' +
+          (t.events.length ? "\u25b8" : "\u00b7") +
+          "</span>" +
+          '<span class="turn-seq">' + t.seq + "</span>" +
+          '<span class="turn-agent' + (t.req.isSubagent ? " sub" : "") + '">' +
+          esc(t.agent) + "</span>" +
+          '<span class="turn-bar"><span style="width:' +
+          ((ctx / maxCtx) * 100).toFixed(1) + '%"></span></span>' +
+          '<span class="turn-ctx">' + fmtTok(ctx) + "</span>" +
+          '<span class="turn-dur">' + fmtDur(t.req.durationMs) + "</span>" +
+          '<span class="turn-evn">' +
+          (t.events.length ? t.events.length + " ev" : "") + "</span>" +
           "</div>" +
-          '<div class="wf-track">' +
-          bars +
-          "</div>" +
-          '<div class="wf-meta">' +
-          meta +
-          "</div>" +
+          '<div class="turn-events" hidden>' + evHtml + "</div>" +
           "</div>"
         );
       })
       .join("");
+
+    return (
+      '<h2 class="sec">Turns <small>(' + turns.length +
+      " · \u2191\u2193 move · \u2192 expand · \u2190 collapse · click for detail)</small></h2>" +
+      timeRibbonHtml(turns) +
+      '<div class="turn-filters">' + filters + "</div>" +
+      '<div class="turn-spine" id="turn-spine">' + rows + "</div>"
+    );
   }
+
 
   // ------------------------------------------------------------- sessions
   var sess = {
@@ -949,11 +1362,19 @@
     var hooks = data.hooks || [];
     hooksForPane = hooks;
     var flow = data.flow || { nodes: [], edges: [] };
+    var siblings = data.siblings || [];
+    stepsForPane = steps;
     var compactSeqs = {};
     var compactionList = data.compactions || [];
     compactionList.forEach(function (c) {
       compactSeqs[c.seq] = c;
     });
+    // AFTER compactSeqs is populated: a turn needs to know whether it compacted,
+    // and building it a few lines earlier read an empty (hoisted) object.
+    turnsForPane = buildTurns(reqs, hooks, steps, compactSeqs);
+    // The brush window is absolute epoch ms, so it is meaningless against a
+    // different session's ribbon. Drop it with the render that produced it.
+    turnRange = null;
 
     var ttfts = reqs
       .map(function (r) {
@@ -1000,7 +1421,7 @@
             ? ' <small class="dim">of ' + hooks.length + "</small>"
             : ""),
       ) +
-      card("Compactions", compactionList.length, compactionList.length > 0);
+      compactionCard(compactionList, data.recordedCompactions);
 
     var pane = initialPane || "flow";
     function subnavBtn(name, label, count) {
@@ -1034,6 +1455,22 @@
           encodeURIComponent(s.sessionId) +
           '" target="_blank" rel="noopener">wire report ↗</a>'
         : "") +
+      // The system prompt used to be reachable only as 8 characters of hash
+      // inside a hover tooltip — you could see that a prompt existed but never
+      // read it without hunting the Prompts tab by eye.
+      (reqs.length && reqs[0].promptHash
+        ? ' <a class="head-link" href="#prompt/' +
+          esc(reqs[0].promptHash) +
+          '">system prompt ↗</a>'
+        : "") +
+      // The ASK. It was in the transcript all along, buried some way down the
+      // steps list behind system-reminder scaffolding, so the one thing you
+      // most want when opening a session — what was this run even asked to
+      // do — took the most scrolling to find.
+      (initialUserStep(steps) != null
+        ? ' <button type="button" class="head-link" data-inspect="ask:0">' +
+          "user prompt</button>"
+        : "") +
       "</span></div>" +
       '<div class="cards">' +
       cards +
@@ -1045,7 +1482,9 @@
       subnavBtn("xray", "Context X-Ray") +
       subnavBtn("tools", "Tool Tax") +
       subnavBtn("wire", "Wire") +
+      subnavBtn("related", "Related", siblings.length || null) +
       "</nav>" +
+      '<div class="session-body">' +
       '<div class="session-panes">' +
       '<section class="session-pane' +
       (pane === "flow" ? " active" : "") +
@@ -1072,13 +1511,17 @@
       '<section class="session-pane' +
       (pane === "wire" ? " active" : "") +
       '" id="pane-wire">' +
-      laneSection(reqs, compactSeqs) +
-      '<h2 class="sec">Request waterfall <small>(' +
-      reqs.length +
-      " API calls · hover for wire metrics · click to jump to the step)</small></h2>" +
-      '<div class="chart-box waterfall" id="wf">' +
-      waterfall(reqs, compactSeqs) +
-      "</div>" +
+      // The spine REPLACES what used to sit here rather than sitting above it:
+      // FIG.1 (transcript items per call), FIG.2 (token flow per call) and the
+      // request waterfall were three renderings of the same 18 calls, and
+      // adding a fourth is not consolidation. Every number they carried is on
+      // a spine row or one click into the inspector — context read, duration,
+      // compaction, and the cache read/write/fresh/output split.
+      //
+      // What genuinely died with the waterfall is TIME OVERLAP: it was the only
+      // view showing calls running concurrently. That returns with the range
+      // selector, which needs a time axis anyway.
+      turnSpineHtml(turnsForPane) +
       '<h2 class="sec">Transcript <small>(' +
       steps.length +
       " steps)</small></h2>" +
@@ -1087,18 +1530,64 @@
       "</div>" +
       minimapHtml(steps) +
       "</section>" +
+      '<section class="session-pane' +
+      (pane === "related" ? " active" : "") +
+      '" id="pane-related">' +
+      renderConversations(reqs) +
+      renderRelatedPane(siblings, s) +
+      "</section>" +
       "</div>" +
-      '<div id="payload-pop" class="payload-pop" hidden></div>';
+      // One inspector for all five panes. It lives beside `.session-panes`
+      // rather than inside any one of them, which is the whole point: a panel
+      // owned by the Flow pane can only ever serve the Flow pane.
+      '<aside class="inspector" id="inspector">' +
+      INSPECTOR_EMPTY +
+      "</aside>" +
+      "</div>";
     setView(html);
     bindSessionInteractions(reqs, compactSeqs, steps);
     bindSessionPanes(s.sessionId, reqs);
-    bindPayloadPopovers();
     if (stepN != null) {
       activatePane("wire");
       setTimeout(function () {
         flashStep(stepN);
       }, 30);
     }
+  }
+
+  /**
+   * The inspector is shared, but what it can describe is NOT.
+   *
+   * The panes have different scopes, and this is a property of the data, not a
+   * layout choice: Context X-Ray and Wire are per API call (215 distinct
+   * context sizes across 224 calls), while Tool Tax is per TOOLSET — one
+   * toolset covered all 224 calls of the session this was found on, and the
+   * `tools` bucket had exactly one distinct value throughout. A dead-tool
+   * selection therefore says nothing about the call you just switched to.
+   *
+   * Leaving it up made the panel look like it described the new pane. So a
+   * selection that does not live in the pane you are now looking at is
+   * dropped, and if you had been somewhere in THIS pane before, you land back
+   * there rather than on nothing.
+   */
+  function syncInspectorToPane(name) {
+    var id = Inspector.selected();
+    if (!id) return;
+    var pane = document.getElementById("pane-" + name);
+    var el = pane
+      ? pane.querySelector('[data-inspect="' + cssEscape(id) + '"]')
+      : null;
+    if (el) return; // still in scope — nothing to do
+    // Session-scoped selections (the ask, rendered in the header) belong to no
+    // pane and are valid in all of them. Only evict something that lives in a
+    // DIFFERENT pane, not something that lives outside panes entirely.
+    var anywhere = document.querySelector('[data-inspect="' + cssEscape(id) + '"]');
+    if (anywhere && !anywhere.closest(".session-pane")) return;
+    Inspector.clear();
+    var remembered = paneCursor[name];
+    if (!remembered || !pane) return;
+    var back = pane.querySelector('[data-inspect="' + cssEscape(remembered) + '"]');
+    if (back && back.offsetParent !== null) back.click();
   }
 
   function activatePane(name) {
@@ -1118,6 +1607,12 @@
         history.replaceState(null, "", next);
       }
     }
+    // LAST, and the order is load-bearing twice over: after the class swap so
+    // scope is tested against the pane that is now up, and after `current.pane`
+    // so the restore click records its cursor under the pane it lands in. With
+    // this call earlier, restoring pane B wrote B's row into A's cursor slot
+    // and A could never be restored again.
+    syncInspectorToPane(name);
   }
 
   function bindSessionPanes(sessionId, reqs) {
@@ -1130,93 +1625,356 @@
         activatePane(a.getAttribute("data-pane"));
       });
     }
-    var flowEl = document.getElementById("flow-graph");
-    if (flowEl) {
-      flowEl.addEventListener("click", function (e) {
-        var node = e.target.closest(".flow-node");
-        if (!node) return;
-        var detail = document.getElementById("flow-detail");
-        if (!detail) return;
-        var raw = node.getAttribute("data-detail");
-        var kind = node.getAttribute("data-kind");
-        var label = node.getAttribute("data-label");
-        var html =
-          '<div class="flow-detail-head"><span class="pill">' +
-          esc(kind) +
-          "</span> " +
-          esc(label) +
-          "</div>";
-        var preview = node.getAttribute("data-detail-preview");
-        if (raw) {
-          try {
-            html +=
-              '<pre class="payload">' +
-              esc(JSON.stringify(JSON.parse(raw), null, 2)) +
-              "</pre>";
-          } catch (err) {
-            html += '<pre class="payload">' + esc(raw) + "</pre>";
-          }
-        } else if (preview) {
-          // Show the preview immediately so the pane never looks empty, then
-          // swap in the full payload when it arrives.
-          html +=
-            '<pre class="payload" id="flow-detail-body">' +
-            esc(preview) +
-            "…</pre>" +
-            '<div class="dim" id="flow-detail-note">loading full payload (' +
-            fmtTok(Number(node.getAttribute("data-detail-chars") || 0)) +
-            " chars)…</div>";
+    // One delegated listener for every inspectable row in every pane. Panes
+    // re-render their own innerHTML freely (the hooks filter, the x-ray reload)
+    // and delegation means none of them ever need re-binding — the class of bug
+    // that made click-to-expand inert for months.
+    var panesEl = document.querySelector(".session-panes");
+    if (panesEl) {
+      function activate(el) {
+        var id = el.getAttribute("data-inspect") || "";
+        // Recorded here, not in the arrow-key helper, so a mouse click and a
+        // keypress leave the same trace. Otherwise leaving a pane by mouse and
+        // returning would land on nothing, while the keyboard remembered.
+        if (current.pane) paneCursor[current.pane] = id;
+        var type = id.slice(0, id.indexOf(":"));
+        if (type === "flow") inspectFlowNode(el, sessionId);
+        else if (type === "seg") inspectSegment(id);
+        else if (type === "hook") inspectHook(id);
+        else if (type === "ctp") inspectTimelinePoint(id);
+        else if (type === "tool") inspectTool(id);
+        else if (type === "prov") inspectProvider(id);
+        else if (type === "ask") inspectAsk();
+        else if (type === "ev") inspectTurnEvent(id);
+      }
+      panesEl.addEventListener("click", function (e) {
+        var el = e.target.closest("[data-inspect]");
+        if (el) activate(el);
+      });
+      panesEl.addEventListener("keydown", function (e) {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        var el = e.target.closest && e.target.closest("[data-inspect]");
+        if (!el) return;
+        e.preventDefault();
+        activate(el);
+      });
+    }
+
+    function inspectHook(id) {
+      var parts = id.split(":"); // hook:<index>:<part>
+      var h = hooksForPane[Number(parts[1])];
+      if (!h) return;
+      var part = parts[2];
+      var sp = h.stdoutPreview || {};
+      var body;
+      if (part === "full") body = JSON.stringify(h.payload || {}, null, 2);
+      else if (part === "return")
+        body =
+          sp.additional_context ||
+          sp.reason ||
+          sp.text ||
+          (sp.returned ? JSON.stringify(sp.returned, null, 2) : "");
+      else body = JSON.stringify(sp, null, 2);
+      Inspector.show(id, {
+        kind: h.event || "hook",
+        title: (h.hookName || "") + " · " + part,
+        body: body,
+      });
+    }
+
+    /**
+     * One timeline bar. This is where the compaction cards went: the same
+     * numbers, on the point they describe, in the panel every other pane uses.
+     */
+    function inspectTimelinePoint(id) {
+      var seq = Number(id.slice(id.indexOf(":") + 1));
+      var pts = (timelineForPane && timelineForPane.points) || [];
+      var p = null;
+      for (var i = 0; i < pts.length; i++) {
+        if (pts[i].seq === seq) {
+          p = pts[i];
+          break;
         }
-        var seq = node.getAttribute("data-seq");
-        if (seq != null && seq !== "") {
-          html +=
-            '<button type="button" class="btn-xray" data-seq="' +
-            esc(seq) +
-            '">Open Context X-Ray for API #' +
-            esc(seq) +
-            "</button>";
+      }
+      if (!p) return;
+      selectedSeq = p.seq;
+      var lines = [
+        "context read   " + fmtTok(p.contextTokens) + " tokens",
+        "  cache read   " + fmtTok(p.cacheRead),
+        "  cache write  " + fmtTok(p.cacheCreation),
+        "  fresh input  " + fmtTok(p.promptTokens),
+        "output         " + fmtTok(p.completionTokens),
+        "transcript     " + p.transcriptItems + " items",
+        "approx (chars) " + fmtTok(p.approxTokens) + " tokens",
+        "model          " + (p.model || "—"),
+        "at             " + new Date(p.ts * 1000).toLocaleTimeString(),
+      ];
+      if (p.compaction) {
+        var c = p.compaction;
+        lines.push(
+          "",
+          "COMPACTION",
+          "  items        " + c.fromItems + " → " + c.toItems + " (dropped " + c.droppedItems + ")",
+          "  context      " +
+            fmtTok(c.preContextTokens) +
+            " → " +
+            fmtTok(c.postContextTokens) +
+            " (freed " +
+            fmtTok(c.droppedTokens) +
+            ")",
+          "  approx       " + fmtTok(c.preApproxTokens) + " → " + fmtTok(c.postApproxTokens),
+        );
+      }
+      if (p.buckets) {
+        lines.push("", "COMPOSITION (approx tokens)");
+        Object.keys(p.buckets)
+          .sort(function (a, b) {
+            return p.buckets[b] - p.buckets[a];
+          })
+          .forEach(function (k) {
+            lines.push("  " + (k + "            ").slice(0, 13) + fmtTok(p.buckets[k]));
+          });
+      }
+      Inspector.show(id, {
+        kind: p.compaction ? "compaction" : "api call",
+        title: "#" + p.seq + " · " + fmtTok(p.contextTokens) + " context tokens",
+        body: lines.join("\n"),
+      });
+    }
+
+    /** Split "kind:<toolsetIdx>:<rest>" where rest may itself contain colons. */
+    function toolTaxTarget(id) {
+      var first = id.indexOf(":");
+      var second = id.indexOf(":", first + 1);
+      var ts = (toolTaxForPane || [])[Number(id.slice(first + 1, second))];
+      return { toolset: ts, name: id.slice(second + 1) };
+    }
+
+    function inspectTool(id) {
+      var t = toolTaxTarget(id);
+      if (!t.toolset) return;
+      var tool = null;
+      for (var i = 0; i < t.toolset.tools.length; i++) {
+        if (t.toolset.tools[i].name === t.name) {
+          tool = t.toolset.tools[i];
+          break;
         }
-        if (kind === "hook") {
-          html +=
-            '<button type="button" class="btn-xray" data-goto-hooks="1">Open Hooks pane</button>';
+      }
+      if (!tool) return;
+      var total =
+        t.toolset.tools.reduce(function (a, x) {
+          return a + x.approxTokens;
+        }, 0) || 1;
+      var g = toolProvider(tool.name);
+      var lines = [
+        "provider       " + (g.kind === "builtin" ? "built-in" : g.kind + " · " + g.key),
+        "declared on    " + t.toolset.requestCount + " API calls",
+        "",
+        "size / call    " + fmtTok(tool.approxTokens) + " tokens",
+        "share of tools " + ((tool.approxTokens / total) * 100).toFixed(1) + "%",
+        "cumulative     " + fmtTok(tool.cumulativeTokens) + " tokens",
+        "invocations    " + tool.calls,
+      ];
+      if (tool.dead && t.toolset.deadTokensCumulative > 0) {
+        // Apportioned by cumulative share — the toolset cost is measured, the
+        // per-tool split is arithmetic on it, not a second estimate.
+        var share = tool.cumulativeTokens / t.toolset.deadTokensCumulative;
+        lines.push(
+          "",
+          "DEAD — declared on every call, never invoked",
+          "est. cost      " + fmtCost(share * t.toolset.deadCostUsd),
+        );
+      }
+      Inspector.show(id, { kind: tool.dead ? "dead tool" : "tool", title: tool.name, body: lines.join("\n") });
+    }
+
+    function inspectProvider(id) {
+      var t = toolTaxTarget(id);
+      if (!t.toolset) return;
+      var groups = toolProviderGroups(t.toolset.tools);
+      var g = null;
+      for (var i = 0; i < groups.length; i++) {
+        if (groups[i].key === t.name) {
+          g = groups[i];
+          break;
         }
-        detail.innerHTML = html;
-        if (!raw && preview) {
-          var nodeId = node.getAttribute("data-node-id");
-          fetchJSON(
+      }
+      if (!g) return;
+      var total =
+        t.toolset.tools.reduce(function (a, x) {
+          return a + x.approxTokens;
+        }, 0) || 1;
+      var lines = [
+        "tools declared " + g.tools.length,
+        "size / call    " + fmtTok(g.approxTokens) + " tokens",
+        "share of tools " + ((g.approxTokens / total) * 100).toFixed(1) + "%",
+        "cumulative     " + fmtTok(g.cumulativeTokens) + " tokens",
+        "invocations    " + g.calls,
+      ];
+      if (g.deferred) {
+        lines.push(
+          "",
+          "DEFERRED — only the auth stubs are loaded. The full tool surface",
+          "arrives after authenticating, and authenticating is sticky: it opts",
+          "the connector into full loading on every later call.",
+        );
+      } else if (g.kind === "plugin" || g.kind === "mcp") {
+        lines.push(
+          "",
+          "Plugins and local MCP servers load in full regardless of the",
+          '"load tools when needed" setting, which only defers connectors.',
+        );
+      }
+      lines.push("", "TOOLS (by size)");
+      g.tools
+        .slice()
+        .sort(function (a, b) {
+          return b.approxTokens - a.approxTokens;
+        })
+        .forEach(function (x) {
+          lines.push(
+            "  " + fmtTok(x.approxTokens).padStart(7) + "  " + (x.calls ? "     " : "dead ") + x.name,
+          );
+        });
+      Inspector.show(id, {
+        kind: g.calls ? "provider" : "dead provider",
+        title: providerLabel(g),
+        body: lines.join("\n"),
+      });
+    }
+
+    function inspectAsk() {
+      var st = initialUserStep(stepsForPane);
+      if (!st) return;
+      Inspector.show("ask:0", {
+        kind: "user prompt",
+        title: "what this session was asked to do",
+        body: String(st.message || ""),
+      });
+    }
+
+    function inspectTurnEvent(id) {
+      var parts = id.split(":"); // ev:<seq>:<index>
+      var seq = Number(parts[1]);
+      var t = null;
+      for (var i = 0; i < turnsForPane.length; i++) {
+        if (turnsForPane[i].seq === seq) {
+          t = turnsForPane[i];
+          break;
+        }
+      }
+      if (!t) return;
+      var e = t.events[Number(parts[2])];
+      if (!e) return;
+      Inspector.show(id, {
+        kind: e.kind,
+        title: "turn " + seq + " · " + e.label,
+        body:
+          "agent          " + t.agent + "\n" +
+          "at             " + new Date(t.req.ts * 1000).toLocaleTimeString() + "\n" +
+          (e.n != null ? "size / dur     " + e.n + "\n" : "") +
+          (e.detail ? "\n" + e.detail : ""),
+      });
+    }
+
+    function inspectSegment(id) {
+      var i = Number(id.slice(id.indexOf(":") + 1));
+      var segs = (xrayForPane && xrayForPane.segments) || [];
+      var s = segs[i];
+      if (!s) return;
+      var total = xrayForPane.totalApproxTokens || 0;
+      var pct = sharePct(s.approxTokens, total);
+      Inspector.show(id, {
+        kind: s.bucket,
+        title:
+          fmtTok(s.approxTokens) + " approx tokens · " + fmtShare(pct) + " of context",
+        // `full` when the server sent it, otherwise the preview — same source
+        // the popover used, just resolved on demand instead of pre-stringified.
+        body: s.full || s.preview || "",
+      });
+    }
+
+    function inspectFlowNode(node, sessionId) {
+      var raw = node.getAttribute("data-detail");
+      var preview = node.getAttribute("data-detail-preview");
+      var kind = node.getAttribute("data-kind");
+      var nodeId = node.getAttribute("data-node-id");
+      var seq = node.getAttribute("data-seq");
+
+      var body = "";
+      var loadingNote = "";
+      var load = null;
+      if (raw) {
+        try {
+          body = JSON.stringify(JSON.parse(raw), null, 2);
+        } catch (err) {
+          body = raw;
+        }
+      } else if (preview) {
+        // Show the preview immediately so the panel never looks empty, then
+        // swap in the full payload when it arrives.
+        body = preview + "…";
+        loadingNote =
+          "loading full payload (" +
+          fmtTok(Number(node.getAttribute("data-detail-chars") || 0)) +
+          " chars)…";
+        load = function () {
+          return fetchJSON(
             "/api/session/" +
               encodeURIComponent(sessionId) +
               "/flow/" +
               encodeURIComponent(nodeId),
-          )
-            .then(function (full) {
-              var body = document.getElementById("flow-detail-body");
-              var note = document.getElementById("flow-detail-note");
-              // The user may have clicked another node while this was in
-              // flight; only write if this node's placeholder is still shown.
-              if (!body || detail.getAttribute("data-showing") !== nodeId) return;
-              body.textContent = JSON.stringify(full.detail, null, 2);
-              if (note) note.remove();
-            })
-            .catch(function (err) {
-              var note = document.getElementById("flow-detail-note");
-              if (note) note.textContent = "full payload unavailable — " + (err.message || err);
-            });
-        }
-        detail.setAttribute("data-showing", node.getAttribute("data-node-id") || "");
-        var btn = detail.querySelector(".btn-xray[data-seq]");
-        if (btn) {
-          btn.addEventListener("click", function () {
+          ).then(function (full) {
+            return JSON.stringify(full.detail, null, 2);
+          });
+        };
+      }
+
+      var actions = [];
+      if (seq != null && seq !== "") {
+        actions.push({
+          label: "Open Context X-Ray for API #" + seq,
+          onClick: function () {
+            // Follow the navigation. Leaving the panel on the flow node meant
+            // the button was still there, still offering to do the thing it
+            // had just done — a dead end that looked like a no-op. The
+            // destination is pushed, so Escape / ← returns to this node.
             activatePane("xray");
-            loadXray(sessionId, Number(btn.getAttribute("data-seq")));
-          });
-        }
-        var hb = detail.querySelector("[data-goto-hooks]");
-        if (hb) {
-          hb.addEventListener("click", function () {
+            loadXray(sessionId, Number(seq));
+            selectedSeq = Number(seq);
+            Inspector.pushOnce();
+            setTimeout(function () {
+              var bar = document.querySelector(
+                '[data-inspect="ctp:' + seq + '"]',
+              );
+              if (bar) selectTarget(bar);
+              else Inspector.cancelPush();
+            }, 0);
+          },
+        });
+      }
+      if (kind === "hook") {
+        actions.push({
+          label: "Open Hooks pane",
+          onClick: function () {
             activatePane("hooks");
-          });
-        }
+            Inspector.pushOnce();
+            setTimeout(function () {
+              var list = paneTargets();
+              if (list.length) selectTarget(list[0]);
+              else Inspector.cancelPush();
+            }, 0);
+          },
+        });
+      }
+
+      Inspector.show("flow:" + nodeId, {
+        kind: kind,
+        title: node.getAttribute("data-label") || "",
+        body: body,
+        loadingNote: loadingNote,
+        actions: actions,
+        load: load,
       });
     }
     var xraySel = document.getElementById("xray-seq");
@@ -1231,67 +1989,7 @@
     loadToolTax(sessionId);
   }
 
-  function bindPayloadPopovers() {
-    var pop = document.getElementById("payload-pop");
-    if (!pop) return;
-    var hideTimer = null;
-    function hide() {
-      pop.hidden = true;
-      pop.innerHTML = "";
-    }
-    function show(el, html) {
-      clearTimeout(hideTimer);
-      pop.innerHTML = html;
-      pop.hidden = false;
-      var r = el.getBoundingClientRect();
-      var top = r.bottom + 8 + window.scrollY;
-      var left = Math.min(
-        r.left + window.scrollX,
-        window.scrollX + window.innerWidth - 360,
-      );
-      pop.style.top = top + "px";
-      pop.style.left = Math.max(8, left) + "px";
-    }
-    // Idempotent by construction. This runs on every session draw AND on every
-    // x-ray load, so without the marker a second pass adds a second click
-    // handler to the same element — and since the handler toggles `hidden`,
-    // two of them cancel out and click-to-expand silently stops working.
-    document.querySelectorAll("[data-full-payload]").forEach(function (el) {
-      if (el.dataset.popBound === "1") return;
-      el.dataset.popBound = "1";
-      el.addEventListener("mouseenter", function () {
-        var raw = el.getAttribute("data-full-payload");
-        if (!raw) return;
-        show(
-          el,
-          '<div class="payload-pop-head">full payload</div><pre class="payload">' +
-            esc(raw) +
-            "</pre>",
-        );
-      });
-      el.addEventListener("mouseleave", function () {
-        hideTimer = setTimeout(hide, 180);
-      });
-      el.addEventListener("click", function (e) {
-        e.preventDefault();
-        var raw = el.getAttribute("data-full-payload");
-        if (!raw) return;
-        el.classList.toggle("expanded");
-        var panel = el.nextElementSibling;
-        if (panel && panel.classList.contains("payload-expand")) {
-          panel.hidden = !panel.hidden;
-        }
-      });
-    });
-    pop.addEventListener("mouseenter", function () {
-      clearTimeout(hideTimer);
-    });
-    pop.addEventListener("mouseleave", function () {
-      hideTimer = setTimeout(hide, 120);
-    });
-  }
-
-  function hookReturnBlock(h) {
+  function hookReturnBlock(h, hi) {
     var sp = h.stdoutPreview || {};
     var returned =
       sp.additional_context ||
@@ -1340,14 +2038,16 @@
           ? " · " + fmtTok(sp.chars) + " chars"
           : "") +
       "</h3>" +
-      '<button type="button" class="payload-hotspot" data-full-payload="' +
-      esc(full) +
-      '">' +
+      '<pre class="payload">' +
       esc(preview) +
-      ' <span class="dim">hover / click to expand</span></button>' +
-      '<pre class="payload payload-expand" hidden>' +
-      esc(full) +
-      "</pre></div>"
+      "</pre>" +
+      // Compared by value, not by length: a preview is `slice(0,160) + "…"`,
+      // so a payload of exactly 161 chars produces two strings of equal length
+      // with the last character missing — and a `>` test would hide the chip.
+      (full !== preview
+        ? inspectChip("hook:" + hi + ":return", "inspect full", "returned payload")
+        : "") +
+      "</div>"
     );
   }
 
@@ -1362,6 +2062,26 @@
    */
   function isObserveOnly(h) {
     return (h.stdoutPreview || {}).observeOnly === true;
+  }
+
+  /**
+   * A small "open this in the inspector" affordance, used beside a preview.
+   *
+   * `what` is the accessible name. The visible label stays short because it
+   * sits under a heading that already says which payload it is, but the
+   * heading is not part of the button's accessible name — without `what`,
+   * a hooks pane is a list of eighty buttons all called "inspect".
+   */
+  function inspectChip(id, label, what) {
+    return (
+      '<button type="button" class="inspect-chip" data-inspect="' +
+      esc(id) +
+      '"' +
+      (what ? ' aria-label="inspect ' + esc(what) + '"' : "") +
+      ">" +
+      esc(label || "inspect") +
+      "</button>"
+    );
   }
 
   function signalHooks(hooks) {
@@ -1406,6 +2126,10 @@
         "Clear the historical noise with <code>tracetap hooks prune</code>.</span></div></div>"
       );
     }
+    var idxOf = new Map();
+    hooks.forEach(function (h, i) {
+      idxOf.set(h, i);
+    });
     return (
       '<div class="hooks-timeline">' +
       '<div class="dim hooks-hint">' +
@@ -1416,6 +2140,9 @@
       "</div>" +
       shown
         .map(function (h) {
+          // Index into the unfiltered list, so an inspect id stays valid when
+          // the observe-only filter changes which rows are on screen.
+          var hi = idxOf.get(h);
           var badge =
             h.decision === "block"
               ? "block"
@@ -1451,28 +2178,36 @@
               : "") +
             "</summary>" +
             '<div class="hook-body">' +
-            hookReturnBlock(h) +
+            hookReturnBlock(h, hi) +
             '<div class="hook-grid">' +
+            // Each payload is rendered once, as a preview, with a chip that
+            // opens it in the inspector. Previously every one was stringified
+            // TWICE — into a data-full-payload attribute and into the visible
+            // <pre> — and both copies HTML-escaped. On a session with hundreds
+            // of hook events that was the largest single source of DOM weight
+            // in the app, for text most users never open.
+            // No inspect chip on these two. The <pre> already holds the
+            // WHOLE preview object — opening it in the panel reproduced the
+            // same text verbatim, which teaches the reader that `inspect`
+            // means nothing. Chips are kept only where the panel shows
+            // something the row cannot: the full stdin payload, and a
+            // returned payload longer than its preview.
             "<div><h3>stdin preview</h3>" +
-            '<button type="button" class="payload-hotspot" data-full-payload="' +
+            '<pre class="payload compact">' +
             esc(JSON.stringify(h.stdinPreview || {}, null, 2)) +
-            '"><pre class="payload compact">' +
-            esc(JSON.stringify(h.stdinPreview || {}, null, 2)) +
-            "</pre></button></div>" +
+            "</pre></div>" +
             "<div><h3>stdout preview</h3>" +
-            '<button type="button" class="payload-hotspot" data-full-payload="' +
+            '<pre class="payload compact">' +
             esc(JSON.stringify(h.stdoutPreview || {}, null, 2)) +
-            '"><pre class="payload compact">' +
-            esc(JSON.stringify(h.stdoutPreview || {}, null, 2)) +
-            "</pre></button></div>" +
+            "</pre></div>" +
             "</div>" +
             (h.payload
-              ? "<h3>full stdin payload</h3>" +
-                '<button type="button" class="payload-hotspot" data-full-payload="' +
+              ? "<h3>full stdin payload " +
+                inspectChip("hook:" + hi + ":full", null, "full stdin payload") +
+                "</h3>" +
+                '<pre class="payload compact">' +
                 esc(JSON.stringify(h.payload, null, 2)) +
-                '"><pre class="payload compact">' +
-                esc(JSON.stringify(h.payload, null, 2)) +
-                "</pre></button>"
+                "</pre>"
               : '<div class="dim">Full stdin not stored — set <code>TRACETAP_HOOK_FULL=1</code> on capture.</div>') +
             '<div class="dim">digest ' +
             esc((h.stdinDigest || "").slice(0, 12)) +
@@ -1489,11 +2224,412 @@
     );
   }
 
+  /**
+   * Round a peak up to a readable axis maximum, so the top gridline is a
+   * number a human would choose (150K, not 147,312).
+   */
+  function niceCeil(v) {
+    if (v <= 0) return 1;
+    var mag = Math.pow(10, Math.floor(Math.log10(v)));
+    var steps = [1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10];
+    for (var i = 0; i < steps.length; i++) {
+      if (steps[i] * mag >= v) return steps[i] * mag;
+    }
+    return 10 * mag;
+  }
+
+  /**
+   * Sessions captured in the same trace log.
+   *
+   * One `.claude-trace` log is one proxied CLI process, so everything in it
+   * shares a terminal, a directory and a stretch of wall-clock time. A live
+   * capture put 24 sessions in a single log — a main thread and the fleet it
+   * spawned — which the session list rendered as 24 unrelated rows.
+   *
+   * Presented flat, not as a tree. Which session SPAWNED which needs per-agent
+   * identity the rows do not carry yet, and a tree would assert a parentage
+   * that has not been established.
+   */
+  /**
+   * The conversations inside ONE session.
+   *
+   * A session that spawns a fleet is not one conversation — the live capture
+   * behind this pane is 308 main-thread calls plus 430 subagent calls across
+   * 11 named agents, all under one session id. Grouping by agent is the only
+   * way the session view stops reading as one impossibly long thread.
+   *
+   * Unnamed subagents are kept as their own row rather than folded into the
+   * main thread or hidden: they were never spawned through the Agent tool
+   * (workflow-orchestrated agents are marked but have no parent record), so
+   * the honest presentation is "subagent, unnamed", not silence.
+   */
+  /**
+   * The first genuinely user-authored step.
+   *
+   * Claude Code prepends `<system-reminder>` steps carrying CLAUDE.md, the
+   * skills roster and environment context, so step 0 is scaffolding on every
+   * session. Taking it literally would show the harness talking to itself
+   * rather than the ask.
+   */
+  function initialUserStep(steps) {
+    for (var i = 0; i < (steps || []).length; i++) {
+      var st = steps[i];
+      if (st.role !== "user") continue;
+      var m = String(st.message || "");
+      if (m.trim().indexOf("<system-reminder>") === 0) continue;
+      return st;
+    }
+    return null;
+  }
+
+  function renderConversations(reqs) {
+    var groups = {};
+    var order = [];
+    reqs.forEach(function (r) {
+      var key = !r.isSubagent ? "\u0000main" : r.agentLabel || "\u0001unnamed";
+      if (!groups[key]) {
+        groups[key] = { key: key, calls: 0, tokens: 0, out: 0, first: r.ts, last: r.ts,
+                        label: !r.isSubagent ? "main thread" : r.agentLabel || "subagent (unnamed)",
+                        type: r.agentType, sub: !!r.isSubagent };
+        order.push(key);
+      }
+      var g = groups[key];
+      g.calls++;
+      g.tokens += (r.promptTokens || 0) + (r.cacheRead || 0) + (r.cacheCreation || 0);
+      g.out += r.completionTokens || 0;
+      if (r.ts < g.first) g.first = r.ts;
+      if (r.ts > g.last) g.last = r.ts;
+    });
+    var list = order
+      .map(function (k) { return groups[k]; })
+      .sort(function (a, b) {
+        if (a.sub !== b.sub) return a.sub ? 1 : -1; // main thread first
+        return b.calls - a.calls;
+      });
+    if (list.length <= 1) {
+      return (
+        '<div class="empty-pane">This session is a single conversation — no ' +
+        "subagent calls were captured in it.</div>"
+      );
+    }
+    var namedSubs = list.filter(function (g) { return g.sub && g.label.indexOf("unnamed") < 0; }).length;
+    var rows = list
+      .map(function (g) {
+        return (
+          '<tr class="' + (g.sub ? "convo-sub" : "convo-main") + '">' +
+          "<td>" +
+          (g.sub ? '<span class="convo-indent">\u2514</span> ' : "") +
+          esc(g.label) +
+          (g.type ? ' <span class="dim">' + esc(g.type) + "</span>" : "") +
+          '</td><td class="num">' + g.calls +
+          '</td><td class="num">' + fmtTok(g.tokens) +
+          '</td><td class="num">' + fmtTok(g.out) +
+          '</td><td class="num">' + fmtDur((g.last - g.first) * 1000) +
+          "</td></tr>"
+        );
+      })
+      .join("");
+    return (
+      '<h2 class="sec">Conversations in this session <small>(' +
+      list.length +
+      " · " +
+      namedSubs +
+      " named agent" +
+      (namedSubs === 1 ? "" : "s") +
+      ")</small></h2>" +
+      '<div class="dim rel-note">One session id can hold a main thread and every ' +
+      "agent it spawned. Names come from the spawning Agent tool call; an agent " +
+      "started by a workflow rather than that tool has no parent record to join " +
+      'to and is shown as "unnamed" rather than merged into the main thread.</div>' +
+      '<div class="tbl-wrap"><table><thead><tr>' +
+      "<th>conversation</th>" +
+      '<th class="num">calls</th><th class="num">context read</th>' +
+      '<th class="num">output</th><th class="num">span</th>' +
+      "</tr></thead><tbody>" + rows + "</tbody></table></div>"
+    );
+  }
+
+  function renderRelatedPane(siblings, s) {
+    if (!siblings.length) {
+      return (
+        '<div class="empty-pane">No other sessions were captured in this trace log.</div>'
+      );
+    }
+    var totalCost = siblings.reduce(function (a, x) {
+      return a + (x.costUsd || 0);
+    }, 0);
+    var log = (s.sourcePath || "").split("/").pop();
+    var rows = siblings
+      .map(function (x) {
+        return (
+          '<tr class="click" data-goto="' +
+          esc(x.sessionId) +
+          '"><td>' +
+          agentPill(x.agent) +
+          "</td><td>" +
+          esc(x.model || "—") +
+          "</td><td>" +
+          fmtTime(x.startedAt) +
+          "</td><td class=\"num\">" +
+          fmtDur(x.durationMs) +
+          "</td><td class=\"num\">" +
+          (x.turns == null ? "—" : x.turns) +
+          "</td><td class=\"num\">" +
+          fmtCost(x.costUsd) +
+          "</td></tr>"
+        );
+      })
+      .join("");
+    return (
+      '<h2 class="sec">Captured alongside <small>(' +
+      siblings.length +
+      " other session" +
+      (siblings.length === 1 ? "" : "s") +
+      " in " +
+      esc(log) +
+      " · " +
+      fmtCost(totalCost) +
+      " combined)</small></h2>" +
+      '<div class="dim rel-note">One trace log is one CLI process. These share a ' +
+      "terminal and a time window with this session — siblings, not children: " +
+      "establishing which spawned which needs per-agent identity that is not " +
+      "captured yet.</div>" +
+      '<div class="tbl-wrap"><table><thead><tr>' +
+      "<th>agent</th><th>model</th><th>started</th>" +
+      '<th class="num">duration</th><th class="num">turns</th><th class="num">cost</th>' +
+      "</tr></thead><tbody>" +
+      rows +
+      "</tbody></table></div>"
+    );
+  }
+
+  /** Expand or collapse one turn. */
+  function setTurnExpanded(seq, open) {
+    var turn = document.querySelector('.turn[data-turn="' + seq + '"]');
+    if (!turn) return false;
+    var box = turn.querySelector(".turn-events");
+    var caret = turn.querySelector(".turn-caret");
+    if (!box || !box.children.length) return false;
+    box.hidden = !open;
+    if (caret) caret.textContent = open ? "\u25be" : "\u25b8";
+    return true;
+  }
+
+  document.addEventListener("click", function (e) {
+    var c = e.target.closest && e.target.closest("[data-expand]");
+    if (c) {
+      e.stopPropagation();
+      var seq = c.getAttribute("data-expand");
+      var box = c.closest(".turn").querySelector(".turn-events");
+      setTurnExpanded(seq, box.hidden);
+      return;
+    }
+    var f = e.target.closest && e.target.closest("[data-turn-filter]");
+    if (!f) return;
+    f.setAttribute("aria-pressed", f.getAttribute("aria-pressed") === "true" ? "false" : "true");
+    applyTurnFilters();
+  });
+
+  /** Selected time window from the ribbon brush, or null for the whole session. */
+  var turnRange = null;
+
+  /**
+   * The ONE place `.turn[hidden]` is written.
+   *
+   * Two independent filters — the event-kind chips and the ribbon brush — both
+   * want to hide turns. Letting each write `hidden` directly means whichever
+   * ran last silently undoes the other; they have to be ANDed in one pass.
+   */
+  function applyTurnFilters() {
+    var on = {};
+    var anyKind = false;
+    document.querySelectorAll("[data-turn-filter]").forEach(function (b) {
+      if (b.getAttribute("aria-pressed") === "true") {
+        on[b.getAttribute("data-turn-filter")] = 1;
+        anyKind = true;
+      }
+    });
+    var r = turnRange;
+    var total = 0;
+    var shownTurns = 0;
+    document.querySelectorAll(".turn").forEach(function (t) {
+      total++;
+      var shown = 0;
+      t.querySelectorAll("[data-ev-kind]").forEach(function (ev) {
+        var vis = !anyKind || on[ev.getAttribute("data-ev-kind")] === 1;
+        ev.hidden = !vis;
+        if (vis) shown++;
+      });
+      // OVERLAP, not containment: a call that straddles the edge of the window
+      // did run during it, and dropping it would understate what was in flight.
+      var inWindow =
+        !r ||
+        (+t.getAttribute("data-to") >= r.from && +t.getAttribute("data-from") <= r.to);
+      // Filtering EVENTS also filters TURNS: a turn with nothing left to show is
+      // noise when you have asked "show me only the compactions".
+      t.hidden = !inWindow || (anyKind && shown === 0);
+      if (!t.hidden) {
+        shownTurns++;
+        if (anyKind && shown) setTurnExpanded(t.getAttribute("data-turn"), true);
+      }
+    });
+    document.querySelectorAll(".ribbon-bar").forEach(function (b) {
+      b.classList.toggle(
+        "out",
+        !!r && (+b.getAttribute("data-to") < r.from || +b.getAttribute("data-from") > r.to),
+      );
+    });
+    var note = document.getElementById("ribbon-note");
+    var rib = document.getElementById("ribbon");
+    if (note && rib && r) {
+      var t0 = +rib.getAttribute("data-t0");
+      note.innerHTML =
+        "window +" + esc(fmtDur(r.from - t0)) + " → +" + esc(fmtDur(r.to - t0)) +
+        " (" + esc(fmtDur(r.to - r.from)) + ") · " + shownTurns + " of " + total +
+        ' turns · <button type="button" class="ribbon-clear">clear</button>';
+    } else if (note && rib) {
+      note.textContent =
+        total + (total === 1 ? " call" : " calls") + " · first start → last finish " +
+        fmtDur(+rib.getAttribute("data-t1") - +rib.getAttribute("data-t0")) +
+        " · drag to select a window";
+    }
+  }
+
+  function setTurnRange(range) {
+    turnRange = range;
+    var sel = document.querySelector(".ribbon-sel");
+    var rib = document.getElementById("ribbon");
+    if (sel && rib) {
+      if (!range) {
+        sel.hidden = true;
+      } else {
+        var t0 = +rib.getAttribute("data-t0");
+        var span = +rib.getAttribute("data-t1") - t0 || 1;
+        sel.hidden = false;
+        sel.style.left = (((range.from - t0) / span) * 100).toFixed(3) + "%";
+        sel.style.width = (((range.to - range.from) / span) * 100).toFixed(3) + "%";
+      }
+    }
+    applyTurnFilters();
+  }
+
+  /**
+   * Brush over the ribbon.
+   *
+   * Bound on `document` rather than on the ribbon element: the spine is
+   * re-rendered wholesale on every pane switch, so a listener attached to the
+   * node would be discarded silently the first time you navigated away and back.
+   */
+  document.addEventListener("mousedown", function (e) {
+    var rib = e.target.closest && e.target.closest(".ribbon");
+    if (!rib) return;
+    e.preventDefault();
+    var lanes = rib.querySelector(".ribbon-lanes");
+    // Measure the LANES, not the scroll container: a vertical scrollbar on
+    // `.ribbon` would otherwise shift every fraction by its width.
+    var box = lanes.getBoundingClientRect();
+    var sel = rib.querySelector(".ribbon-sel");
+    var t0 = +rib.getAttribute("data-t0");
+    var span = +rib.getAttribute("data-t1") - t0 || 1;
+    var startX = e.clientX;
+    var moved = false;
+
+    function frac(clientX) {
+      return Math.max(0, Math.min(1, (clientX - box.left) / (box.width || 1)));
+    }
+    function paint(clientX) {
+      var a = Math.min(frac(startX), frac(clientX));
+      var b = Math.max(frac(startX), frac(clientX));
+      sel.hidden = false;
+      sel.style.left = (a * 100).toFixed(3) + "%";
+      sel.style.width = ((b - a) * 100).toFixed(3) + "%";
+      return [a, b];
+    }
+    function onMove(ev) {
+      // 3px of slop so a click that jitters is still a click, not a 0.2ms window.
+      if (Math.abs(ev.clientX - startX) > 3) moved = true;
+      if (moved) paint(ev.clientX);
+    }
+    function onUp(ev) {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      if (!moved) {
+        var bar = e.target.closest && e.target.closest(".ribbon-bar");
+        if (bar) {
+          // A click on a bar is navigation, not selection: jump the spine to
+          // that turn rather than filtering down to it.
+          var seq = bar.getAttribute("data-ribbon-seq");
+          var row = document.querySelector('.turn[data-turn="' + seq + '"] .turn-row');
+          if (row) {
+            row.scrollIntoView({ block: "center" });
+            row.click();
+          }
+        } else {
+          setTurnRange(null);
+        }
+        return;
+      }
+      var ab = paint(ev.clientX);
+      setTurnRange({ from: t0 + ab[0] * span, to: t0 + ab[1] * span });
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+
+  document.addEventListener("click", function (e) {
+    if (e.target.closest && e.target.closest(".ribbon-clear")) setTurnRange(null);
+  });
+
+  // Escape clearing the window is a rung on the existing unwind ladder, not a
+  // listener of its own — see the `Escape` branch in the keyboard handler.
+
+  // Session-header inspect targets. The pane listener is mounted on
+  // `.session-panes`, so anything rendered in the header — the ask, and
+  // whatever joins it later — would otherwise be inert.
+  document.addEventListener("click", function (e) {
+    var el = e.target.closest && e.target.closest('[data-inspect^="ask:"]');
+    if (!el) return;
+    var st = initialUserStep(stepsForPane);
+    if (!st) return;
+    Inspector.show("ask:0", {
+      kind: "user prompt",
+      title: "what this session was asked to do",
+      body: String(st.message || ""),
+    });
+  });
+
+  document.addEventListener("click", function (e) {
+    var tr = e.target.closest && e.target.closest("tr[data-goto]");
+    if (!tr) return;
+    location.hash = "#session/" + encodeURIComponent(tr.getAttribute("data-goto"));
+  });
+
   function renderContextTimeline(tl) {
     if (!tl || !tl.points || !tl.points.length) {
       return '<div class="dim">No context timeline points.</div>';
     }
-    var peak = Math.max(1, tl.peakPromptTokens || tl.peakApproxTokens || 1);
+    // Height is keyed to contextTokens — what the model actually read. The old
+    // series was `promptTokens`, which under prompt caching is the UNCACHED
+    // remainder: literally 2 on every call of a cached agentic session, so the
+    // chart was 224 identical bars and the header read "peak 2 prompt tokens".
+    var peak = Math.max(1, tl.peakContextTokens || tl.peakApproxTokens || 1);
+    var axisMax = niceCeil(peak);
+    var ticks = [1, 0.75, 0.5, 0.25, 0];
+
+    var caveat =
+      tl.outOfOrderPairs > 0
+        ? ' <span class="warn-note" title="' +
+          esc(
+            tl.outOfOrderPairs +
+              " adjacent call pairs run backwards in wall-clock time, so this " +
+              "session interleaves concurrent conversations (a main thread plus " +
+              "subagents). Neighbouring bars are not neighbouring turns.",
+          ) +
+          '">⚠ ' +
+          tl.outOfOrderPairs +
+          " interleaved</span>"
+        : "";
+
     var html =
       '<h2 class="sec">Context size timeline <small>' +
       tl.points.length +
@@ -1501,40 +2637,51 @@
       tl.compactionCount +
       " compaction(s) · peak " +
       fmtTok(peak) +
-      " prompt tokens</small></h2>" +
+      " context tokens</small>" +
+      caveat +
+      "</h2>" +
+      // The axis is the point of this block: without it the bars were a shape
+      // with no magnitude, and the only number on screen was a wrong one.
+      '<div class="ct-frame">' +
+      '<div class="ct-axis" aria-hidden="true">' +
+      ticks
+        .map(function (t) {
+          return (
+            '<span class="ct-tick" style="bottom:' +
+            t * 100 +
+            '%">' +
+            (t === 0 ? "0" : fmtTok(Math.round(axisMax * t))) +
+            "</span>"
+          );
+        })
+        .join("") +
+      "</div>" +
+      '<div class="ct-plot">' +
+      ticks
+        .map(function (t) {
+          return '<span class="ct-grid" style="bottom:' + t * 100 + '%"></span>';
+        })
+        .join("") +
       '<div class="context-timeline" id="context-timeline">';
+
     tl.points.forEach(function (p) {
-      var h = Math.max(4, Math.round((p.promptTokens / peak) * 100));
+      var h = Math.max(1, Math.round((p.contextTokens / axisMax) * 100));
       var cls =
         "ct-bar" +
         (p.compaction ? " compact" : "") +
         (p.errored ? " errored" : "");
-      var title =
-        "#" +
-        p.seq +
-        " · " +
-        fmtTok(p.promptTokens) +
-        " prompt · " +
-        p.transcriptItems +
-        " items" +
-        (p.compaction
-          ? " · COMPACTION " +
-            p.compaction.fromItems +
-            "→" +
-            p.compaction.toItems +
-            " items · tokens " +
-            fmtTok(p.compaction.prePromptTokens) +
-            "→" +
-            fmtTok(p.compaction.postPromptTokens)
-          : "");
       html +=
         '<button type="button" class="' +
         cls +
         '" data-seq="' +
         p.seq +
-        '" title="' +
-        esc(title) +
-        '" style="height:' +
+        '" data-inspect="ctp:' +
+        p.seq +
+        '" aria-label="call ' +
+        p.seq +
+        ", " +
+        fmtTok(p.contextTokens) +
+        ' context tokens" style="height:' +
         h +
         '%">' +
         '<span class="ct-seq">' +
@@ -1543,41 +2690,17 @@
         (p.compaction ? '<span class="ct-compact">⇣</span>' : "") +
         "</button>";
     });
-    html += "</div>";
-    var comps = tl.points.filter(function (p) {
-      return p.compaction;
-    });
-    if (comps.length) {
-      html += '<div class="compaction-list">';
-      comps.forEach(function (p) {
-        var c = p.compaction;
-        html +=
-          '<div class="compaction-card">' +
-          '<span class="pill">compaction</span> API #' +
-          p.seq +
-          " · items <b>" +
-          c.fromItems +
-          " → " +
-          c.toItems +
-          "</b> (dropped " +
-          c.droppedItems +
-          ")" +
-          " · tokens <b>" +
-          fmtTok(c.prePromptTokens) +
-          " → " +
-          fmtTok(c.postPromptTokens) +
-          "</b>" +
-          " · approx <b>" +
-          fmtTok(c.preApproxTokens) +
-          " → " +
-          fmtTok(c.postApproxTokens) +
-          "</b>" +
-          ' <button type="button" class="btn-xray" data-seq="' +
-          p.seq +
-          '">inspect</button></div>';
-      });
-      html += "</div>";
-    }
+    html += "</div></div></div>";
+    // The compaction cards used to stack below as a second, parallel list —
+    // 85 of them on this session, each with its own `inspect` button and its
+    // own idea of what detail looks like. They are the same points already on
+    // the timeline, so the bar IS the row now: it carries the ⇣ marker and
+    // opens the identical detail in the shared inspector.
+    html +=
+      '<div class="ct-legend dim">' +
+      "bar height = context tokens read (uncached input + cache read + cache write) · " +
+      "⇣ = compaction · click a bar to inspect" +
+      "</div>";
     return html;
   }
 
@@ -1633,7 +2756,9 @@
         esc(n.label) +
         '" data-node-id="' +
         esc(n.id) +
-        '"' +
+        '" data-inspect="flow:' +
+        esc(n.id) +
+        '" tabindex="0" role="button"' +
         (n.requestSeq != null ? ' data-seq="' + n.requestSeq + '"' : "") +
         // Large payloads arrive as a preview only; the rest is fetched on click.
         // Inlining every node's full detail put hundreds of KB into DOM
@@ -1661,8 +2786,9 @@
       if (i < nodes.length - 1)
         html += '<div class="flow-edge" aria-hidden="true"></div>';
     });
-    html +=
-      '</div><aside class="flow-detail" id="flow-detail"><div class="dim">Click a node to inspect payload</div></aside></div>';
+    // No local detail panel any more — the session-level inspector serves every
+    // pane, so the flow graph is just the graph.
+    html += "</div></div>";
     return html;
   }
 
@@ -1679,15 +2805,10 @@
     if (!host) return;
     fetchJSON("/api/session/" + encodeURIComponent(sessionId) + "/timeline")
       .then(function (tl) {
+        timelineForPane = tl;
         host.innerHTML = renderContextTimeline(tl);
-        host
-          .querySelectorAll(".compaction-card .btn-xray[data-seq]")
-          .forEach(function (btn) {
-            btn.addEventListener("click", function () {
-              activatePane("xray");
-              loadXray(sessionId, Number(btn.getAttribute("data-seq")));
-            });
-          });
+        // The separate compaction-card list is gone; each card's `inspect`
+        // button is now the bar itself, via the delegated [data-inspect].
         var tlEl = host.querySelector("#context-timeline");
         if (tlEl) {
           tlEl.addEventListener("click", function (e) {
@@ -1715,6 +2836,13 @@
    * after a click and overwrite it — the button appears to do nothing.
    */
   var xrayToken = 0;
+  // The rendered x-ray response, kept so the inspector can resolve a segment
+  // by index instead of every row carrying its full text in a DOM attribute.
+  var xrayForPane = null;
+  var timelineForPane = null;
+  var toolTaxForPane = null;
+  var stepsForPane = [];
+  var turnsForPane = [];
 
   function loadXray(sessionId, seq) {
     var token = ++xrayToken;
@@ -1739,9 +2867,9 @@
               ? " · wire " + fmtTok(x.wirePromptTokens) + " prompt"
               : "");
         }
+        xrayForPane = x;
         if (viewEl) {
           viewEl.innerHTML = drawXray(x);
-          bindPayloadPopovers();
           viewEl
             .querySelectorAll(".btn-xray[data-seq]")
             .forEach(function (btn) {
@@ -1776,6 +2904,50 @@
     return pct < 0.1 ? "<0.1%" : pct.toFixed(1) + "%";
   }
 
+  /**
+   * Bucket rows double as filters for the segment list beneath them.
+   *
+   * The composition bar answers "what is eating the window" and the segment
+   * list answers "which specific text", but the two were unconnected: seeing
+   * TOOLS at 72% meant scrolling a mixed list of 244 segments hunting for the
+   * tool ones. Clicking a row now narrows the list to that bucket. Multiple
+   * rows can be active — an OR, since the question is usually "show me tools
+   * AND skills, hide the conversation".
+   */
+  function applyBucketFilter(pane) {
+    var on = {};
+    var any = false;
+    pane.querySelectorAll("[data-bucket-filter]").forEach(function (b) {
+      if (b.getAttribute("aria-pressed") === "true") {
+        on[b.getAttribute("data-bucket-filter")] = 1;
+        any = true;
+      }
+    });
+    var shown = 0;
+    pane.querySelectorAll("[data-bucket]").forEach(function (seg) {
+      var vis = !any || on[seg.getAttribute("data-bucket")] === 1;
+      seg.hidden = !vis;
+      if (vis) shown++;
+    });
+    var note = pane.querySelector("#xray-seg-count");
+    if (note) {
+      note.textContent = any
+        ? shown + " of " + pane.querySelectorAll("[data-bucket]").length + " shown"
+        : "";
+    }
+  }
+
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest && e.target.closest("[data-bucket-filter]");
+    if (!btn) return;
+    var pane = btn.closest(".session-pane") || document;
+    btn.setAttribute(
+      "aria-pressed",
+      btn.getAttribute("aria-pressed") === "true" ? "false" : "true",
+    );
+    applyBucketFilter(pane);
+  });
+
   function drawXray(x) {
     var total = 0;
     x.buckets.forEach(function (b) {
@@ -1791,15 +2963,17 @@
         .map(function (b) {
           var pct = sharePct(b.approxTokens, total);
           return (
-            '<div class="xray-row bucket-' +
+            '<button type="button" class="xray-row bucket-' +
             esc(b.bucket) +
-            '" title="' +
+            '" data-bucket-filter="' +
+            esc(b.bucket) +
+            '" aria-pressed="false" title="' +
             esc(b.label) +
             " · " +
             fmtTok(b.approxTokens) +
             " approx tokens · " +
             b.segments +
-            ' segment(s)">' +
+            ' segment(s) · click to filter the segments below">' +
             '<span class="xray-row-label">' +
             esc(b.label) +
             "</span>" +
@@ -1814,7 +2988,7 @@
             "</span>" +
             '<span class="xray-row-pct">' +
             fmtShare(pct) +
-            "</span></div>"
+            "</span></button>"
           );
         })
         .join("") +
@@ -1873,30 +3047,28 @@
     var segs =
       '<h2 class="sec">Segments <small>(' +
       x.segments.length +
-      ")</small></h2>" +
+      ' <span id="xray-seg-count"></span></small></h2>' +
       '<div class="xray-segs">' +
       x.segments
         .slice(0, 80)
-        .map(function (s) {
-          var full = s.preview; // preview already truncated; prefer longer if present
-          if (s.full) full = s.full;
+        .map(function (s, i) {
           var pct = sharePct(s.approxTokens, total);
           return (
             '<button type="button" class="xray-seg bucket-' +
             esc(s.bucket) +
-            ' payload-hotspot" data-full-payload="' +
-            esc(full) +
+            // No payload in the attribute and no native title=. The segment
+            // carried both a data-full-payload popover and a title tooltip, so
+            // two independent tooltips fired on one hover and drew over each
+            // other. The inspector reads the segment from the cached response.
+            '" data-inspect="seg:' +
+            i +
+            '" data-bucket="' +
+            esc(s.bucket) +
             // The row is shaded to its own share of the context, so the segments
             // actually eating the window are visible without reading a number.
             '" style="--share:' +
             Math.min(100, pct).toFixed(2) +
-            '%" title="' +
-            esc(s.bucket) +
-            " · " +
-            fmtTok(s.approxTokens) +
-            " approx tokens · " +
-            fmtShare(pct) +
-            ' of context — hover for full text">' +
+            '%">' +
             '<span class="xray-seg-bucket">' +
             esc(s.bucket) +
             "</span>" +
@@ -2598,6 +3770,75 @@
     return '<span class="pill ok">' + t.calls + "×</span>";
   }
 
+  /**
+   * Which provider shipped this tool, from the name alone.
+   *
+   * Claude Code namespaces every MCP tool as `mcp__<server>__<tool>`, and the
+   * server segment says where it came from: `plugin_<plugin>_<server>` for a
+   * plugin, `claude_ai_<Connector>` for a hosted connector, a bare name for a
+   * local server. Anything without the prefix is built in.
+   */
+  function toolProvider(name) {
+    if (name.indexOf("mcp__") !== 0) return { key: "built-in", kind: "builtin" };
+    var server = name.slice(5).split("__")[0];
+    if (server.indexOf("plugin_") === 0) {
+      return { key: server.slice(7).split("_")[0], kind: "plugin" };
+    }
+    if (server.indexOf("claude_ai_") === 0) {
+      return { key: server.slice(10), kind: "connector" };
+    }
+    return { key: server, kind: "mcp" };
+  }
+
+  // A connector that ships ONLY these is not really loaded — it is a stub the
+  // model can call to trigger auth, which is what "load tools when needed"
+  // leaves behind. Distinguishing stubs from full surfaces is the whole point
+  // of the breakdown: they cost ~350 tokens instead of ~8,000.
+  var AUTH_STUBS = { authenticate: 1, complete_authentication: 1 };
+
+  /** Group a toolset's tools by provider, with the deferral state resolved. */
+  function toolProviderGroups(tools) {
+    var byKey = {};
+    tools.forEach(function (t) {
+      var p = toolProvider(t.name);
+      var g = byKey[p.key];
+      if (!g) {
+        g = byKey[p.key] = {
+          key: p.key,
+          kind: p.kind,
+          tools: [],
+          approxTokens: 0,
+          cumulativeTokens: 0,
+          calls: 0,
+        };
+      }
+      g.tools.push(t);
+      g.approxTokens += t.approxTokens;
+      g.cumulativeTokens += t.cumulativeTokens;
+      g.calls += t.calls;
+    });
+    return Object.keys(byKey)
+      .map(function (k) {
+        var g = byKey[k];
+        g.deferred =
+          g.kind === "connector" &&
+          g.tools.every(function (t) {
+            return AUTH_STUBS[t.name.split("__").pop()] === 1;
+          });
+        return g;
+      })
+      .sort(function (a, b) {
+        return b.approxTokens - a.approxTokens;
+      });
+  }
+
+  function providerLabel(g) {
+    if (g.kind === "builtin") return "built-in";
+    if (g.kind === "plugin") return "plugin · " + g.key;
+    if (g.kind === "connector") return "connector · " + g.key;
+    return "mcp · " + g.key;
+  }
+
   function sessionToolsetHtml(ts, idx) {
     var maxTok = ts.tools.length ? ts.tools[0].approxTokens : 1;
     ts.tools.forEach(function (t) {
@@ -2608,7 +3849,11 @@
         return (
           "<tr" +
           (t.dead ? ' class="tt-dead"' : "") +
-          '><td class="bar-cell"><div class="bar' +
+          ' data-inspect="tool:' +
+          idx +
+          ":" +
+          esc(t.name) +
+          '" tabindex="0"><td class="bar-cell"><div class="bar' +
           (t.dead ? " warn" : "") +
           '" style="width:' +
           ((t.approxTokens / maxTok) * 100).toFixed(1) +
@@ -2627,6 +3872,67 @@
         );
       })
       .join("");
+
+    // Per-provider roll-up. 238 individually-ranked tools answer "which tool is
+    // biggest" but not "which integration am I paying for", and the second is
+    // the actionable one: a provider is something you can turn off, a tool is
+    // not. It also makes deferral state legible — 28 connectors sitting at two
+    // auth stubs look identical to 28 cheap connectors until they are grouped.
+    var groups = toolProviderGroups(ts.tools);
+    var totalTok = ts.tools.reduce(function (a, t) {
+      return a + t.approxTokens;
+    }, 0) || 1;
+    var maxGroup = groups.length ? groups[0].approxTokens : 1;
+    var groupRows = groups
+      .map(function (g) {
+        var deadTok = g.tools.reduce(function (a, t) {
+          return a + (t.dead ? t.approxTokens : 0);
+        }, 0);
+        return (
+          "<tr" +
+          (g.calls === 0 ? ' class="tt-dead"' : "") +
+          ' data-inspect="prov:' +
+          idx +
+          ":" +
+          esc(g.key) +
+          '" tabindex="0"><td class="bar-cell"><div class="bar' +
+          (g.calls === 0 ? " warn" : "") +
+          '" style="width:' +
+          ((g.approxTokens / maxGroup) * 100).toFixed(1) +
+          '%"></div><span>' +
+          esc(providerLabel(g)) +
+          (g.deferred ? ' <span class="pill dim">deferred</span>' : "") +
+          "</span></td>" +
+          '<td class="num">' +
+          g.tools.length +
+          "</td>" +
+          '<td class="num">' +
+          fmtTok(g.approxTokens) +
+          "</td>" +
+          '<td class="num">' +
+          ((g.approxTokens / totalTok) * 100).toFixed(1) +
+          "%</td>" +
+          '<td class="num">' +
+          (g.calls
+            ? '<span class="pill">' + g.calls + "</span>"
+            : '<span class="pill warn">0 · ' + fmtTok(deadTok) + " dead</span>") +
+          "</td></tr>"
+        );
+      })
+      .join("");
+    var providerTable =
+      '<h2 class="sec">By provider <small>(' +
+      groups.length +
+      " providers · a provider is something you can switch off; a tool is not)</small></h2>" +
+      '<div class="tbl-wrap"><table><thead><tr>' +
+      "<th>provider</th>" +
+      '<th class="num">tools</th>' +
+      '<th class="num">≈tok / call</th>' +
+      '<th class="num">share</th>' +
+      '<th class="num">calls</th>' +
+      "</tr></thead><tbody>" +
+      groupRows +
+      "</tbody></table></div>";
     return (
       '<div class="cards">' +
       card("Declared", ts.declaredCount) +
@@ -2644,6 +3950,8 @@
       (ts.requestCount === 1 ? "" : "s") +
       (idx > 0 ? " · variant" : "") +
       ", ranked by cumulative cost)</small></h2>" +
+      providerTable +
+      '<h2 class="sec">By tool</h2>' +
       '<div class="tbl-wrap"><table><thead><tr>' +
       "<th>tool</th>" +
       '<th class="num">≈tok / call</th>' +
@@ -2665,6 +3973,7 @@
             '<div class="empty-pane">No tool declarations captured for this session.</div>';
           return;
         }
+        toolTaxForPane = data.toolsets;
         host.innerHTML = data.toolsets.map(sessionToolsetHtml).join("");
       })
       .catch(function (err) {
@@ -3204,10 +4513,17 @@
     return view.querySelector(".kb-focus");
   }
 
+  /**
+   * `.kb-focus` cursor for the LIST pages (sessions, usage, prompts, …).
+   *
+   * Session pages have their own cursor — the inspector selection driven by
+   * `sessionArrowNav` — so j/k are routed there instead of here. Two cursors
+   * on one page means two highlights disagreeing about where you are.
+   */
   function moveCursor(dir) {
-    var rows = Array.prototype.slice.call(
-      view.querySelectorAll("tr.click, .wf-row.click"),
-    );
+    // `.wf-row.click` used to be here for the request waterfall. The waterfall
+    // is gone; the selector went with it.
+    var rows = Array.prototype.slice.call(view.querySelectorAll("tr.click"));
     if (!rows.length) return;
     var cur = focusedRow();
     var idx = cur ? rows.indexOf(cur) : -1;
@@ -3242,12 +4558,122 @@
     hooksShowObserveOnly = !!t.checked;
     var pane = document.getElementById("pane-hooks");
     if (!pane) return;
-    // Re-rendering the pane throws away every element the popovers were bound
-    // to, so the new hotspots need binding or they are inert on hover and
-    // click. Safe to call repeatedly — bindPayloadPopovers marks what it binds.
+    // Inspect chips are delegated off `.session-panes`, which contains every
+    // pane and survives this innerHTML swap — so a re-render needs no
+    // rebinding, which is the only reason the old popover code ran again here.
     pane.innerHTML = renderHooksPane(hooksForPane);
-    bindPayloadPopovers();
   });
+
+  // -- session keyboard model ---------------------------------------------
+  //
+  // Two axes, which is the whole idea: UP/DOWN moves within the list you are
+  // looking at, LEFT/RIGHT moves the same selection to a different view of it.
+  // A turn stays selected as you cross panes, so "what did the context look
+  // like on this call" and "what did the wire do on this call" are one
+  // keystroke apart instead of a click, a scroll and a hunt.
+  var SESSION_PANES = ["flow", "hooks", "xray", "tools", "wire", "related"];
+  var selectedSeq = null;
+  // Where you were in each pane. Returning a pane to its first row every time
+  // makes LEFT/RIGHT feel like it discards your place, which defeats the point
+  // of moving between views of the same work.
+  var paneCursor = {};
+
+  /** Inspectable rows in the active pane, in visual order, excluding hidden. */
+  function paneTargets() {
+    var pane = document.querySelector(".session-pane.active");
+    if (!pane) return [];
+    return Array.prototype.slice
+      .call(pane.querySelectorAll("[data-inspect]"))
+      .filter(function (el) {
+        // Hook chips live inside collapsed <details>; arrowing onto something
+        // the user cannot see reads as the keys being broken.
+        return el.offsetParent !== null;
+      });
+  }
+
+  function selectTarget(el) {
+    if (!el) return;
+    el.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // Re-use the delegated [data-inspect] resolver rather than a second
+    // dispatch table — one place decides what a row means.
+    el.click();
+  }
+
+  /** After switching panes, land on the same turn if this pane has it. */
+  function reselectInPane() {
+    var list = paneTargets();
+    if (!list.length) return;
+    // A turn wins over a remembered cursor: if this pane can show the call you
+    // were just looking at, that is what "the same thing, another view" means.
+    var wanted = selectedSeq != null ? "ctp:" + selectedSeq : null;
+    var remembered = paneCursor[current.pane];
+    for (var pass = 0; pass < 2; pass++) {
+      var want = pass === 0 ? wanted : remembered;
+      if (!want) continue;
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].getAttribute("data-inspect") === want) {
+          selectTarget(list[i]);
+          return;
+        }
+      }
+    }
+    selectTarget(list[0]);
+  }
+
+  function sessionArrowNav(e) {
+    var k = e.key;
+    // j/k are the vim spelling of ↓/↑ and must mean the same thing here. Left
+    // to fall through they reached `moveCursor`, a second cursor that paints
+    // `.kb-focus` on transcript rows while ↑/↓ moved the inspector selection
+    // — two highlights, on different elements, both claiming to be "where you
+    // are".
+    var vertical = k === "ArrowDown" || k === "ArrowUp" || k === "j" || k === "k";
+    var horizontal = k === "ArrowRight" || k === "ArrowLeft";
+    if (!vertical && !horizontal) return false;
+
+    if (horizontal) {
+      // On a turn row, LEFT/RIGHT means expand/collapse rather than change
+      // pane — drilling into the thing you have selected is the nearer
+      // meaning, and the pane switch is still there once it is collapsed.
+      var sel = Inspector.selected() || "";
+      if (sel.indexOf("ctp:") === 0) {
+        var seq = sel.slice(4);
+        if (setTurnExpanded(seq, k === "ArrowRight")) {
+          e.preventDefault();
+          return true;
+        }
+      }
+      var cur = SESSION_PANES.indexOf(current.pane || "flow");
+      if (cur < 0) cur = 0;
+      var step = k === "ArrowRight" ? 1 : SESSION_PANES.length - 1;
+      e.preventDefault();
+      activatePane(SESSION_PANES[(cur + step) % SESSION_PANES.length]);
+      // Panes render lazily; give the new one a frame before selecting in it.
+      setTimeout(reselectInPane, 0);
+      return true;
+    }
+
+    var list = paneTargets();
+    if (!list.length) return false;
+    e.preventDefault();
+    var curId = Inspector.selected();
+    var i = -1;
+    for (var n = 0; n < list.length; n++) {
+      if (list[n].getAttribute("data-inspect") === curId) {
+        i = n;
+        break;
+      }
+    }
+    var d = k === "ArrowDown" || k === "j" ? 1 : -1;
+    var next =
+      i < 0
+        ? d > 0
+          ? 0
+          : list.length - 1
+        : Math.min(list.length - 1, Math.max(0, i + d));
+    selectTarget(list[next]);
+    return true;
+  }
 
   document.addEventListener("keydown", function (e) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -3261,6 +4687,7 @@
       if (e.key === "Escape") e.target.blur();
       return;
     }
+    if (current.name === "session" && sessionArrowNav(e)) return;
     if (e.key === "/") {
       e.preventDefault();
       focusSearch();
@@ -3273,6 +4700,22 @@
       location.hash = "#" + TABS[Number(e.key) - 1];
     else if (e.key === "?") toggleHelp();
     else if (e.key === "Escape") {
+      // Escape unwinds one level at a time: a drill-down first, then the
+      // inspector, then the page. "Close what I just opened" has to win over
+      // "go back", or there is no way to dismiss a selection without losing
+      // your place — and a drill-down is something you just opened too.
+      if (Inspector.back()) return;
+      if (Inspector.selected()) {
+        Inspector.clear();
+        return;
+      }
+      // A brushed time window is a narrowing you applied, so it unwinds before
+      // the page does — otherwise Escape to drop the window also throws you out
+      // of the session, which is what a competing listener here used to do.
+      if (turnRange) {
+        setTurnRange(null);
+        return;
+      }
       if (current.name === "session") location.hash = "#sessions";
       else if (current.name === "prompt") location.hash = "#prompts";
     }
@@ -3489,6 +4932,10 @@
       ["j / k", "move row cursor"],
       ["↵", "open focused row"],
       ["1–6", "switch view"],
+      // Two axes inside a session: down the list you are in, across the views
+      // of the thing you have selected.
+      ["↑ / ↓", "in a session: previous / next row"],
+      ["← / →", "in a session: same turn, previous / next pane"],
       ["esc", "back / close"],
       ["?", "this overlay"],
     ];

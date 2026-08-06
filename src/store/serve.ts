@@ -1,6 +1,7 @@
 import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
+import { spawn } from "child_process";
 import { AddressInfo } from "net";
 import { Store, defaultDbPath } from "./index";
 import type { RequestRow, SearchFilters, SessionListFilters, ToolsetUsageRow } from "./index";
@@ -15,6 +16,7 @@ import { auditOneFilePath, reportFromScans } from "../audit";
 import type { AuditFileScan, AuditReport } from "../audit";
 import type { FlowGraph } from "../flow/derive";
 import type { ContextTimeline } from "../context/timeline";
+import { findCompactions as findCompactionPoints } from "../context/timeline";
 
 /**
  * `tracetap serve` — the local observatory over the cross-session store.
@@ -99,8 +101,86 @@ function assetDir(): string {
 }
 
 /**
+ * Newest mtime across the compiled tree, or 0 if it cannot be read.
+ *
+ * `composePage()` re-reads the frontend from disk on EVERY request, so CSS and
+ * client JS are always current. The compiled server is the opposite: it is
+ * whatever Node loaded at startup, and a later `npm run build` changes nothing
+ * until the process restarts. Nothing surfaced that asymmetry, and it hid a
+ * missing API route for two days — the page offered a Tool Tax pane that the
+ * running server had never heard of, so `/api/session/<id>/tools` fell through
+ * to the catch-all handler and 404'd with the path fragment glued onto the
+ * session id (`No indexed session 'claude:b5ba8662/tools'`).
+ *
+ * A start-time check cannot catch this: at startup, process and disk agree by
+ * definition. The drift only appears afterwards, so the stamp has to be taken
+ * once at load and re-compared while running.
+ */
+export function distBuildStamp(root: string = path.join(__dirname, "..")): number {
+  const stack = [root];
+  let newest = 0;
+  while (stack.length) {
+    const dir = stack.pop() as string;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue; // raced with a rebuild, or not a directory — not worth failing over
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.name.endsWith(".js")) {
+        try {
+          const m = fs.statSync(p).mtimeMs;
+          if (m > newest) newest = m;
+        } catch {
+          /* file vanished mid-walk */
+        }
+      }
+    }
+  }
+  return newest;
+}
+
+/** What was on disk when this process loaded — i.e. what Node actually ran. */
+const LOADED_BUILD_STAMP = distBuildStamp();
+
+// Re-walking dist on every /api/meta would be wasteful (the page polls it), and
+// a few seconds of lag on a "you should restart" notice costs nothing.
+const BUILD_STAMP_TTL_MS = 5000;
+let buildStampMemo: { at: number; value: number } | null = null;
+
+/**
+ * @returns `{ loadedAt, builtAt, stale }` — `stale` means a newer build is on
+ *   disk than the one this process is running.
+ *
+ * The one-second tolerance absorbs filesystem timestamp granularity; without
+ * it a rebuild that lands in the same second as startup can read as drift.
+ */
+export function buildFreshness(): {
+  loadedAt: number;
+  builtAt: number;
+  stale: boolean;
+} {
+  const now = Date.now();
+  if (!buildStampMemo || now - buildStampMemo.at >= BUILD_STAMP_TTL_MS) {
+    buildStampMemo = { at: now, value: distBuildStamp() };
+  }
+  const builtAt = buildStampMemo.value;
+  return {
+    loadedAt: LOADED_BUILD_STAMP,
+    builtAt,
+    stale: builtAt > LOADED_BUILD_STAMP + 1000,
+  };
+}
+
+/**
  * Compose the dashboard page: app.html with the CSS and JS inlined. Read per
  * request (the files are small) so editing the assets needs no server restart.
+ *
+ * Note the asymmetry this creates with the compiled server — see
+ * `distBuildStamp` for why that needs announcing rather than just documenting.
  */
 export function composePage(): string {
   const dir = assetDir();
@@ -141,15 +221,23 @@ function percentile(sorted: number[], q: number): number | null {
   return sorted[idx];
 }
 
-/** Compaction points: requests where the resent transcript SHRANK vs the previous call. */
+/**
+ * Compaction points for one session.
+ *
+ * Delegates to the timeline's definition rather than keeping a second copy.
+ * The copy that used to live here tested transcript items only, so the session
+ * summary card reported 85 compactions while the timeline — already fixed to
+ * require an actual context drop — reported 54 on the same session. Two
+ * implementations of one concept will always drift; the only reliable fix is
+ * for there to be one.
+ *
+ * Sorting is this caller's job: `findCompactionPoints` diffs neighbours, so it
+ * requires TIME order. Rows arrive here in seq order, and on a session that
+ * runs a fleet those differ — which is itself one of the two things that made
+ * the old count wrong.
+ */
 export function findCompactions(requests: RequestRow[]): { seq: number; from: number; to: number }[] {
-  const out: { seq: number; from: number; to: number }[] = [];
-  for (let i = 1; i < requests.length; i++) {
-    const prev = requests[i - 1].transcriptItems;
-    const cur = requests[i].transcriptItems;
-    if (prev > 0 && cur < prev) out.push({ seq: requests[i].seq, from: prev, to: cur });
-  }
-  return out;
+  return findCompactionPoints([...requests].sort((a, b) => a.ts - b.ts || a.seq - b.seq));
 }
 
 function fleetAnalytics(store: Store, prices: PriceTable) {
@@ -294,14 +382,20 @@ function fleetAnalytics(store: Store, prices: PriceTable) {
     .slice(0, 20);
 
   // Mid-task compactions: transcript shrank between consecutive calls.
+  // Both the transcript AND the context must shrink — see findCompactions.
+  // Counting item drops alone swept up every hop between interleaved subagent
+  // conversations, which on a fleet session is most adjacent pairs.
   const compactionRow = store.db
     .prepare(
       `SELECT COUNT(*) AS total, COUNT(DISTINCT session_id) AS sessions FROM (
          SELECT session_id,
                 transcript_items - LAG(transcript_items)
-                  OVER (PARTITION BY session_id ORDER BY seq) AS delta
+                  OVER (PARTITION BY session_id ORDER BY seq) AS item_delta,
+                (prompt_tokens + cache_read + cache_creation)
+                  - LAG(prompt_tokens + cache_read + cache_creation)
+                  OVER (PARTITION BY session_id ORDER BY seq) AS ctx_delta
          FROM requests
-       ) WHERE delta < 0`,
+       ) WHERE item_delta < 0 AND ctx_delta < 0`,
     )
     .get() as { total: number; sessions: number };
 
@@ -770,7 +864,12 @@ export async function handleRequest(
         events: (store.db.prepare("SELECT COUNT(*) AS n FROM usage_events").get() as any).n,
       };
       const { source } = await getPrices();
-      sendJson(res, 200, { dbPath: store.dbPath, counts, priceSource: source });
+      sendJson(res, 200, {
+        dbPath: store.dbPath,
+        counts,
+        priceSource: source,
+        build: buildFreshness(),
+      });
       return;
     }
 
@@ -924,7 +1023,20 @@ export async function handleRequest(
         requests,
         hooks,
         flow,
+        // Compactions come in two provenances and the page says which. The
+        // recorded set is Claude Code's own `compact_boundary` records, which
+        // carry the trigger (auto vs /compact) and exact pre/post sizes; the
+        // inferred set is our wire-side guess, kept as the fallback for agents
+        // and captures that have no transcript. Never merged — a measurement
+        // and a guess that disagree is information, and averaging them away
+        // would be the worst of both.
         compactions: findCompactions(requests),
+        recordedCompactions: paneSection(sectionErrors, "recordedCompactions", () =>
+          store.recordedCompactions(sessionId),
+        ),
+        siblings: paneSection(sectionErrors, "siblings", () =>
+          store.sessionsFromSameSource(sessionId),
+        ),
         reportAvailable: fs.existsSync(reportPathFor(session.sourcePath)),
         ...(Object.keys(sectionErrors).length ? { sectionErrors } : {}),
       });
@@ -1048,6 +1160,91 @@ export async function handleRequest(
 }
 
 /** Entry point for `tracetap serve`. */
+/** True when the request came from this machine over the loopback interface. */
+export function isLoopbackAddress(addr: string | undefined): boolean {
+  if (!addr) return false;
+  return (
+    addr === "127.0.0.1" ||
+    addr === "::1" ||
+    addr === "::ffff:127.0.0.1" ||
+    addr.startsWith("127.")
+  );
+}
+
+/**
+ * Re-exec the server so it picks up a newer build.
+ *
+ * The page reloads its own assets from disk on every request, so a browser
+ * refresh always shows current HTML/CSS/JS — but compiled server code is frozen
+ * at process start and CANNOT be reloaded in place. That asymmetry is what the
+ * stale badge reports, and until now the badge was the end of the road: it told
+ * you to act and gave you nothing to act with, so the reasonable response
+ * ("refresh the page") could never work.
+ *
+ * Guards, in order:
+ *  - POST only. Restarting is state-changing, and a GET would let any page that
+ *    embeds an <img> pointed at this URL bounce the process.
+ *  - Loopback only. `--host 0.0.0.0` is supported, and a restart reachable from
+ *    the network is a denial-of-service primitive.
+ *  - Stale only. This is an UPGRADE button, not a general restart: with nothing
+ *    new on disk it answers 409 rather than pointlessly bouncing.
+ *
+ * The listener is closed before the replacement is spawned, so the child never
+ * races the parent for the port. Open connections are dropped explicitly —
+ * `server.close()` alone waits for them, and the SSE stream never ends.
+ */
+function handleRestart(
+  server: http.Server,
+  store: Store,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): void {
+  if (req.method !== "POST") {
+    res.setHeader("allow", "POST");
+    sendJson(res, 405, { error: "Restart requires POST." });
+    return;
+  }
+  if (!isLoopbackAddress(req.socket.remoteAddress ?? undefined)) {
+    sendJson(res, 403, { error: "Restart is available only from this machine." });
+    return;
+  }
+  const fresh = buildFreshness();
+  if (!fresh.stale) {
+    sendJson(res, 409, {
+      error: "Already running the newest build on disk.",
+      ...fresh,
+    });
+    return;
+  }
+
+  sendJson(res, 202, { restarting: true, ...fresh });
+
+  const relaunch = () => {
+    try {
+      store.close();
+    } catch {
+      /* closing a store we are abandoning anyway */
+    }
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      cwd: process.cwd(),
+      detached: true,
+      stdio: "inherit",
+    });
+    child.unref();
+    process.exit(0);
+  };
+
+  // Give the 202 a moment to flush, then stop accepting, drop what is open
+  // (the SSE stream would otherwise hold `close` forever), and hand over.
+  setTimeout(() => {
+    server.close(relaunch);
+    (server as any).closeAllConnections?.();
+    // Belt and braces: if `close` never fires, hand over anyway rather than
+    // leaving the user with a server that answered 202 and then did nothing.
+    setTimeout(relaunch, 1500).unref?.();
+  }, 100).unref?.();
+}
+
 export async function runServe(argv: string[]): Promise<void> {
   if (argv.includes("--help") || argv.includes("-h")) {
     console.log(SERVE_HELP);
@@ -1058,6 +1255,12 @@ export async function runServe(argv: string[]): Promise<void> {
   const store = new Store(opts.dbPath);
 
   const server = http.createServer((req, res) => {
+    // Handled here rather than in `handleRequest` because it needs the server
+    // and the process, which the pure request handler deliberately does not.
+    if ((req.url || "").split("?")[0] === "/api/restart") {
+      handleRestart(server, store, req, res);
+      return;
+    }
     void handleRequest(store, req, res);
   });
 
@@ -1067,16 +1270,34 @@ export async function runServe(argv: string[]): Promise<void> {
       const addr = server.address() as AddressInfo;
       const host = opts.host === "0.0.0.0" || opts.host === "::" ? "localhost" : opts.host;
       console.log(`tracetap serve → http://${host}:${addr.port}  (db: ${store.dbPath})`);
+      // Printed so a scrollback line can settle "is my fix in this process?"
+      // without inferring it from `ls -l dist` and `ps -o lstart`.
+      console.log(`build ${new Date(LOADED_BUILD_STAMP).toISOString()}`);
       console.log(`Press Ctrl+C to stop.`);
       resolve();
     });
   });
 
+  /**
+   * Stop accepting, drop what is open, exit.
+   *
+   * `server.close()` alone WAITS for in-flight connections, and `/api/events`
+   * is a Server-Sent Events stream that by design never ends — so a page left
+   * open in a browser made Ctrl+C and `kill` hang forever. The symptom is
+   * silent: the signal is delivered, the process ignores it, and you accumulate
+   * servers that survive every `pkill` and quietly hold their port. Eight of
+   * them piled up in one session before the cause was found.
+   *
+   * The exit is forced after a grace period so a stuck socket cannot outvote a
+   * shutdown request. Same reasoning as `handleRestart`, which hit this first.
+   */
   const shutdown = () => {
     server.close(() => {
       store.close();
       process.exit(0);
     });
+    (server as any).closeAllConnections?.();
+    setTimeout(() => process.exit(0), 2000).unref?.();
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

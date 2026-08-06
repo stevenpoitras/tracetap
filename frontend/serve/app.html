@@ -32,6 +32,9 @@
   <span class="sb-item sb-db" id="sb-db"></span>
   <span class="sb-item" id="sb-counts"></span>
   <span class="sb-spacer"></span>
+  <!-- A button, not a label: a refresh cannot clear this (compiled server code
+       is frozen at process start), so the badge has to be the way to act. -->
+  <button type="button" class="sb-item sb-stale" id="sb-stale" hidden></button>
   <span class="sb-item" id="sb-prices"></span>
   <span class="live" id="live" title="Live index updates (SSE)"><span class="dot"></span><span id="live-label">connecting</span></span>
 </footer>

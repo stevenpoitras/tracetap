@@ -18,8 +18,12 @@ import { buildContextXray } from "../context/xray";
 import type { ContextXray } from "../context/xray";
 import type { AuditFileScan } from "../audit";
 import { buildContextTimeline } from "../context/timeline";
+import { compactionsForSession } from "../context/compaction";
+import type { CompactionRecord } from "../context/compaction";
 import type { ContextMetrics, ContextTimeline } from "../context/timeline";
 import { toolsetFromBody } from "../context/tooltax";
+import { identifyRequest, spawnIndex } from "../trajectory/agent-identity";
+import type { AgentSpawn, IdentityPair } from "../trajectory/agent-identity";
 import type { ToolTokenEntry } from "../context/tooltax";
 
 /**
@@ -205,6 +209,11 @@ export interface RequestRow {
   promptHash: string;
   /** 1-based index of the transcript step this call produced, null when none. */
   agentStepIndex: number | null;
+  /** True when Claude Code marked this call as a subagent's. */
+  isSubagent: boolean;
+  /** The parent's label for that subagent, when the spawn was joined. */
+  agentLabel: string | null;
+  agentType: string | null;
 }
 
 /** One indexed step's text content (the transcript row the FTS index holds). */
@@ -301,7 +310,7 @@ const SORTABLE_COLUMNS = new Set([
   "cost_usd",
 ]);
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 8;
 
 // ---------------------------------------------------------------------------
 // Paths / discovery
@@ -397,6 +406,34 @@ function projectCwdFor(sourcePath: string): string {
   const dir = path.dirname(path.resolve(sourcePath));
   if (TRACE_DIRS.includes(path.basename(dir))) return path.dirname(dir);
   return dir;
+}
+
+/**
+ * Claude Code's own session uuid for a conversation, from the request headers.
+ *
+ * The join key to `~/.claude/projects/<slug>/<uuid>.jsonl`, where compactions
+ * are recorded rather than inferred. Subagents INHERIT their parent's value, so
+ * this is not an identity for the calling agent — `agent-identity.ts` handles
+ * that — but it is exactly right here: the transcript belongs to the session as
+ * a whole.
+ *
+ * Takes the first value seen. A group is one conversation by construction, and
+ * where a capture spans a `--resume` the first id is the one whose transcript
+ * holds the earlier boundaries.
+ *
+ * @returns the uuid, or null for non-Claude agents and pre-header captures.
+ */
+function claudeSessionIdOf(group: PairGroup): string | null {
+  for (const pair of group.pairs) {
+    const headers = pair?.request?.headers;
+    if (!headers) continue;
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() !== "x-claude-code-session-id") continue;
+      const s = String(v ?? "").trim();
+      if (/^[0-9a-fA-F-]{36}$/.test(s)) return s;
+    }
+  }
+  return null;
 }
 
 /**
@@ -527,7 +564,13 @@ export class Store {
         cost_usd            REAL,
         tool_histogram_json TEXT,
         source_path         TEXT,
-        content_hash        TEXT
+        content_hash        TEXT,
+        -- Claude Code's own session uuid, from the x-claude-code-session-id
+        -- request header. The join key to its transcript under
+        -- ~/.claude/projects/<slug>/<uuid>.jsonl, where compactions are
+        -- RECORDED rather than inferred. Null for non-Claude agents and for
+        -- logs captured before the header existed.
+        claude_session_id   TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source_path);
       CREATE INDEX IF NOT EXISTS idx_sessions_agent  ON sessions(agent);
@@ -570,6 +613,13 @@ export class Store {
         ctx_total_chars  INTEGER,
         ctx_total_tokens INTEGER,
         ctx_buckets_json TEXT,
+        -- Which conversation inside the session made this call. A session that
+        -- spawns a fleet writes every agent into one log under one session id,
+        -- so without these three columns every neighbour-diffing metric
+        -- compares across unrelated conversations. See trajectory/agent-identity.
+        is_subagent      INTEGER NOT NULL DEFAULT 0,
+        agent_label      TEXT,
+        agent_type       TEXT,
         -- Content address of the declared tool set (toolsets.toolset_hash);
         -- NULL when the body declares no tools.
         toolset_hash     TEXT
@@ -689,6 +739,11 @@ export class Store {
 
     const pairs = parsePairs(content);
     const groups = groupPairs(pairs);
+    // File-scoped, NOT group-scoped. Sessions are grouped by system prompt, and
+    // a subagent's system prompt differs from its parent's — so a subagent's
+    // group never contains the Agent tool_use that named it. Building the index
+    // per group produced 484 correctly-marked subagent rows and zero names.
+    const spawns = spawnIndex(pairs as unknown as IdentityPair[]);
 
     const run = this.db.transaction(() => {
       this.deleteSourceRows(sourcePath);
@@ -696,7 +751,14 @@ export class Store {
       let steps = 0;
       for (const group of groups) {
         const traj = buildTrajectory(group);
-        steps += this.insertTrajectory(traj, group, sourcePath, contentHash, opts?.projectCwd);
+        steps += this.insertTrajectory(
+          traj,
+          group,
+          sourcePath,
+          contentHash,
+          opts?.projectCwd,
+          spawns,
+        );
         sessions += 1;
       }
       this.db
@@ -730,7 +792,8 @@ export class Store {
     group: PairGroup,
     sourcePath: string,
     contentHash: string,
-    projectCwdOverride?: string,
+    projectCwdOverride: string | undefined,
+    spawns: AgentSpawn[],
   ): number {
     const stats = analyze(traj, this.prices ? { prices: this.prices } : {});
 
@@ -744,6 +807,7 @@ export class Store {
     }
     const startedAt = Number.isFinite(minTs) ? minTs : 0;
     const endedAt = Number.isFinite(maxTs) ? maxTs : 0;
+    const claudeSessionId = claudeSessionIdOf(group);
 
     // A trajectory's session_id is its own; clear any prior rows for it (e.g.
     // the same conversation re-captured in a different file) before inserting.
@@ -757,8 +821,8 @@ export class Store {
         `INSERT INTO sessions(
            session_id, agent, model, project_cwd, started_at, ended_at, duration_ms,
            total_in_tokens, total_out_tokens, cache_read, cache_creation, cost_usd,
-           tool_histogram_json, source_path, content_hash
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           tool_histogram_json, source_path, content_hash, claude_session_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         traj.sessionId,
@@ -776,6 +840,7 @@ export class Store {
         JSON.stringify(stats.toolHistogram),
         sourcePath,
         contentHash,
+        claudeSessionId,
       );
 
     const insStep = this.db.prepare(
@@ -801,13 +866,18 @@ export class Store {
       steps += 1;
     }
 
-    this.insertRequests(group, traj, sourcePath);
+    this.insertRequests(group, traj, sourcePath, spawns);
     this.insertUsageEvents(traj, sourcePath);
     return steps;
   }
 
   /** Write one wire-metrics row per captured pair + upsert prompt versions. */
-  private insertRequests(group: PairGroup, traj: Trajectory, sourcePath: string): void {
+  private insertRequests(
+    group: PairGroup,
+    traj: Trajectory,
+    sourcePath: string,
+    spawns: AgentSpawn[],
+  ): void {
     const agentName = group.adapter.agentInfo(group.pairs[0]).name;
     // Agent steps were emitted by buildOne in pair order, one per pair whose
     // response parsed to items or usage. Replaying that predicate over the same
@@ -820,8 +890,9 @@ export class Store {
          prompt_tokens, completion_tokens, cache_read, cache_creation,
          reasoning_tokens, stop_reason, errored, transcript_items,
          prompt_hash, agent_step_index, source_path,
-         ctx_total_chars, ctx_total_tokens, ctx_buckets_json, toolset_hash
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ctx_total_chars, ctx_total_tokens, ctx_buckets_json, toolset_hash,
+         is_subagent, agent_label, agent_type
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const upsertPrompt = this.db.prepare(
       `INSERT INTO prompts(prompt_hash, agent, content, first_seen, last_seen)
@@ -890,6 +961,7 @@ export class Store {
       // load re-read and re-parsed every body in the session. A body that will
       // not segment is stored as NULL, and the read path falls back for it.
       const ctx = contextMetricsForPair(seq, pair, promptHash);
+      const identity = identifyRequest(pair as IdentityPair, spawns);
       const toolset = toolsetForPair(pair);
       if (toolset) {
         upsertToolset.run({
@@ -925,6 +997,9 @@ export class Store {
         ctx?.totalApproxTokens ?? null,
         ctx ? JSON.stringify(ctx.buckets) : null,
         toolset?.hash ?? null,
+        identity.isSubagent ? 1 : 0,
+        identity.label,
+        identity.subagentType,
       );
     });
   }
@@ -1329,6 +1404,68 @@ export class Store {
     );
   }
 
+  // -- compactions, as recorded rather than inferred -------------------------
+
+  /** Claude Code's session uuid for this session, when the header was captured. */
+  claudeSessionId(sessionId: string): string | null {
+    const row = this.db
+      .prepare("SELECT claude_session_id AS id FROM sessions WHERE session_id = ?")
+      .get(sessionId) as { id?: string } | undefined;
+    return row?.id ? String(row.id) : null;
+  }
+
+  /**
+   * Compactions actually performed, read from Claude Code's own transcript.
+   *
+   * This is the AUTHORITY, and it carries what no wire-side inference can:
+   * `trigger`, which says whether the agent compacted itself to stay under the
+   * limit or the user typed `/compact`. The inferred path in
+   * `context/timeline.ts` measured 75% false positives against the live index
+   * even after two rounds of hardening.
+   *
+   * SCOPE IS THE CLAUDE CODE SESSION, NOT THIS GROUP, and the return value says
+   * so rather than implying otherwise. tracetap groups a capture by system
+   * prompt, so one Claude Code session becomes many sessions here — 20 of them
+   * for one measured uuid — while the transcript records the main thread's
+   * conversation as a whole. Two attributions were tried and both rejected:
+   *
+   *  - by TIME CONTAINMENT: main-thread groups overlap (the system prompt
+   *    changes as tools load and unload, then changes back), so 25 boundaries
+   *    were assigned 52 times.
+   *  - by NEXT MAIN-THREAD CALL: exactly-once, but it fails its own sanity
+   *    check. `postTokens` (12–38K) counts the conversation after summarizing,
+   *    while the next wire call reads 195–242K because it also re-sends the
+   *    system prompt and ~64K of tool declarations. Those are different
+   *    quantities, so the pairing proves nothing.
+   *
+   * `subagentOnly` marks a group whose calls are all subagent traffic. Its
+   * context is not what got compacted, so a caller should not show these there.
+   *
+   * @returns `records: []` when no transcript is available — a different agent,
+   *   an older capture with no session header, or a deleted transcript. That is
+   *   "unknown", NOT "no compactions happened"; fall back to the inferred set.
+   */
+  recordedCompactions(sessionId: string): {
+    claudeSessionId: string | null;
+    scope: "claude-session";
+    subagentOnly: boolean;
+    records: CompactionRecord[];
+  } {
+    const claudeSessionId = this.claudeSessionId(sessionId);
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n, SUM(is_subagent = 0) AS main
+           FROM requests WHERE session_id = ?`,
+      )
+      .get(sessionId) as { n?: number; main?: number } | undefined;
+    return {
+      claudeSessionId,
+      scope: "claude-session",
+      subagentOnly: !!row?.n && !row?.main,
+      records: claudeSessionId ? compactionsForSession(claudeSessionId) : [],
+    };
+  }
+
   // -- wire metrics ----------------------------------------------------------
 
   /** Per-request wire metrics for one session, in capture order. */
@@ -1338,7 +1475,7 @@ export class Store {
         `SELECT session_id, seq, ts, model, status, duration_ms, ttft_ms,
                 prompt_tokens, completion_tokens, cache_read, cache_creation,
                 reasoning_tokens, stop_reason, errored, transcript_items, prompt_hash,
-                agent_step_index
+                agent_step_index, is_subagent, agent_label, agent_type
          FROM requests WHERE session_id = ? ORDER BY seq`,
       )
       .all(sessionId) as any[];
@@ -1361,6 +1498,9 @@ export class Store {
         transcriptItems: Number(r.transcript_items ?? 0),
         promptHash: String(r.prompt_hash ?? ""),
         agentStepIndex: r.agent_step_index == null ? null : Number(r.agent_step_index),
+        isSubagent: Number(r.is_subagent ?? 0) === 1,
+        agentLabel: r.agent_label == null ? null : String(r.agent_label),
+        agentType: r.agent_type == null ? null : String(r.agent_type),
       }),
     );
   }
@@ -1632,6 +1772,33 @@ export class Store {
     if (opts?.dryRun) return { matched, deleted: 0 };
     const info = this.db.prepare(`DELETE FROM hooks WHERE ${where}`).run();
     return { matched, deleted: info.changes };
+  }
+
+  /**
+   * Other sessions captured in the SAME trace log, oldest first.
+   *
+   * The strongest "related sessions" signal available without per-agent
+   * identity: one `.claude-trace` log is one proxied CLI process, so every
+   * session in it shares a terminal, a working directory and a stretch of
+   * wall-clock time. On a live capture, one log held 24 sessions spanning
+   * 00:40 to 03:20 — a main thread and the fleet it spawned, which the session
+   * list showed as 24 unrelated rows.
+   *
+   * This is a SIBLING relation, not a parent/child one. Establishing which
+   * session spawned which needs agent identity that the rows do not carry yet,
+   * so the shape here is deliberately a flat list rather than a tree that
+   * would imply knowledge we do not have.
+   */
+  sessionsFromSameSource(sessionId: string): SessionSummary[] {
+    // One listSessions() pass, not one per sibling: getSession re-lists every
+    // session on each call, so mapping ids through it would be quadratic — and
+    // this is the case with 24 siblings, not 2.
+    const all = this.listSessions();
+    const self = all.find((s) => s.sessionId === sessionId);
+    if (!self) return [];
+    return all
+      .filter((s) => s.sessionId !== sessionId && s.sourcePath === self.sourcePath)
+      .sort((a, b) => a.startedAt - b.startedAt);
   }
 
   /**
