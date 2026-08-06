@@ -2974,12 +2974,33 @@
       return null;
     }
 
+    /** The turn built for this API call, or null when none was built. */
+    function turnForSeq(seq) {
+      for (var i = 0; i < turnsForPane.length; i++) {
+        if (turnsForPane[i].seq === seq) return turnsForPane[i];
+      }
+      return null;
+    }
+
     function inspectTimelinePoint(id) {
       var seq = Number(id.slice(id.indexOf(":") + 1));
       var p = timelinePointFor(seq);
       if (!p) return;
       selectedSeq = p.seq;
-      var lines = [
+      // The turn's TEXT leads, then its metrics. Both are already in the
+      // browser — buildTurns joins the preceding user step onto every turn —
+      // but the only row that showed them clamps to one line
+      // (`.turn-sum { white-space: nowrap; text-overflow: ellipsis }`), so the
+      // inspector was the one place the full ask could be read and it was
+      // answering with numbers. `.payload` already wraps and scrolls at 40vh.
+      var t = turnForSeq(p.seq);
+      var lines = [];
+      if (t && t.prompt) lines.push("PROMPT", String(t.prompt), "");
+      if (t && t.step && t.step.message) {
+        lines.push("RESPONSE", String(t.step.message), "");
+      }
+      if (lines.length) lines.push("METRICS");
+      lines = lines.concat([
         "context read   " + fmtTok(p.contextTokens) + " tokens",
         "  cache read   " + fmtTok(p.cacheRead),
         "  cache write  " + fmtTok(p.cacheCreation),
@@ -2990,7 +3011,7 @@
           (p.approxTokens == null ? "—" : fmtTok(p.approxTokens) + " tokens"),
         "model          " + (p.model || "—"),
         "at             " + new Date(p.ts * 1000).toLocaleTimeString(),
-      ];
+      ]);
       if (p.compaction) {
         var c = p.compaction;
         lines.push(
@@ -3137,14 +3158,7 @@
 
     function inspectTurnEvent(id) {
       var parts = id.split(":"); // ev:<seq>:<index>
-      var seq = Number(parts[1]);
-      var t = null;
-      for (var i = 0; i < turnsForPane.length; i++) {
-        if (turnsForPane[i].seq === seq) {
-          t = turnsForPane[i];
-          break;
-        }
-      }
+      var t = turnForSeq(Number(parts[1]));
       if (!t) return;
       var e = t.events[Number(parts[2])];
       if (!e) return;
