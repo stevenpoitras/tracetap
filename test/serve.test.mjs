@@ -1007,6 +1007,358 @@ test("exact hook session_id match disables the time join entirely", () => {
   }
 });
 
+/**
+ * A claude store whose capture carries the `x-claude-code-session-id` header,
+ * so `sessions.claude_session_id` is populated the way a real capture's is.
+ * `makeClaudeStore`'s fixture has no such header, which is why every existing
+ * hook test exercises the time join rather than the identity one.
+ */
+function makeIdentifiedClaudeStore(prefix, uuid) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const claudeDir = path.join(dir, "proj", ".claude-trace");
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const pairs = fs
+    .readFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), "utf-8")
+    .trim()
+    .split("\n")
+    .map((l) => {
+      const p = JSON.parse(l);
+      p.request.headers = { ...(p.request.headers || {}), "x-claude-code-session-id": uuid };
+      return JSON.stringify(p);
+    });
+  fs.writeFileSync(path.join(claudeDir, "claude.jsonl"), pairs.join("\n") + "\n");
+  const s = new Store(path.join(dir, "index.db"));
+  s.indexPaths([path.join(dir, "proj")]);
+  return { dir, store: s, session: s.listSessions({ agent: "claude" })[0] };
+}
+
+test("hooks join on Claude's session uuid, which is never the wire session id", () => {
+  // Synthetic: `indexPaths` also sweeps the real `~/.tracetap/hooks`, so a uuid
+  // that exists on the developer's machine would import its live rows here.
+  const uuid = "99999999-8888-7777-6666-555555555555";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-hookuuid-", uuid);
+  try {
+    // The bug this pins: the tap keys its log by Claude's uuid, so a lookup by
+    // the wire id (a system-prompt-group key, a different namespace) matched
+    // nothing and every session fell through to the time heuristic.
+    assert.notEqual(session.sessionId, uuid, "wire id and hook id are distinct namespaces");
+    assert.equal(s.claudeSessionId(session.sessionId), uuid);
+
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    // Timed a day outside the capture window: only identity can find this, so
+    // a pass cannot be the time join succeeding by luck.
+    writeHookLog(hooksDir, "real.jsonl", [
+      hookEvent({ session_id: uuid, ts: "2023-11-15T22:13:19.000Z", payload: { prompt: "mine" } }),
+    ]);
+    writeHookLog(hooksDir, "foreign.jsonl", [
+      hookEvent({ session_id: "another-uuid", payload: { prompt: "FOREIGN" } }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    const rows = s.listHooksForSession(session.sessionId);
+    assert.equal(rows.length, 1, "the uuid-keyed hook is served");
+    assert.equal(rows[0].sessionId, uuid);
+    assert.equal(rows[0].payload.prompt, "mine");
+    // A resolved uuid is positive identity, so the clock never gets a vote and
+    // the concurrent foreign session cannot ride in under this one.
+    assert.ok(!JSON.stringify(rows).includes("FOREIGN"));
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("only one wire session owns a conversation's hooks", () => {
+  const uuid = "11111111-2222-3333-4444-555555555555";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-hookowner-", uuid);
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    writeHookLog(hooksDir, "real.jsonl", [hookEvent({ session_id: uuid })]);
+    s.indexHooks(hooksDir);
+    assert.equal(s.listHooksForSession(session.sessionId).length, 1);
+
+    // A second wire group under the SAME conversation — what a mid-session
+    // system-prompt change produces. Without an elected owner the one hook
+    // would render under both, and a real capture fanned out to 48 groups.
+    s.db
+      .prepare(
+        `INSERT INTO sessions(session_id, agent, project_cwd, started_at, ended_at,
+                              source_path, content_hash, claude_session_id)
+         SELECT 'claude:sibling', agent, project_cwd, started_at, ended_at,
+                source_path, content_hash, claude_session_id
+         FROM sessions WHERE session_id = ?`,
+      )
+      .run(session.sessionId);
+
+    assert.equal(s.listHooksForSession(session.sessionId).length, 1, "owner keeps its hooks");
+    assert.equal(
+      s.listHooksForSession("claude:sibling").length,
+      0,
+      "sibling group does not duplicate the conversation's hooks",
+    );
+
+    // The empty pane must send the reader somewhere real, so the sibling names
+    // the owner...
+    assert.equal(s.hooksMetaForSession("claude:sibling").ownerSessionId, session.sessionId);
+    // ...and a conversation with no hooks at all names nobody, rather than
+    // pointing at a session whose pane is just as empty.
+    s.db.prepare("DELETE FROM hooks").run();
+    assert.equal(s.hooksMetaForSession("claude:sibling").ownerSessionId, null);
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bumping past schema 8 re-stamps a closed log with the majority uuid", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-schema-"));
+  try {
+    const claudeDir = path.join(dir, "proj", ".claude-trace");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    const minority = "cccccccc-0000-0000-0000-000000000000";
+    const majority = "dddddddd-0000-0000-0000-000000000000";
+    const base = fs
+      .readFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), "utf-8")
+      .trim()
+      .split("\n");
+    const stamp = (line, uuid) => {
+      const p = JSON.parse(line);
+      p.request.headers = { ...(p.request.headers || {}), "x-claude-code-session-id": uuid };
+      return JSON.stringify(p);
+    };
+    fs.writeFileSync(
+      path.join(claudeDir, "claude.jsonl"),
+      [stamp(base[0], minority), stamp(base[1], majority), stamp(base[1], majority)].join("\n") +
+        "\n",
+    );
+
+    const dbPath = path.join(dir, "index.db");
+    let s = new Store(dbPath);
+    s.indexPaths([path.join(dir, "proj")]);
+    const sessionId = s.listSessions({ agent: "claude" })[0].sessionId;
+    // Simulate a database written by the OLD build: schema 8, and the stamp the
+    // old first-seen rule would have produced. The log never changes again, and
+    // `indexFile` returns early on an unchanged content hash — so nothing but a
+    // version bump can ever correct it. Seed 8 specifically: seeding some other
+    // number tests the pre-existing wipe rather than this bump.
+    s.db.prepare("UPDATE sessions SET claude_session_id = ?").run(minority);
+    s.db.prepare("UPDATE meta SET value = '8' WHERE key = 'schema_version'").run();
+    s.close();
+
+    s = new Store(dbPath);
+    assert.equal(
+      s.db.prepare("SELECT count(*) AS n FROM files").get().n,
+      0,
+      "schema 8 is stale, so the watermark is dropped and the log re-parses",
+    );
+    const res = s.indexPaths([path.join(dir, "proj")]);
+    assert.ok(res.filesIndexed >= 1, "re-indexed rather than skipped");
+    assert.equal(
+      s.claudeSessionId(sessionId),
+      majority,
+      "the closed log picks up majority stamping — the whole point of the bump",
+    );
+    assert.equal(
+      s.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value,
+      "9",
+      "and the database records the version that did it",
+    );
+    s.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a subagent-only conversation still elects an owner, deterministically", () => {
+  const uuid = "22222222-2222-2222-2222-222222222222";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-hooksub-", uuid);
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    writeHookLog(hooksDir, "real.jsonl", [hookEvent({ session_id: uuid })]);
+    s.indexHooks(hooksDir);
+
+    // Every group of this conversation is subagent traffic. Electing nobody
+    // would strand the hooks where no pane can reach them.
+    s.db.prepare("UPDATE requests SET is_subagent = 1 WHERE session_id = ?").run(session.sessionId);
+    assert.equal(
+      s.listHooksForSession(session.sessionId).length,
+      1,
+      "hooks stay reachable when no group has main-thread traffic",
+    );
+
+    // A sibling sharing started_at to the second — what a parallel Task fan-out
+    // produces. With both other sort keys tied the winner must still be fixed,
+    // or a reindex silently moves the conversation's hooks between groups.
+    s.db
+      .prepare(
+        `INSERT INTO sessions(session_id, agent, project_cwd, started_at, ended_at,
+                              source_path, content_hash, claude_session_id)
+         SELECT 'claude:aaaa', agent, project_cwd, started_at, ended_at,
+                source_path, content_hash, claude_session_id
+         FROM sessions WHERE session_id = ?`,
+      )
+      .run(session.sessionId);
+    const first = s.listHooksForSession("claude:aaaa").length;
+    for (let i = 0; i < 5; i++) {
+      assert.equal(s.listHooksForSession("claude:aaaa").length, first, "election is stable");
+    }
+    // 'claude:aaaa' sorts before the fixture's 'claude:<hex>' id, so it wins.
+    assert.equal(first, 1, "the lowest session_id breaks a full tie");
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("claude_session_id is stamped by majority, not by whichever header arrived first", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-stamp-"));
+  try {
+    const claudeDir = path.join(dir, "proj", ".claude-trace");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    const minority = "aaaaaaaa-0000-0000-0000-000000000000";
+    const majority = "bbbbbbbb-0000-0000-0000-000000000000";
+    // One group, two conversations: the group key is {system, model} and does
+    // not include the uuid, so a real capture can and does span them. The
+    // minority id is FIRST, which is exactly what used to win.
+    const base = fs
+      .readFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), "utf-8")
+      .trim()
+      .split("\n");
+    const stamp = (line, uuid) => {
+      const p = JSON.parse(line);
+      p.request.headers = { ...(p.request.headers || {}), "x-claude-code-session-id": uuid };
+      return JSON.stringify(p);
+    };
+    fs.writeFileSync(
+      path.join(claudeDir, "claude.jsonl"),
+      [stamp(base[0], minority), stamp(base[1], majority), stamp(base[1], majority)].join("\n") +
+        "\n",
+    );
+    const s = new Store(path.join(dir, "index.db"));
+    s.indexPaths([path.join(dir, "proj")]);
+    const session = s.listSessions({ agent: "claude" })[0];
+    assert.equal(
+      s.claudeSessionId(session.sessionId),
+      majority,
+      "the conversation filling the group wins, not the one that spoke first",
+    );
+    s.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the identity join is fenced by cwd, not trusted outright", () => {
+  const uuid = "77777777-6666-5555-4444-333333333333";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-hookfence-", uuid);
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    // Keyed to this conversation, but recorded in another project. One wire key
+    // can be produced by logs from two projects and `session_id` is a PRIMARY
+    // KEY, so the surviving row can carry the wrong project — the hook's own
+    // cwd is the better witness, and it must be able to overrule identity.
+    writeHookLog(hooksDir, "foreign-cwd.jsonl", [
+      hookEvent({
+        session_id: uuid,
+        stdin_preview: { cwd: "/somewhere/else/entirely" },
+        payload: { prompt: "OTHER-PROJECT-SECRET" },
+      }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    const rows = s.listHooksForSession(session.sessionId);
+    assert.equal(rows.length, 0, "identity does not override a conflicting cwd");
+    assert.ok(!JSON.stringify(rows).includes("OTHER-PROJECT-SECRET"));
+
+    // ...and the pane must not then claim no hooks belong to the conversation.
+    assert.equal(s.hooksMetaForSession(session.sessionId).conversationHookCount, 1);
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Flow and compaction triggers read the conversation, not just the elected owner", () => {
+  const uuid = "44444444-3333-2222-1111-000000000000";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-hookflow-", uuid);
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    writeHookLog(hooksDir, "real.jsonl", [
+      hookEvent({ session_id: uuid, event: "PreCompact", hook_name: "pre" }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    // A sibling group of the same conversation, which the election will not pick.
+    s.db
+      .prepare(
+        `INSERT INTO sessions(session_id, agent, project_cwd, started_at, ended_at,
+                              source_path, content_hash, claude_session_id)
+         SELECT 'claude:sibling', agent, project_cwd, started_at, ended_at,
+                source_path, content_hash, claude_session_id
+         FROM sessions WHERE session_id = ?`,
+      )
+      .run(session.sessionId);
+
+    // The pane defers to the owner — that is the presentation rule...
+    assert.equal(s.listHooksForSession("claude:sibling").length, 0);
+    // ...but Flow describes what happened during THIS session, so a non-owner
+    // must still see the events. Owner-scoping here degraded every compaction
+    // trigger to `unknown`.
+    const flow = s.sessionFlow("claude:sibling");
+    assert.ok(
+      flow.nodes.some((n) => n.kind === "hook"),
+      "sibling's Flow graph still carries the conversation's hook nodes",
+    );
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Flow is bounded to the session window, not the whole conversation", () => {
+  const uuid = "eeeeeeee-0000-0000-0000-000000000000";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-flowbound-", uuid);
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    // Same conversation, but a day past this session's window. A conversation
+    // can span 24 hours across 48 groups while one group covers 0.0 seconds,
+    // and deriveFlow drains every hook it is handed — so reading the whole
+    // conversation unbounded turned a 7-node graph into a 7,911-node, 5 MB one
+    // and claimed events hours outside the window happened inside it.
+    const far = (session.startedAt + 86400) * 1000;
+    writeHookLog(
+      hooksDir,
+      "far.jsonl",
+      Array.from({ length: 50 }, (_, i) =>
+        hookEvent({
+          session_id: uuid,
+          ts: new Date(far + i * 1000).toISOString(),
+          event: "PreToolUse",
+          hook_name: "far",
+        }),
+      ),
+    );
+    // ...and one inside the window, which must survive.
+    writeHookLog(hooksDir, "near.jsonl", [hookEvent({ session_id: uuid, hook_name: "near" })]);
+    s.indexHooks(hooksDir);
+
+    // The pane still lists the conversation's hooks — the bound is Flow's.
+    assert.equal(s.listHooksForSession(session.sessionId).length, 51);
+
+    const hookNodes = s.sessionFlow(session.sessionId).nodes.filter((n) => n.kind === "hook");
+    assert.equal(hookNodes.length, 1, "only the in-window hook becomes a flow node");
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("GET /api/tooltax reports the dead tool across the fleet", async () => {
   const r = await get("/api/tooltax");
   assert.equal(r.status, 200);

@@ -1462,6 +1462,9 @@ export async function handleRequest(
       const hooks = paneSection(sectionErrors, "hooks", () =>
         store.listHooksForSession(sessionId),
       );
+      const hooksMeta = paneSection(sectionErrors, "hooksMeta", () =>
+        store.hooksMetaForSession(sessionId),
+      );
       const flow = paneSection(sectionErrors, "flow", () =>
         trimFlowDetail(store.sessionFlow(sessionId)),
       );
@@ -1472,6 +1475,7 @@ export async function handleRequest(
         steps,
         requests,
         hooks,
+        hooksMeta,
         flow,
         // Compactions come in two provenances and the page says which. The
         // recorded set is Claude Code's own `compact_boundary` records, which

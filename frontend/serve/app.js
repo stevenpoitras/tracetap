@@ -10,6 +10,10 @@
   // re-render without another fetch.
   var hooksShowObserveOnly = false;
   var hooksForPane = [];
+  var hooksMetaForPane = null;
+  // The hooks list and its meta are isolated sections, so either can fail
+  // alone. A blank list from a THROWN section is not evidence of anything.
+  var hooksSectionFailed = false;
 
   var INSPECTOR_EMPTY =
     '<div class="dim inspector-empty">Select a row to inspect its payload</div>';
@@ -2537,6 +2541,10 @@
       steps = data.steps;
     var hooks = data.hooks || [];
     hooksForPane = hooks;
+    hooksMetaForPane = data.hooksMeta
+      ? Object.assign({}, data.hooksMeta, { selfId: (data.session || {}).sessionId })
+      : null;
+    hooksSectionFailed = !!(data.sectionErrors && data.sectionErrors.hooks);
     var flow = data.flow || { nodes: [], edges: [] };
     var siblings = data.siblings || [];
     stepsForPane = steps;
@@ -3388,11 +3396,49 @@
 
   function renderHooksPane(hooks) {
     if (!hooks.length) {
-      return (
-        '<div class="empty-pane">No hook events for this session.<br/>' +
-        '<span class="dim">Run <code>tracetap hooks install</code> then re-index (<code>tracetap index</code>).<br/>' +
-        "If Flow shows hooks but this pane was blank before, it was a hash-route bug — use the buttons above.</span></div>"
-      );
+      // Say WHICH reason applies. Telling a reader to install and re-index when
+      // the taps are installed and the rows are indexed sends them in circles.
+      var m = hooksMetaForPane;
+      var why;
+      if (!m || hooksSectionFailed) {
+        // paneSection() returns null when a section throws, and the list and its
+        // meta fail independently. Either way the emptiness is a load failure,
+        // not a finding — every branch below would assert a cause from it.
+        why = "Could not determine why — the hook data failed to load. Reload the page.";
+      } else if (!m.indexedTotal) {
+        why =
+          "No hooks are indexed at all. Run <code>tracetap hooks install</code>, then " +
+          "<code>tracetap index</code>.";
+      } else if (m.ownerSessionId && m.ownerSessionId !== m.selfId) {
+        why =
+          "This conversation's hooks are shown on its main-thread session: " +
+          '<a href="#session/' +
+          encodeURIComponent(m.ownerSessionId) +
+          '">' +
+          esc(m.ownerSessionId) +
+          "</a>. One conversation splits into several wire sessions, so its hooks " +
+          "are listed once rather than repeated under each.";
+      } else if (!m.claudeSessionId) {
+        why =
+          "This capture carries no <code>x-claude-code-session-id</code> header, so its " +
+          "hooks cannot be identified. " +
+          esc(String(m.indexedTotal)) +
+          " hook events are indexed for other sessions.";
+      } else if (m.conversationHookCount) {
+        // Rows are keyed to this conversation but every one named a different
+        // project, so the cwd fence dropped them. Saying "none belong" here
+        // would be false.
+        why =
+          esc(String(m.conversationHookCount)) +
+          " hook events are keyed to this conversation but record a different working " +
+          "directory, so they were withheld rather than attributed to this project.";
+      } else {
+        why =
+          esc(String(m.indexedTotal)) +
+          " hook events are indexed, but none belong to this conversation — it ran " +
+          "without hooks installed, or the hooks fired in a session that was never captured.";
+      }
+      return '<div class="empty-pane">No hook events for this session.<br/><span class="dim">' + why + "</span></div>";
     }
     var shown = hooksShowObserveOnly ? hooks : signalHooks(hooks);
     var hidden = hooks.length - shown.length;
