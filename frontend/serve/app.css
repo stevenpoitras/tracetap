@@ -1520,7 +1520,7 @@ h2.sec small {
 }
 .xray-row-n {
   font-size: 11px;
-  color: var(--fg);
+  color: var(--text);
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
@@ -1595,7 +1595,7 @@ h2.sec small {
   color: var(--dim);
 }
 .xray-seg-n {
-  color: var(--fg);
+  color: var(--text);
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
