@@ -655,6 +655,31 @@ test("GET /api/activity returns a gapless daily spine that scopes /api/sessions"
   assert.equal(full.sessions.length, unscoped.sessions.length);
 });
 
+test("GET /api/activity names a trailing default window, anchored to the newest day", async () => {
+  const a = JSON.parse((await get("/api/activity")).text);
+
+  // Anchored to the newest ACTIVE day, not to today: a window ending today
+  // would spend most of its width on silence whenever nothing has run lately,
+  // and the opening selection would float off the right edge of the strip.
+  assert.equal(a.defaultUntil, a.maxDate);
+
+  const i = a.days.findIndex((d) => d.date === a.defaultSince);
+  assert.ok(i >= 0, "defaultSince is a day the spine actually renders");
+  assert.equal(
+    i,
+    Math.max(0, a.days.length - 7),
+    "seven trailing days, or the whole spine when history is shorter",
+  );
+
+  // The default has to be a scope /api/sessions accepts verbatim, or the pane
+  // opens on a window nothing else can answer.
+  const scoped = JSON.parse(
+    (await get(`/api/sessions?since=${a.defaultSince}&until=${a.defaultUntil}&limit=500`)).text,
+  );
+  const expected = a.days.slice(i).reduce((n, d) => n + d.sessions, 0);
+  assert.equal(scoped.sessions.length, expected);
+});
+
 test("/api/usage and /api/analytics agree on one scope", async () => {
   const scope = "?agent=claude";
   const usage = JSON.parse((await get("/api/usage" + scope + "&granularity=total")).text);

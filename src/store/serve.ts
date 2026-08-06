@@ -1076,6 +1076,17 @@ function parseWhenParam(raw: string, opts: { endOfDay?: boolean } = {}): number 
 /** One column per day in the scope brush, so a year of history stays scrubbable. */
 const ACTIVITY_MAX_DAYS = 400;
 
+/**
+ * How much of that history the pane OPENS on.
+ *
+ * The spine showing a year and the pane defaulting to a year are different
+ * decisions, and conflating them made every figure answer the wrong question: a
+ * 26-week cost calendar holding four filled cells, a "cost per day" chart whose
+ * adjacent bars were seven weeks apart, a p95 pooled across models retired
+ * months ago. Long history is worth HAVING and rarely worth LANDING ON.
+ */
+const DEFAULT_SCOPE_DAYS = 7;
+
 export interface ActivityDay {
   /** Local `YYYY-MM-DD`, matching `parseWhen`'s local-midnight boundaries. */
   date: string;
@@ -1098,8 +1109,13 @@ function zeroFillDays(rows: { day: string; sessions: number; cost: number; agent
   minDate: string;
   maxDate: string;
   truncated: boolean;
+  /** Trailing window the pane opens on; `""` when the index is empty. */
+  defaultSince: string;
+  defaultUntil: string;
 } {
-  if (!rows.length) return { days: [], minDate: "", maxDate: "", truncated: false };
+  if (!rows.length) {
+    return { days: [], minDate: "", maxDate: "", truncated: false, defaultSince: "", defaultUntil: "" };
+  }
   const byDay = new Map(rows.map((r) => [r.day, r]));
   const maxDate = rows[rows.length - 1].day;
   const toDate = (s: string) => {
@@ -1130,7 +1146,19 @@ function zeroFillDays(rows: { day: string; sessions: number; cost: number; agent
       agents: hit ? hit.agents : 0,
     });
   }
-  return { days, minDate: days[0].date, maxDate, truncated };
+  // Anchored to the newest ACTIVE day, not to today: if nothing has run since
+  // Friday, a window ending today spends most of its width on silence and the
+  // default selection floats off the right edge of the strip. Ending at maxDate
+  // makes it flush with the spine and guarantees the pane opens on real data.
+  const defaultIdx = Math.max(0, days.length - DEFAULT_SCOPE_DAYS);
+  return {
+    days,
+    minDate: days[0].date,
+    maxDate,
+    truncated,
+    defaultSince: days[defaultIdx].date,
+    defaultUntil: maxDate,
+  };
 }
 
 /**
