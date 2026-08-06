@@ -36,9 +36,19 @@ export function buildStdinPreview(stdin: unknown): Record<string, unknown> {
   // Every key on this list is an opaque identifier or a bounded literal, which
   // is the bar for entering it: this allowlist is the redaction fence for hook
   // stdin, and these events are indexed and rendered WITHOUT --redact-bodies.
-  // Measured against real captures, the longest of these is 36 chars. Their
-  // sensitive neighbours — session_title, prompt, tool_response,
-  // last_assistant_message, compact_summary, custom_instructions — stay off it.
+  // Measured against real captures, the longest of these is 36 chars.
+  //
+  // Their sensitive neighbours fall into two groups, and the difference matters
+  // to anyone reading a preview:
+  //   never present   session_title, compact_summary, custom_instructions,
+  //                   error_details, message, tool_response — no branch below
+  //                   emits them in any form.
+  //   summarized      prompt keeps a length AND its first 120 chars VERBATIM in
+  //                   prompt_preview; last_assistant_message keeps a length
+  //                   only. So a secret pasted into the first 120 characters of
+  //                   a prompt does reach the log. Pre-existing, and the reason
+  //                   this list must stay identifiers-only rather than becoming
+  //                   the place where new free text gets added.
   //
   // These are dropped at CAPTURE time, so a reindex can never recover them for
   // events already on disk. Anything omitted here is unattributable forever,
