@@ -97,3 +97,36 @@ test("buildContextXray diffs new vs carried vs dropped", () => {
   const solo = buildContextXray({ seq: 0, pair: prev });
   assert.equal(solo.delta, undefined);
 });
+
+test("tools declarations segment per tool, not as one blob", () => {
+  const read = { name: "Read", description: "Read a file", input_schema: {} };
+  const sleeper = {
+    name: "SleeperTool",
+    description: "x".repeat(400),
+    input_schema: { type: "object", properties: {} },
+  };
+  const segs = segmentsFromRequestBody({
+    model: "claude-opus-4",
+    system: "sys",
+    tools: [read, sleeper],
+    messages: [{ role: "user", content: "hi" }],
+  });
+  const toolSegs = segs.filter((s) => s.bucket === "tools");
+  assert.equal(toolSegs.length, 2);
+  assert.deepEqual(
+    toolSegs.map((s) => s.kind),
+    ["tool:Read", "tool:SleeperTool"],
+  );
+  // Each segment is sized to ITS tool, so the bucket now exposes per-tool cost.
+  assert.equal(toolSegs[0].chars, JSON.stringify(read).length);
+  assert.equal(toolSegs[1].chars, JSON.stringify(sleeper).length);
+  // Per-tool ids diff independently: dropping one tool drops one segment.
+  const without = segmentsFromRequestBody({
+    model: "claude-opus-4",
+    system: "sys",
+    tools: [read],
+    messages: [{ role: "user", content: "hi" }],
+  }).filter((s) => s.bucket === "tools");
+  assert.equal(without.length, 1);
+  assert.equal(without[0].id, toolSegs[0].id);
+});

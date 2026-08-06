@@ -3,7 +3,9 @@ import * as fs from "fs";
 import * as path from "path";
 import { AddressInfo } from "net";
 import { Store, defaultDbPath } from "./index";
-import type { RequestRow, SearchFilters, SessionListFilters } from "./index";
+import type { RequestRow, SearchFilters, SessionListFilters, ToolsetUsageRow } from "./index";
+import { computeToolsetTax } from "../context/tooltax";
+import type { ToolsetTax } from "../context/tooltax";
 import { costForMetrics, priceFor } from "../analytics";
 import type { PriceTable } from "../analytics";
 import { loadPrices } from "../pricing";
@@ -404,6 +406,183 @@ export async function auditIndexedFiles(
   return report;
 }
 
+/** Tax for one (session, toolset) row, priced at the model's cache-read rate. */
+function taxForUsageRow(row: ToolsetUsageRow, prices: PriceTable): ToolsetTax {
+  const price = row.model ? priceFor(row.model, prices) : null;
+  return computeToolsetTax(
+    row.toolsetHash,
+    row.perTool,
+    row.toolHistogram,
+    row.requestCount,
+    price ? price.cacheRead : null,
+  );
+}
+
+/**
+ * Fleet dead-tool-tax rollup: which declared tools cost tokens on every request
+ * without ever being invoked, across all indexed sessions. Pure DB reads — the
+ * declared side was persisted at index time (toolsets registry), the called
+ * side is each session's tool histogram.
+ */
+export function fleetToolTax(store: Store, prices: PriceTable) {
+  const rows = store.listToolsetUsage();
+
+  interface ToolAgg {
+    name: string;
+    approxTokens: number;
+    declaredSessions: Set<string>;
+    calledSessions: Set<string>;
+    callsBySession: Map<string, number>;
+    cumulativeTokens: number;
+    deadTokensCumulative: number;
+    deadCostUsd: number;
+    pricedDeadRows: number;
+    deadRows: number;
+  }
+  const perTool = new Map<string, ToolAgg>();
+
+  interface SessionAgg {
+    sessionId: string;
+    agent: string;
+    model: string;
+    projectCwd: string;
+    requestCount: number;
+    declaredCount: number;
+    calledCount: number;
+    deadCount: number;
+    deadTokensPerRequest: number;
+    deadTokensCumulative: number;
+    cumulativeToolTokens: number;
+    deadCostUsd: number | null;
+    /** Requests behind the declared/dead counts (largest toolset row wins). */
+    dominantRequests: number;
+  }
+  const perSession = new Map<string, SessionAgg>();
+
+  let cumulativeToolTokens = 0;
+  let deadTokensCumulative = 0;
+  let deadCostUsd = 0;
+  let pricedRows = 0;
+  // Rows with real dead tokens but no price entry: their dollars are missing
+  // from deadCostUsd, so the total must say so (same contract as
+  // fleetAnalytics' hasUnpriced → fmtCost's "+" suffix).
+  let unpricedDeadRows = 0;
+
+  for (const row of rows) {
+    const tax = taxForUsageRow(row, prices);
+    const rowToolTokens = row.perTool.reduce((a, t) => a + t.approxTokens, 0) * row.requestCount;
+    cumulativeToolTokens += rowToolTokens;
+    deadTokensCumulative += tax.deadTokensCumulative;
+    if (tax.deadCostUsd != null) {
+      deadCostUsd += tax.deadCostUsd;
+      pricedRows++;
+    } else if (tax.deadTokensCumulative > 0) {
+      unpricedDeadRows++;
+    }
+
+    let s = perSession.get(row.sessionId);
+    if (!s) {
+      s = {
+        sessionId: row.sessionId,
+        agent: row.agent,
+        model: row.model,
+        projectCwd: row.projectCwd,
+        requestCount: 0,
+        declaredCount: 0,
+        calledCount: 0,
+        deadCount: 0,
+        deadTokensPerRequest: 0,
+        deadTokensCumulative: 0,
+        cumulativeToolTokens: 0,
+        deadCostUsd: null,
+        dominantRequests: -1,
+      };
+      perSession.set(row.sessionId, s);
+    }
+    s.requestCount += row.requestCount;
+    s.deadTokensCumulative += tax.deadTokensCumulative;
+    s.cumulativeToolTokens += rowToolTokens;
+    if (tax.deadCostUsd != null) s.deadCostUsd = (s.deadCostUsd ?? 0) + tax.deadCostUsd;
+    // Counts and per-request figures come from the session's dominant toolset
+    // (the one most of its requests declared) — summing them across variant
+    // sets would double-count tools shared by every variant.
+    if (row.requestCount > s.dominantRequests) {
+      s.dominantRequests = row.requestCount;
+      s.declaredCount = tax.declaredCount;
+      s.calledCount = tax.calledCount;
+      s.deadCount = tax.deadCount;
+      s.deadTokensPerRequest = tax.deadTokensPerRequest;
+    }
+
+    for (const t of tax.tools) {
+      let agg = perTool.get(t.name);
+      if (!agg) {
+        agg = {
+          name: t.name,
+          approxTokens: 0,
+          declaredSessions: new Set(),
+          calledSessions: new Set(),
+          callsBySession: new Map(),
+          cumulativeTokens: 0,
+          deadTokensCumulative: 0,
+          deadCostUsd: 0,
+          pricedDeadRows: 0,
+          deadRows: 0,
+        };
+        perTool.set(t.name, agg);
+      }
+      agg.approxTokens = Math.max(agg.approxTokens, t.approxTokens);
+      agg.declaredSessions.add(row.sessionId);
+      if (t.calls > 0) agg.calledSessions.add(row.sessionId);
+      // Histogram counts are session-wide; keep one figure per session so a
+      // session with several toolset variants doesn't double-count calls.
+      agg.callsBySession.set(row.sessionId, t.calls);
+      agg.cumulativeTokens += t.cumulativeTokens;
+      if (t.dead) {
+        agg.deadTokensCumulative += t.cumulativeTokens;
+        agg.deadRows++;
+        const price = row.model ? priceFor(row.model, prices) : null;
+        if (price) {
+          agg.deadCostUsd += (t.cumulativeTokens * price.cacheRead) / 1_000_000;
+          agg.pricedDeadRows++;
+        }
+      }
+    }
+  }
+
+  const tools = [...perTool.values()]
+    .map((a) => ({
+      name: a.name,
+      approxTokens: a.approxTokens,
+      sessionsDeclared: a.declaredSessions.size,
+      sessionsCalled: a.calledSessions.size,
+      calls: [...a.callsBySession.values()].reduce((x, y) => x + y, 0),
+      cumulativeTokens: a.cumulativeTokens,
+      deadTokensCumulative: a.deadTokensCumulative,
+      deadCostUsd: a.pricedDeadRows > 0 ? a.deadCostUsd : null,
+      hasUnpriced: a.deadRows > a.pricedDeadRows,
+    }))
+    .sort((a, b) => b.deadTokensCumulative - a.deadTokensCumulative);
+
+  const sessions = [...perSession.values()]
+    .map(({ dominantRequests: _d, ...s }) => s)
+    .sort((a, b) => b.deadTokensCumulative - a.deadTokensCumulative);
+
+  return {
+    totals: {
+      sessions: sessions.length,
+      tools: tools.length,
+      cumulativeToolTokens,
+      deadTokensCumulative,
+      deadShare: cumulativeToolTokens > 0 ? deadTokensCumulative / cumulativeToolTokens : 0,
+      deadCostUsd: pricedRows > 0 ? deadCostUsd : null,
+      hasUnpriced: unpricedDeadRows > 0,
+    },
+    tools,
+    sessions,
+  };
+}
+
 /** Cached context timelines for the current index state (see timelineFor). */
 const timelineMemo = new Map<string, ContextTimeline>();
 let timelineMemoSig = "";
@@ -759,6 +938,24 @@ export async function handleRequest(
         return;
       }
 
+      // /api/session/<id>/tools — dead-tool-tax for one session: declared
+      // toolsets (from the registry) crossed with the session's call histogram.
+      const toolsMatch = rest.match(/^(.*)\/tools$/);
+      if (toolsMatch) {
+        const sessionId = toolsMatch[1];
+        const session = store.getSession(sessionId);
+        if (!session) {
+          sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
+          return;
+        }
+        const { prices, source } = await getPrices();
+        const toolsets = store
+          .listToolsetUsage(sessionId)
+          .map((row) => taxForUsageRow(row, prices));
+        sendJson(res, 200, { sessionId, toolsets, priceSource: source });
+        return;
+      }
+
       // /api/session/<id>/flow/<nodeId> — full detail for one node, since the
       // graph payload only carries previews.
       const flowMatch = rest.match(/^(.*)\/flow\/(.+)$/);
@@ -841,6 +1038,12 @@ export async function handleRequest(
     if (pathname === "/api/analytics") {
       const { prices, source } = await getPrices();
       sendJson(res, 200, { ...fleetAnalytics(store, prices), priceSource: source });
+      return;
+    }
+
+    if (pathname === "/api/tooltax") {
+      const { prices, source } = await getPrices();
+      sendJson(res, 200, { ...fleetToolTax(store, prices), priceSource: source });
       return;
     }
 

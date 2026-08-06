@@ -80,6 +80,99 @@ before(async () => {
     hookLines.map((e) => JSON.stringify(e)).join("\n") + "\n",
   );
 
+  // Synthetic session with a DEAD tool: declares Read + SleeperTool, only ever
+  // calls Read. Its own system prompt gives it a distinct conversation key so
+  // it cannot merge with the claude fixture session.
+  const deadToolBody = {
+    model: "claude-opus-4",
+    system: "Dead tool tax test system.",
+    messages: [{ role: "user", content: [{ type: "text", text: "go" }] }],
+    tools: [
+      { name: "Read", description: "Read a file", input_schema: {} },
+      {
+        name: "SleeperTool",
+        description: "x".repeat(400),
+        input_schema: { type: "object", properties: {} },
+      },
+    ],
+  };
+  const deadToolPair = (ts) => ({
+    request: {
+      timestamp: ts,
+      method: "POST",
+      url: "https://api.anthropic.com/v1/messages",
+      headers: { "content-type": "application/json" },
+      body: deadToolBody,
+    },
+    response: {
+      timestamp: ts + 1,
+      status_code: 200,
+      body: {
+        model: "claude-opus-4",
+        content: [
+          { type: "text", text: "reading" },
+          { type: "tool_use", id: "tu1", name: "Read", input: { path: "f" } },
+        ],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 100, output_tokens: 10 },
+      },
+    },
+  });
+  fs.writeFileSync(
+    path.join(claudeDir, "deadtool.jsonl"),
+    [deadToolPair(1700000100), deadToolPair(1700000200)]
+      .map((p) => JSON.stringify(p))
+      .join("\n") + "\n",
+  );
+
+  // Session whose toolset CHANGES mid-flight: request 1 declares [Read] and the
+  // response calls Read; request 2 declares [Read, Bash, VariantOnlyTool] and
+  // calls nothing. Call counts must stay scoped to the declaring requests —
+  // Read is alive under variant A but dead under variant B.
+  const variantPair = (ts, tools, callRead) => ({
+    request: {
+      timestamp: ts,
+      method: "POST",
+      url: "https://api.anthropic.com/v1/messages",
+      headers: { "content-type": "application/json" },
+      body: {
+        model: "claude-opus-4",
+        system: "Toolset variant test system.",
+        messages: [{ role: "user", content: [{ type: "text", text: "go" }] }],
+        tools,
+      },
+    },
+    response: {
+      timestamp: ts + 1,
+      status_code: 200,
+      body: {
+        model: "claude-opus-4",
+        content: callRead
+          ? [
+              { type: "text", text: "reading" },
+              { type: "tool_use", id: "tv1", name: "Read", input: { path: "f" } },
+            ]
+          : [{ type: "text", text: "done" }],
+        stop_reason: callRead ? "tool_use" : "end_turn",
+        usage: { input_tokens: 100, output_tokens: 10 },
+      },
+    },
+  });
+  const readTool = { name: "Read", description: "Read a file", input_schema: {} };
+  fs.writeFileSync(
+    path.join(claudeDir, "variant.jsonl"),
+    [
+      variantPair(1700000300, [readTool], true),
+      variantPair(1700000400, [
+        readTool,
+        { name: "Bash", description: "Run a command", input_schema: {} },
+        { name: "VariantOnlyTool", description: "y".repeat(200), input_schema: {} },
+      ], false),
+    ]
+      .map((p) => JSON.stringify(p))
+      .join("\n") + "\n",
+  );
+
   const dbPath = path.join(tmp, "index.db");
   store = new Store(dbPath);
   store.indexPaths([path.join(tmp, "proj")]);
@@ -162,10 +255,10 @@ test("GET /api/sessions returns the seeded sessions", async () => {
   assert.equal(r.status, 200);
   assert.match(r.contentType, /application\/json/);
   const body = JSON.parse(r.text);
-  assert.equal(body.count, 2);
-  assert.equal(body.sessions.length, 2);
+  assert.equal(body.count, 4);
+  assert.equal(body.sessions.length, 4);
   const agents = body.sessions.map((s) => s.agent).sort();
-  assert.deepEqual(agents, ["claude", "codex"]);
+  assert.deepEqual(agents, ["claude", "claude", "claude", "codex"]);
   // documented shape
   for (const key of [
     "sessionId",
@@ -214,7 +307,11 @@ test("GET /api/search returns a hit for a known term", async () => {
 
 test("report route serves the sibling HTML for a known session", async () => {
   const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
-  const id = list.sessions[0].sessionId;
+  // Two claude sessions exist (fixture + dead-tool synthetic); only the
+  // fixture's source log has a sibling .html report.
+  const id = list.sessions.find((s) =>
+    s.sourcePath.endsWith("claude.jsonl"),
+  ).sessionId;
   const r = await get("/report?session=" + encodeURIComponent(id));
   assert.equal(r.status, 200);
   assert.match(r.contentType, /text\/html/);
@@ -252,6 +349,7 @@ test("GET / carries the observatory shell (tabs + inlined assets)", async () => 
   const r = await get("/");
   assert.match(r.text, /id="tabs"/);
   assert.match(r.text, /#analytics/);
+  assert.match(r.text, /data-tab="tooltax"/);
   assert.match(r.text, /\/api\/events/, "SSE client must be wired in");
 });
 
@@ -365,7 +463,13 @@ test("GET /api/session/<id>/context/<seq> returns Context X-Ray with delta", asy
 
 test("GET /api/session/<id>/context/<seq> is memoized until the source log changes", async () => {
   const list = JSON.parse((await get("/api/sessions?agent=claude")).text);
-  const id = list.sessions[0].sessionId;
+  // Must be the session backed by `claudeSource` — this test invalidates the
+  // memo by touching that file's mtime, and the dead-tool/variant synthetics
+  // are claude sessions too, so a positional [0] can pick a session whose
+  // signature the touch never moves.
+  const id = list.sessions.find((s) =>
+    s.sourcePath.endsWith("claude.jsonl"),
+  ).sessionId;
   const url = (seq) => "/api/session/" + encodeURIComponent(id) + "/context/" + seq;
 
   // Every X-Ray costs one read + parse of the whole source JSONL, so what has
@@ -700,4 +804,85 @@ test("exact hook session_id match disables the time join entirely", () => {
     s.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("GET /api/tooltax reports the dead tool across the fleet", async () => {
+  const r = await get("/api/tooltax");
+  assert.equal(r.status, 200);
+  const d = JSON.parse(r.text);
+  assert.ok(d.totals.sessions >= 1);
+  assert.ok(d.totals.cumulativeToolTokens > 0);
+
+  const sleeper = d.tools.find((t) => t.name === "SleeperTool");
+  assert.ok(sleeper, "SleeperTool missing from fleet tool table");
+  assert.equal(sleeper.sessionsCalled, 0);
+  assert.equal(sleeper.calls, 0);
+  // Declared on 2 requests, never called: dead on both.
+  assert.equal(sleeper.deadTokensCumulative, sleeper.approxTokens * 2);
+
+  const read = d.tools.find((t) => t.name === "Read");
+  assert.ok(read);
+  assert.ok(read.sessionsCalled >= 1);
+
+  const deadSession = d.sessions.find((s) => s.deadCount === 1);
+  assert.ok(deadSession, "synthetic dead-tool session missing");
+  assert.equal(deadSession.declaredCount, 2);
+  assert.equal(deadSession.calledCount, 1);
+  assert.equal(deadSession.requestCount, 2);
+  assert.equal(deadSession.deadTokensPerRequest, sleeper.approxTokens);
+});
+
+test("GET /api/session/<id>/tools crosses toolset with histogram (and 404s)", async () => {
+  const usage = store.listToolsetUsage().find((u) => u.toolCount === 2);
+  assert.ok(usage, "synthetic toolset not indexed");
+  // Content addressing: both requests share one toolsets row.
+  assert.equal(usage.requestCount, 2);
+
+  const r = await get(
+    "/api/session/" + encodeURIComponent(usage.sessionId) + "/tools",
+  );
+  assert.equal(r.status, 200);
+  const d = JSON.parse(r.text);
+  assert.equal(d.sessionId, usage.sessionId);
+  assert.equal(d.toolsets.length, 1);
+  const ts = d.toolsets[0];
+  assert.equal(ts.declaredCount, 2);
+  assert.equal(ts.calledCount, 1);
+  assert.equal(ts.deadCount, 1);
+  const dead = ts.tools.find((t) => t.dead);
+  assert.equal(dead.name, "SleeperTool");
+  assert.equal(ts.deadTokensPerRequest, dead.approxTokens);
+  assert.equal(ts.deadTokensCumulative, dead.approxTokens * 2);
+
+  const missing = await get("/api/session/nope/tools");
+  assert.equal(missing.status, 404);
+});
+
+test("toolset variants scope call counts to their own requests", async () => {
+  // The variant session produced two distinct toolset hashes.
+  const counts = new Map();
+  for (const u of store.listToolsetUsage()) {
+    counts.set(u.sessionId, (counts.get(u.sessionId) || 0) + 1);
+  }
+  const variantEntry = [...counts.entries()].find(([, n]) => n === 2);
+  assert.ok(variantEntry, "variant session should carry two toolsets");
+  const sessionId = variantEntry[0];
+
+  const rows = store.listToolsetUsage(sessionId);
+  const a = rows.find((u) => u.toolCount === 1);
+  const b = rows.find((u) => u.toolCount === 3);
+  assert.ok(a && b);
+  // Read's call belongs to variant A's window only.
+  assert.deepEqual(a.toolHistogram, { Read: 1 });
+  assert.deepEqual(b.toolHistogram, {});
+
+  const r = await get("/api/session/" + encodeURIComponent(sessionId) + "/tools");
+  assert.equal(r.status, 200);
+  const d = JSON.parse(r.text);
+  const taxA = d.toolsets.find((t) => t.declaredCount === 1);
+  const taxB = d.toolsets.find((t) => t.declaredCount === 3);
+  assert.equal(taxA.deadCount, 0);
+  // Under variant B nothing was called — Read included, despite its
+  // session-wide call. The old session-wide histogram reported it alive here.
+  assert.equal(taxB.deadCount, 3);
 });
