@@ -10,6 +10,7 @@
   // re-render without another fetch.
   var hooksShowObserveOnly = false;
   var hooksForPane = [];
+  var hooksMetaForPane = null;
 
   var INSPECTOR_EMPTY =
     '<div class="dim inspector-empty">Select a row to inspect its payload</div>';
@@ -2537,6 +2538,9 @@
       steps = data.steps;
     var hooks = data.hooks || [];
     hooksForPane = hooks;
+    hooksMetaForPane = data.hooksMeta
+      ? Object.assign({}, data.hooksMeta, { selfId: (data.session || {}).sessionId })
+      : null;
     var flow = data.flow || { nodes: [], edges: [] };
     var siblings = data.siblings || [];
     stepsForPane = steps;
@@ -3388,11 +3392,36 @@
 
   function renderHooksPane(hooks) {
     if (!hooks.length) {
-      return (
-        '<div class="empty-pane">No hook events for this session.<br/>' +
-        '<span class="dim">Run <code>tracetap hooks install</code> then re-index (<code>tracetap index</code>).<br/>' +
-        "If Flow shows hooks but this pane was blank before, it was a hash-route bug — use the buttons above.</span></div>"
-      );
+      // Say WHICH reason applies. Telling a reader to install and re-index when
+      // the taps are installed and the rows are indexed sends them in circles.
+      var m = hooksMetaForPane || {};
+      var why;
+      if (!m.indexedTotal) {
+        why =
+          "No hooks are indexed at all. Run <code>tracetap hooks install</code>, then " +
+          "<code>tracetap index</code>.";
+      } else if (m.ownerSessionId && m.ownerSessionId !== m.selfId) {
+        why =
+          "This conversation's hooks are shown on its main-thread session: " +
+          '<a href="#session/' +
+          encodeURIComponent(m.ownerSessionId) +
+          '">' +
+          esc(m.ownerSessionId) +
+          "</a>. One conversation splits into several wire sessions, so its hooks " +
+          "are listed once rather than repeated under each.";
+      } else if (!m.claudeSessionId) {
+        why =
+          "This capture carries no <code>x-claude-code-session-id</code> header, so its " +
+          "hooks cannot be identified. " +
+          esc(String(m.indexedTotal)) +
+          " hook events are indexed for other sessions.";
+      } else {
+        why =
+          esc(String(m.indexedTotal)) +
+          " hook events are indexed, but none belong to this conversation — it ran " +
+          "without hooks installed, or the hooks fired in a session that was never captured.";
+      }
+      return '<div class="empty-pane">No hook events for this session.<br/><span class="dim">' + why + "</span></div>";
     }
     var shown = hooksShowObserveOnly ? hooks : signalHooks(hooks);
     var hidden = hooks.length - shown.length;

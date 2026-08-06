@@ -2094,13 +2094,52 @@ export class Store {
   }
 
   /**
-   * Hooks for a wire session: exact `session_id` match OR time-overlap with the
-   * session window (±10 min slack). Wire conversation keys rarely equal Claude's
-   * hook session_id, so time correlation is the practical bridge.
+   * The wire session that OWNS a Claude conversation's hooks, or null.
    *
-   * The time join is fenced so it cannot serve another session's data:
-   * - When any exact `session_id` row exists, the wire id IS the hook session
-   *   id, so the join is skipped outright — it could only add foreign rows.
+   * `hooks.session_id` is Claude Code's conversation uuid, but a conversation
+   * fans out into many wire sessions — they are grouped by system prompt, so a
+   * skill loading mid-session splits the wire session while the conversation,
+   * and its hook stream, runs on unbroken. One capture showed 48 wire sessions
+   * under a single uuid, and 7 of those carried main-thread traffic with
+   * windows nested inside each other, so neither "show it on all of them" nor
+   * a time slice can be right: the first multiplies one hook by 48, and the
+   * second has no unambiguous boundary to cut on.
+   *
+   * Hooks fire on the main thread, so exactly one session is elected: the one
+   * with the most main-thread requests, earliest first on a tie. Subagent-only
+   * groups own nothing — their traffic never fired a hook.
+   */
+  private hookOwnerFor(claudeSessionId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT s.session_id AS id,
+                (SELECT count(*) FROM requests r
+                  WHERE r.session_id = s.session_id AND r.is_subagent = 0) AS main_reqs
+         FROM sessions s
+         WHERE s.claude_session_id = ?
+         ORDER BY main_reqs DESC, s.started_at ASC
+         LIMIT 1`,
+      )
+      .get(claudeSessionId) as { id?: string; main_reqs?: number } | undefined;
+    if (!row?.id || !row.main_reqs) return null;
+    return String(row.id);
+  }
+
+  /**
+   * Hooks for a wire session: identity match on Claude's session uuid, else
+   * time-overlap with the session window (±10 min slack).
+   *
+   * The identity join is the real one. `hooks.session_id` holds the uuid the
+   * tap read from hook stdin, which equals `sessions.claude_session_id` (the
+   * `x-claude-code-session-id` header) and never the wire `session_id` — that
+   * is a system-prompt-group key in a different namespace. Matching wire ids
+   * against hook ids finds nothing, by construction.
+   *
+   * The time join stays as the fallback for captures that carry no uuid at all
+   * (non-Claude agents, pre-header captures), and is fenced so it cannot serve
+   * another session's data:
+   * - When any exact row exists, identity is already established, so the join
+   *   is skipped outright — it could only add foreign rows.
    * - A hook event that carries a `cwd` identity conflicting with this
    *   session's project cwd belongs to a different session and is dropped.
    * - When more than one hook session survives in the window, none can be
@@ -2110,17 +2149,27 @@ export class Store {
    */
   listHooksForSession(sessionId: string): HookRow[] {
     const session = this.getSession(sessionId);
-    const byId = this.db
-      .prepare(
-        `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
+    const select = `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
                 stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
                 payload_json, source_path
-         FROM hooks WHERE session_id = ? ORDER BY ts, id`,
-      )
-      .all(sessionId) as any[];
+         FROM hooks WHERE session_id = ? ORDER BY ts, id`;
+
+    // A hook log keyed by the wire id would match here; none is today, but the
+    // check is cheap and keeps the identity path honest if that ever changes.
+    let byId = this.db.prepare(select).all(sessionId) as any[];
+
+    // The join that actually fires: Claude's uuid, held by one elected owner so
+    // a conversation's hooks appear once rather than under every wire group.
+    const claudeSessionId = this.claudeSessionId(sessionId);
+    if (!byId.length && claudeSessionId && this.hookOwnerFor(claudeSessionId) === sessionId) {
+      byId = this.db.prepare(select).all(claudeSessionId) as any[];
+    }
 
     let byTime: any[] = [];
-    if (session && !byId.length) {
+    // A uuid is positive identity: if it resolved and still produced no rows,
+    // this conversation simply has no hooks, and guessing by clock would serve
+    // a neighbouring session's under it.
+    if (session && !byId.length && !claudeSessionId) {
       const slack = 600; // 10 minutes — long tool calls can lag the wire window
       const start = session.startedAt > 0 ? session.startedAt - slack : 0;
       const end = session.endedAt > 0 ? session.endedAt + slack : Number.MAX_SAFE_INTEGER;
@@ -2154,6 +2203,33 @@ export class Store {
     rows.push(...timeRows);
     rows.sort((a, b) => a.ts - b.ts || a.id - b.id);
     return rows;
+  }
+
+  /**
+   * Why a session's hook pane is empty, so the UI can say which of the three
+   * reasons applies instead of asserting one it never checked.
+   *
+   * The old empty state told every reader to install hooks and re-index. That
+   * is unhelpable advice in the common case: the taps were installed and the
+   * rows were indexed, and the pane was blank because the join was keyed wrong.
+   */
+  hooksMetaForSession(sessionId: string): {
+    indexedTotal: number;
+    claudeSessionId: string | null;
+    ownerSessionId: string | null;
+  } {
+    const total = this.db.prepare("SELECT count(*) AS n FROM hooks").get() as { n: number };
+    const claudeSessionId = this.claudeSessionId(sessionId);
+    // Only name an owner that actually holds rows. Electing one regardless
+    // would point the reader at a session whose pane is just as empty.
+    let ownerSessionId: string | null = null;
+    if (claudeSessionId) {
+      const mine = this.db
+        .prepare("SELECT count(*) AS n FROM hooks WHERE session_id = ?")
+        .get(claudeSessionId) as { n: number };
+      if (mine?.n) ownerSessionId = this.hookOwnerFor(claudeSessionId);
+    }
+    return { indexedTotal: total?.n ?? 0, claudeSessionId, ownerSessionId };
   }
 
   /** Build the Flow graph for one session (steps + hooks + requests). */
