@@ -3394,9 +3394,14 @@
     if (!hooks.length) {
       // Say WHICH reason applies. Telling a reader to install and re-index when
       // the taps are installed and the rows are indexed sends them in circles.
-      var m = hooksMetaForPane || {};
+      var m = hooksMetaForPane;
       var why;
-      if (!m.indexedTotal) {
+      if (!m) {
+        // paneSection() returns null when the section threw. Without this the
+        // `!indexedTotal` branch below would fire and print the install advice
+        // this rewrite exists to delete — asserting a cause from a load failure.
+        why = "Could not determine why — the hook summary failed to load. Reload the page.";
+      } else if (!m.indexedTotal) {
         why =
           "No hooks are indexed at all. Run <code>tracetap hooks install</code>, then " +
           "<code>tracetap index</code>.";
@@ -3415,6 +3420,14 @@
           "hooks cannot be identified. " +
           esc(String(m.indexedTotal)) +
           " hook events are indexed for other sessions.";
+      } else if (m.conversationHookCount) {
+        // Rows are keyed to this conversation but every one named a different
+        // project, so the cwd fence dropped them. Saying "none belong" here
+        // would be false.
+        why =
+          esc(String(m.conversationHookCount)) +
+          " hook events are keyed to this conversation but record a different working " +
+          "directory, so they were withheld rather than attributed to this project.";
       } else {
         why =
           esc(String(m.indexedTotal)) +

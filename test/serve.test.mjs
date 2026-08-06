@@ -1112,6 +1112,113 @@ test("only one wire session owns a conversation's hooks", () => {
   }
 });
 
+test("claude_session_id is stamped by majority, not by whichever header arrived first", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-stamp-"));
+  try {
+    const claudeDir = path.join(dir, "proj", ".claude-trace");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    const minority = "aaaaaaaa-0000-0000-0000-000000000000";
+    const majority = "bbbbbbbb-0000-0000-0000-000000000000";
+    // One group, two conversations: the group key is {system, model} and does
+    // not include the uuid, so a real capture can and does span them. The
+    // minority id is FIRST, which is exactly what used to win.
+    const base = fs
+      .readFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), "utf-8")
+      .trim()
+      .split("\n");
+    const stamp = (line, uuid) => {
+      const p = JSON.parse(line);
+      p.request.headers = { ...(p.request.headers || {}), "x-claude-code-session-id": uuid };
+      return JSON.stringify(p);
+    };
+    fs.writeFileSync(
+      path.join(claudeDir, "claude.jsonl"),
+      [stamp(base[0], minority), stamp(base[1], majority), stamp(base[1], majority)].join("\n") +
+        "\n",
+    );
+    const s = new Store(path.join(dir, "index.db"));
+    s.indexPaths([path.join(dir, "proj")]);
+    const session = s.listSessions({ agent: "claude" })[0];
+    assert.equal(
+      s.claudeSessionId(session.sessionId),
+      majority,
+      "the conversation filling the group wins, not the one that spoke first",
+    );
+    s.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the identity join is fenced by cwd, not trusted outright", () => {
+  const uuid = "77777777-6666-5555-4444-333333333333";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-hookfence-", uuid);
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    // Keyed to this conversation, but recorded in another project. One wire key
+    // can be produced by logs from two projects and `session_id` is a PRIMARY
+    // KEY, so the surviving row can carry the wrong project — the hook's own
+    // cwd is the better witness, and it must be able to overrule identity.
+    writeHookLog(hooksDir, "foreign-cwd.jsonl", [
+      hookEvent({
+        session_id: uuid,
+        stdin_preview: { cwd: "/somewhere/else/entirely" },
+        payload: { prompt: "OTHER-PROJECT-SECRET" },
+      }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    const rows = s.listHooksForSession(session.sessionId);
+    assert.equal(rows.length, 0, "identity does not override a conflicting cwd");
+    assert.ok(!JSON.stringify(rows).includes("OTHER-PROJECT-SECRET"));
+
+    // ...and the pane must not then claim no hooks belong to the conversation.
+    assert.equal(s.hooksMetaForSession(session.sessionId).conversationHookCount, 1);
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Flow and compaction triggers read the conversation, not just the elected owner", () => {
+  const uuid = "44444444-3333-2222-1111-000000000000";
+  const { dir, store: s, session } = makeIdentifiedClaudeStore("tracetap-hookflow-", uuid);
+  try {
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(hooksDir);
+    writeHookLog(hooksDir, "real.jsonl", [
+      hookEvent({ session_id: uuid, event: "PreCompact", hook_name: "pre" }),
+    ]);
+    s.indexHooks(hooksDir);
+
+    // A sibling group of the same conversation, which the election will not pick.
+    s.db
+      .prepare(
+        `INSERT INTO sessions(session_id, agent, project_cwd, started_at, ended_at,
+                              source_path, content_hash, claude_session_id)
+         SELECT 'claude:sibling', agent, project_cwd, started_at, ended_at,
+                source_path, content_hash, claude_session_id
+         FROM sessions WHERE session_id = ?`,
+      )
+      .run(session.sessionId);
+
+    // The pane defers to the owner — that is the presentation rule...
+    assert.equal(s.listHooksForSession("claude:sibling").length, 0);
+    // ...but Flow describes what happened during THIS session, so a non-owner
+    // must still see the events. Owner-scoping here degraded every compaction
+    // trigger to `unknown`.
+    const flow = s.sessionFlow("claude:sibling");
+    assert.ok(
+      flow.nodes.some((n) => n.kind === "hook"),
+      "sibling's Flow graph still carries the conversation's hook nodes",
+    );
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("GET /api/tooltax reports the dead tool across the fleet", async () => {
   const r = await get("/api/tooltax");
   assert.equal(r.status, 200);

@@ -526,23 +526,46 @@ function projectCwdFor(sourcePath: string): string {
  * that — but it is exactly right here: the transcript belongs to the session as
  * a whole.
  *
- * Takes the first value seen. A group is one conversation by construction, and
- * where a capture spans a `--resume` the first id is the one whose transcript
- * holds the earlier boundaries.
+ * Takes the value carried by the MOST requests, not the first one seen. A group
+ * is keyed on {system, model}, which does not include the uuid, so a group is
+ * NOT one conversation by construction — the earlier claim that it was is the
+ * reason this used to be first-seen. On a live capture one log file carried 13
+ * distinct uuids, and the 838-request group `claude:b07ec8dc` was stamped with
+ * a uuid holding 16 of them because its header happened to arrive first, while
+ * the conversation actually filling the group had 2,593.
+ *
+ * That mis-stamp is not cosmetic: this value is the join key to the hook stream
+ * and to `~/.claude/projects/<slug>/<uuid>.jsonl`, so a minority stamp serves
+ * one conversation's hooks and compaction records under another's session.
+ * Majority is still a heuristic — a group spanning two conversations has no
+ * single right answer — but it cannot be decided by header arrival order.
+ *
+ * Ties break toward the first seen, which restores the old behaviour for the
+ * genuinely ambiguous case.
  *
  * @returns the uuid, or null for non-Claude agents and pre-header captures.
  */
 function claudeSessionIdOf(group: PairGroup): string | null {
+  const counts = new Map<string, number>();
   for (const pair of group.pairs) {
     const headers = pair?.request?.headers;
     if (!headers) continue;
     for (const [k, v] of Object.entries(headers)) {
       if (k.toLowerCase() !== "x-claude-code-session-id") continue;
       const s = String(v ?? "").trim();
-      if (/^[0-9a-fA-F-]{36}$/.test(s)) return s;
+      if (/^[0-9a-fA-F-]{36}$/.test(s)) counts.set(s, (counts.get(s) ?? 0) + 1);
     }
   }
-  return null;
+  let best: string | null = null;
+  let bestN = 0;
+  // Insertion order is first-seen order, so a strict `>` keeps the earliest on a tie.
+  for (const [id, n] of counts) {
+    if (n > bestN) {
+      best = id;
+      bestN = n;
+    }
+  }
+  return best;
 }
 
 /**
@@ -684,6 +707,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source_path);
       CREATE INDEX IF NOT EXISTS idx_sessions_agent  ON sessions(agent);
       CREATE INDEX IF NOT EXISTS idx_sessions_model  ON sessions(model);
+      -- The hook join key. Every session pane resolves an owner through it, and
+      -- IF NOT EXISTS means existing databases pick it up without a reindex.
+      CREATE INDEX IF NOT EXISTS idx_sessions_claude ON sessions(claude_session_id);
       CREATE VIRTUAL TABLE IF NOT EXISTS steps_fts USING fts5(
         session_id UNINDEXED,
         step_index UNINDEXED,
@@ -2106,23 +2132,74 @@ export class Store {
    * second has no unambiguous boundary to cut on.
    *
    * Hooks fire on the main thread, so exactly one session is elected: the one
-   * with the most main-thread requests, earliest first on a tie. Subagent-only
-   * groups own nothing — their traffic never fired a hook.
+   * with the most main-thread requests, earliest first on a tie.
+   *
+   * A conversation whose groups are ALL subagent traffic still elects one —
+   * the earliest. Electing nobody would strand its hooks where no pane could
+   * reach them, and "unreachable" is a worse answer than "shown on the earliest
+   * group of the conversation they belong to".
+   *
+   * This is a presentation rule, so it belongs only to the pane path. Consumers
+   * that need the conversation's whole hook stream regardless of which group is
+   * being viewed use `listHooksForConversation`.
    */
   private hookOwnerFor(claudeSessionId: string): string | null {
     const row = this.db
       .prepare(
-        `SELECT s.session_id AS id,
-                (SELECT count(*) FROM requests r
-                  WHERE r.session_id = s.session_id AND r.is_subagent = 0) AS main_reqs
+        `SELECT s.session_id AS id
          FROM sessions s
          WHERE s.claude_session_id = ?
-         ORDER BY main_reqs DESC, s.started_at ASC
+         ORDER BY (SELECT count(*) FROM requests r
+                    WHERE r.session_id = s.session_id AND r.is_subagent = 0) DESC,
+                  s.started_at ASC
          LIMIT 1`,
       )
-      .get(claudeSessionId) as { id?: string; main_reqs?: number } | undefined;
-    if (!row?.id || !row.main_reqs) return null;
-    return String(row.id);
+      .get(claudeSessionId) as { id?: string } | undefined;
+    return row?.id ? String(row.id) : null;
+  }
+
+  /**
+   * Every hook of the conversation this session belongs to, with no election.
+   *
+   * The owner election answers "which pane should list this hook once", which is
+   * the wrong question for anything deriving BEHAVIOUR from hooks: the Flow
+   * graph and `compactionTriggers` need the events that actually fired during
+   * the session they are describing, and the group that compacted is often not
+   * the group with the most main-thread requests.
+   */
+  private listHooksForConversation(sessionId: string): HookRow[] {
+    const claudeSessionId = this.claudeSessionId(sessionId);
+    if (!claudeSessionId) return this.listHooksForSession(sessionId);
+    const rows = this.db
+      .prepare(
+        `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
+                stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
+                payload_json, source_path
+         FROM hooks WHERE session_id = ? ORDER BY ts, id`,
+      )
+      .all(claudeSessionId) as any[];
+    return this.fenceHookRows(rows.map(hookRowFromDb), this.getSession(sessionId)?.projectCwd);
+  }
+
+  /**
+   * Drop rows whose `cwd` names a different project than the session's.
+   *
+   * The tap records Claude's cwd in the stdin preview, so a mismatch is positive
+   * identity for a DIFFERENT session. A hook with no recorded cwd still passes:
+   * absence is not evidence of being foreign.
+   *
+   * This guards the identity path too, not just the time join. `session_id` is
+   * a PRIMARY KEY and one wire key can be produced by logs from two different
+   * projects, so the surviving row can be stamped from the wrong one — the cwd
+   * on the hook itself is the more trustworthy witness.
+   */
+  private fenceHookRows(rows: HookRow[], projectCwd: string | undefined): HookRow[] {
+    const sessionCwd = normalizeCwd(projectCwd);
+    if (!sessionCwd) return rows;
+    return rows.filter((row) => {
+      const hookCwd = normalizeCwd((row.stdinPreview as any)?.cwd);
+      return !hookCwd || hookCwd === sessionCwd;
+    });
   }
 
   /**
@@ -2185,17 +2262,11 @@ export class Store {
         .all(start, end) as any[];
     }
 
-    const rows: HookRow[] = byId.map(hookRowFromDb);
-    const sessionCwd = normalizeCwd(session?.projectCwd);
-    const timeRows: HookRow[] = [];
-    for (const r of byTime) {
-      const row = hookRowFromDb(r);
-      // The tap records Claude's cwd in the stdin preview; a mismatch with the
-      // wire session's project is positive identity for a DIFFERENT session.
-      const hookCwd = normalizeCwd((row.stdinPreview as any)?.cwd);
-      if (hookCwd && sessionCwd && hookCwd !== sessionCwd) continue;
-      timeRows.push(row);
-    }
+    // Fenced on BOTH arms now. `claude_session_id` is a majority vote over a
+    // group that can span conversations, so identity is strong evidence, not
+    // proof — and a hook naming a different project is proof against it.
+    const rows: HookRow[] = this.fenceHookRows(byId.map(hookRowFromDb), session?.projectCwd);
+    const timeRows: HookRow[] = this.fenceHookRows(byTime.map(hookRowFromDb), session?.projectCwd);
     const hookSessions = new Set(timeRows.map((r) => r.sessionId));
     if (hookSessions.size > 1) {
       for (const row of timeRows) row.payload = null;
@@ -2217,26 +2288,31 @@ export class Store {
     indexedTotal: number;
     claudeSessionId: string | null;
     ownerSessionId: string | null;
+    conversationHookCount: number;
   } {
     const total = this.db.prepare("SELECT count(*) AS n FROM hooks").get() as { n: number };
     const claudeSessionId = this.claudeSessionId(sessionId);
     // Only name an owner that actually holds rows. Electing one regardless
     // would point the reader at a session whose pane is just as empty.
     let ownerSessionId: string | null = null;
+    let conversationHookCount = 0;
     if (claudeSessionId) {
       const mine = this.db
         .prepare("SELECT count(*) AS n FROM hooks WHERE session_id = ?")
         .get(claudeSessionId) as { n: number };
-      if (mine?.n) ownerSessionId = this.hookOwnerFor(claudeSessionId);
+      conversationHookCount = mine?.n ?? 0;
+      if (conversationHookCount) ownerSessionId = this.hookOwnerFor(claudeSessionId);
     }
-    return { indexedTotal: total?.n ?? 0, claudeSessionId, ownerSessionId };
+    return { indexedTotal: total?.n ?? 0, claudeSessionId, ownerSessionId, conversationHookCount };
   }
 
   /** Build the Flow graph for one session (steps + hooks + requests). */
   sessionFlow(sessionId: string): FlowGraph {
     return deriveFlow({
       steps: this.listSteps(sessionId),
-      hooks: this.listHooksForSession(sessionId),
+      // Conversation-scoped, not owner-scoped: Flow describes what happened
+      // during THIS session, and a non-owner group still fired hooks.
+      hooks: this.listHooksForConversation(sessionId),
       requests: this.listRequests(sessionId),
     });
   }
@@ -2465,7 +2541,10 @@ export class Store {
   ): Map<number, CompactionTrigger> {
     const out = new Map<number, CompactionTrigger>();
     if (!compactionTimes.length) return out;
-    const pre = this.listHooksForSession(sessionId)
+    // Conversation-scoped: the group that compacted is often not the group with
+    // the most main-thread requests, so an owner-scoped read would hand back []
+    // and every trigger would degrade to `unknown`.
+    const pre = this.listHooksForConversation(sessionId)
       .filter((h) => h.event === "PreCompact")
       .sort((a, b) => a.ts - b.ts);
     if (!pre.length) return out;
