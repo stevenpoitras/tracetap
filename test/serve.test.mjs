@@ -1160,9 +1160,11 @@ test("bumping past schema 8 re-stamps a closed log with the majority uuid", () =
       majority,
       "the closed log picks up majority stamping — the whole point of the bump",
     );
-    assert.equal(
-      s.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value,
-      "9",
+    // Asserted as "advanced past the seeded 8", not as a literal: every later
+    // derived-data change bumps this again, and pinning the number would make
+    // each of those bumps look like a test failure.
+    assert.ok(
+      Number(s.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value) > 8,
       "and the database records the version that did it",
     );
     s.close();
