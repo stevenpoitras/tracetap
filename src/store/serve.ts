@@ -1321,6 +1321,14 @@ export async function handleRequest(
       if (project) filters.project = project;
       if (tool) filters.tool = tool;
       if (qtext) filters.q = qtext;
+      // Explicit only. The store defaults to "any" and so does this endpoint,
+      // because narrowing is the caller's business: the sessions pane asks for
+      // `main`, while `/api/session/<id>` and the sibling walk both route
+      // through the same listSessions and must keep resolving a subagent group.
+      const thread = firstParam(q.get("thread") ?? undefined);
+      if (thread === "main" || thread === "subagent" || thread === "any") {
+        filters.thread = thread;
+      }
       if (q.get("errored") === "1" || q.get("errored") === "true") filters.errored = true;
       if (sort) filters.sort = sort;
       if (order === "asc" || order === "desc") filters.order = order;

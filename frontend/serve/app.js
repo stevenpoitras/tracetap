@@ -2191,6 +2191,11 @@
     model: "",
     project: "",
     errored: false,
+    // The list opens on main-thread sessions. A fan-out's traffic is grouped
+    // separately (a subagent's system prompt differs from its parent's, and
+    // tracetap groups by system prompt), so on a live index 37 of 99 rows were
+    // subagent buckets interleaved with the sessions you actually started.
+    subagents: false,
   };
 
   var SESSION_COLS = [
@@ -2226,6 +2231,9 @@
       '<label class="check"><input id="f-errored" type="checkbox"' +
       (sess.errored ? " checked" : "") +
       "/> errored only</label>" +
+      '<label class="check" title="Subagent traffic is grouped into its own sessions, not folded into the parent that spawned it."><input id="f-subagents" type="checkbox"' +
+      (sess.subagents ? " checked" : "") +
+      "/> include subagents</label>" +
       "</div>" +
       '<div class="meta-line" id="meta">Loading…</div>' +
       '<div class="tbl-wrap"><table><thead><tr id="head"></tr></thead><tbody id="rows">' +
@@ -2239,9 +2247,9 @@
         .getElementById(id)
         .addEventListener("input", debounce(onSessionControls, 200));
     });
-    document
-      .getElementById("f-errored")
-      .addEventListener("change", onSessionControls);
+    ["f-errored", "f-subagents"].forEach(function (id) {
+      document.getElementById(id).addEventListener("change", onSessionControls);
+    });
     loadSessionData();
   }
 
@@ -2251,6 +2259,7 @@
     sess.model = document.getElementById("f-model").value.trim();
     sess.project = document.getElementById("f-project").value.trim();
     sess.errored = document.getElementById("f-errored").checked;
+    sess.subagents = document.getElementById("f-subagents").checked;
     loadSessionData();
   }
 
@@ -2264,6 +2273,7 @@
     if (sess.model) p.set("model", sess.model);
     if (sess.project) p.set("project", sess.project);
     if (sess.errored) p.set("errored", "1");
+    if (!sess.subagents) p.set("thread", "main");
     return p;
   }
 
@@ -2286,7 +2296,10 @@
   // The session count leads either way — it is the same list being counted, and
   // saying so is what makes the query read as a filter rather than a mode.
   function sessionMetaText(data) {
-    var base = data.count + " session" + (data.count === 1 ? "" : "s");
+    var base =
+      data.count +
+      (sess.subagents ? " session" : " main-thread session") +
+      (data.count === 1 ? "" : "s");
     if (!sess.q) return base;
     var hits = (data.sessions || []).reduce(function (n, s) {
       return n + ((s.match && s.match.hits) || 0);
@@ -2354,8 +2367,14 @@
     if (!sessions.length) {
       rows.innerHTML = "";
       empty.style.display = "block";
+      // Under a query the default narrowing is the likeliest reason for an
+      // empty table, and a filter you forgot you were under reads as a broken
+      // search — so name it rather than leaving the user to rediscover the box.
       empty.innerHTML = sess.q
-        ? "No sessions match “" + esc(sess.q) + "”."
+        ? "No sessions match “" +
+          esc(sess.q) +
+          "”." +
+          (sess.subagents ? "" : " Subagent traffic is excluded — tick “include subagents” to search it too.")
         : "No indexed sessions. Capture with <code>tracetap claude|codex|gemini</code>, then run <code>tracetap index</code>.";
       return;
     }
@@ -5997,6 +6016,11 @@
     // "applies to every figure on this page" was false for exactly this block:
     // pick a window in early August and the newest rows were still from today.
     var p = anScopeParams();
+    // Main thread only. Six rows of "You are an INDEPENDENT REVIEWER for PR
+    // #390…" is a list of things the fleet was told to do, not of things you
+    // were doing — and a recency shortcut you cannot recognise yourself in is
+    // not a shortcut. The full list's "include subagents" box is the door back.
+    p.set("thread", "main");
     p.set("limit", "6");
     fetchJSON("/api/sessions?" + p)
       .then(function (d) {
@@ -7184,7 +7208,9 @@
       };
     });
     Promise.all([
-      fetchJSON("/api/sessions?limit=200").catch(function () {
+      // Same reasoning as the recency block: the palette is primary navigation,
+      // so it lists the sessions you started, not the fan-outs they spawned.
+      fetchJSON("/api/sessions?thread=main&limit=200").catch(function () {
         return { sessions: [] };
       }),
       fetchJSON("/api/prompts").catch(function () {
