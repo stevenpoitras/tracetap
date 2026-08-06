@@ -49,10 +49,37 @@ test("discoverLogFiles finds every trace log under a root, skipping noise", () =
   assert.ok(!files.some((f) => f.includes("node_modules")), "node_modules must be skipped");
 });
 
+test("a log that cannot be read is reported, not silently skipped", () => {
+  // The whole point: an unreadable log used to be indistinguishable from one
+  // with nothing new in it, which is how an oversized capture went unnoticed.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tracetap-unreadable-"));
+  const traceDir = path.join(dir, "proj", ".claude-trace");
+  fs.mkdirSync(traceDir, { recursive: true });
+  const good = path.join(traceDir, "good.jsonl");
+  const bad = path.join(traceDir, "bad.jsonl");
+  fs.copyFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), good);
+  fs.copyFileSync(path.join(TRAJ_FIX, "claude-tooluse.jsonl"), bad);
+  fs.chmodSync(bad, 0o000);
+  const s = new Store(path.join(dir, "index.db"));
+  try {
+    const res = s.indexPaths([path.join(dir, "proj")]);
+    // The walk continues past the failure.
+    assert.equal(res.filesIndexed, 1);
+    assert.equal(res.failures.length, 1);
+    assert.equal(res.failures[0].sourcePath, bad);
+    assert.match(res.failures[0].error, /EACCES|permission/i);
+  } finally {
+    fs.chmodSync(bad, 0o600);
+    s.close?.();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("index builds the db from a dir of fixtures", () => {
   const res = store.indexPaths([path.join(tmp, "proj")]);
   assert.equal(res.filesIndexed, 3);
   assert.equal(res.filesSkipped, 0);
+  assert.deepEqual(res.failures, []);
   // claude + codex + errored = 3 trajectories/sessions.
   assert.equal(res.sessions, 3);
   assert.ok(res.steps >= 7, `expected several steps, got ${res.steps}`);

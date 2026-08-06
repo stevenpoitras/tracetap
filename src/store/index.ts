@@ -1,12 +1,13 @@
 import * as fs from "fs";
 import { sessionTitle } from "./title.js";
+import { hashFile, parseJsonlFile } from "../jsonl.js";
 import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
 import Database from "better-sqlite3";
 import type { Database as DatabaseType } from "better-sqlite3";
 import type { RawPair } from "../types";
-import { buildTrajectory, groupPairs } from "../trajectory";
+import { buildTrajectory, conversationIdOf, groupPairs } from "../trajectory";
 import type { PairGroup, Trajectory, Step } from "../trajectory";
 import { analyze, costForMetrics, priceFor } from "../analytics";
 import type { PriceTable } from "../analytics";
@@ -128,6 +129,15 @@ export interface IndexResult {
   filesSkipped: number;
   sessions: number;
   steps: number;
+  /**
+   * Logs that threw and were passed over, with the reason.
+   *
+   * Reported rather than swallowed: a file that silently fails to index is
+   * indistinguishable from one with nothing new in it, and that is exactly how
+   * an oversized log went unnoticed until the dashboard was missing a week of
+   * sessions. One log failing must not stop the walk — but it must be sayable.
+   */
+  failures: { sourcePath: string; error: string }[];
 }
 
 export interface SessionListFilters {
@@ -826,8 +836,11 @@ export class Store {
   indexFile(jsonlPath: string, opts?: { projectCwd?: string }): IndexFileResult {
     const sourcePath = path.resolve(jsonlPath);
     const st = fs.statSync(sourcePath);
-    const content = fs.readFileSync(sourcePath, "utf-8");
-    const contentHash = crypto.createHash("sha256").update(content).digest("hex");
+    // Streamed, never slurped: past ~512 MB a whole-file string throws
+    // ERR_STRING_TOO_LONG, and the per-file catch in `indexPaths` turned that
+    // into a silently skipped log rather than a reported failure. Hashed before
+    // parsing so the common "unchanged" answer costs one read and no JSON.
+    const contentHash = hashFile(sourcePath);
 
     const prior = this.db
       .prepare("SELECT content_hash FROM files WHERE source_path = ?")
@@ -836,7 +849,8 @@ export class Store {
       return { sourcePath, skipped: true, sessions: 0, steps: 0 };
     }
 
-    const pairs = parsePairs(content);
+    const { records: pairs } = parseJsonlFile<RawPair>(sourcePath);
+
     const groups = groupPairs(pairs);
     // File-scoped, NOT group-scoped. Sessions are grouped by system prompt, and
     // a subagent's system prompt differs from its parent's — so a subagent's
@@ -1143,6 +1157,7 @@ export class Store {
     const effectiveRoots = roots && roots.length > 0 ? roots : [process.cwd(), os.homedir()];
     const files = discoverLogFiles(effectiveRoots, maxDepth);
     const results: IndexFileResult[] = [];
+    const failures: { sourcePath: string; error: string }[] = [];
     let filesIndexed = 0;
     let filesSkipped = 0;
     let sessions = 0;
@@ -1151,7 +1166,8 @@ export class Store {
       let res: IndexFileResult;
       try {
         res = this.indexFile(file);
-      } catch {
+      } catch (err) {
+        failures.push({ sourcePath: file, error: (err as Error)?.message ?? String(err) });
         continue;
       }
       results.push(res);
@@ -1166,7 +1182,7 @@ export class Store {
     } catch {
       /* hooks dir may be absent */
     }
-    return { files: results, filesIndexed, filesSkipped, sessions, steps };
+    return { files: results, filesIndexed, filesSkipped, sessions, steps, failures };
   }
 
   // -- search --------------------------------------------------------------
@@ -1964,8 +1980,9 @@ export class Store {
   indexHookFile(jsonlPath: string): { sourcePath: string; skipped: boolean; events: number } {
     const sourcePath = path.resolve(jsonlPath);
     const st = fs.statSync(sourcePath);
-    const content = fs.readFileSync(sourcePath, "utf-8");
-    const contentHash = crypto.createHash("sha256").update(content).digest("hex");
+    // Same streamed read as the traffic logs. A hook log grows one line per
+    // fire and outlives many sessions, so it hits the string ceiling too.
+    const contentHash = hashFile(sourcePath);
     const prior = this.db
       .prepare("SELECT content_hash FROM hook_files WHERE source_path = ?")
       .get(sourcePath) as { content_hash: string } | undefined;
@@ -1973,19 +1990,11 @@ export class Store {
       return { sourcePath, skipped: true, events: 0 };
     }
 
-    const events: HookEvent[] = [];
-    for (const raw of content.split("\n")) {
-      const line = raw.trim();
-      if (!line) continue;
-      try {
-        const ev = JSON.parse(line) as HookEvent;
-        if (ev && (ev.v === HOOK_EVENT_VERSION || ev.v === 1) && ev.session_id && ev.event) {
-          events.push(ev);
-        }
-      } catch {
-        continue;
-      }
-    }
+    const { records: events } = parseJsonlFile<HookEvent>(
+      sourcePath,
+      (ev) =>
+        !!ev && (ev.v === HOOK_EVENT_VERSION || ev.v === 1) && !!ev.session_id && !!ev.event,
+    );
 
     const run = this.db.transaction(() => {
       this.db.prepare("DELETE FROM hooks WHERE source_path = ?").run(sourcePath);
@@ -2170,20 +2179,25 @@ export class Store {
   private loadSessionPairs(sessionId: string): RawPair[] | null {
     const session = this.getSession(sessionId);
     if (!session?.sourcePath) return null;
-    let content: string;
+    // Pairs in the file may span multiple conversation groups, so this session's
+    // are selected AS THEY PARSE rather than by grouping the whole file and
+    // discarding the rest — one live 888 MB log held 40 conversations, and the
+    // caller wants one. Streamed for the same reason: slurping it would throw
+    // ERR_STRING_TOO_LONG, which this method's `catch` used to turn into a bare
+    // "No request body" 404 in the X-Ray pane.
+    let pairs: RawPair[];
     try {
-      content = fs.readFileSync(session.sourcePath, "utf-8");
+      pairs = parseJsonlFile<RawPair>(
+        session.sourcePath,
+        (p) => conversationIdOf(p) === sessionId,
+      ).records;
     } catch {
       return null;
     }
-    const pairs = parsePairs(content);
-    // Pairs in the file may span multiple conversation groups; filter to this
-    // session. No fallback: the grouping is deterministic over content, so a
-    // miss means the file no longer holds this conversation — answer null (the
-    // routes 404) rather than another session's bodies.
-    const groups = groupPairs(pairs);
-    const group = groups.find((g) => g.sessionId === sessionId);
-    return group ? group.pairs : null;
+    // No fallback: the grouping is deterministic over content, so a miss means
+    // the file no longer holds this conversation — answer null (the routes 404)
+    // rather than another session's bodies.
+    return pairs.length ? pairs : null;
   }
 
   /**
@@ -2563,19 +2577,6 @@ function promptSummaryFromRow(r: any): PromptSummary {
 // Parsing / FTS query / snippets
 // ---------------------------------------------------------------------------
 
-function parsePairs(content: string): RawPair[] {
-  const pairs: RawPair[] = [];
-  for (const raw of content.split("\n")) {
-    const line = raw.trim();
-    if (!line) continue;
-    try {
-      pairs.push(JSON.parse(line) as RawPair);
-    } catch {
-      // Skip malformed lines.
-    }
-  }
-  return pairs;
-}
 
 /**
  * Build a safe FTS5 MATCH expression from a free-text query. The query is

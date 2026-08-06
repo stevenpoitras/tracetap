@@ -12,6 +12,7 @@ import type { RawPair } from "../types";
 import type { AtifTrajectory } from "./types";
 import { logToAtif } from "./from-trajectory";
 import { redactBodies, type RedactMode } from "../redact";
+import { parseJsonlFile } from "../jsonl";
 
 /**
  * Body-level secret redaction for the export path. Export defaults redaction
@@ -64,17 +65,7 @@ export function readPairsFromJsonl(jsonlFile: string): RawPair[] {
   if (!fs.existsSync(jsonlFile)) {
     throw new Error(`File '${jsonlFile}' not found.`);
   }
-  const pairs: RawPair[] = [];
-  for (const raw of fs.readFileSync(jsonlFile, "utf-8").split("\n")) {
-    const line = raw.trim();
-    if (!line) continue;
-    try {
-      pairs.push(JSON.parse(line) as RawPair);
-    } catch {
-      // Skip invalid lines silently.
-    }
-  }
-  return pairs;
+  return parseJsonlFile<RawPair>(jsonlFile).records;
 }
 
 /**
