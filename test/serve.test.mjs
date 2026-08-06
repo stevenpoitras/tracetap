@@ -594,6 +594,67 @@ test("GET /api/analytics scopes EVERY rollup by since/until/agent", async () => 
   assert.match(JSON.parse(bad.text).error, /Unrecognized date/);
 });
 
+// The analytics spine hands /api/sessions a YYYY-MM-DD string. Before this,
+// /api/sessions accepted since/until ONLY as epoch numbers and silently dropped
+// anything else — so picking 8/2 in the scope bar left "Jump back in" showing
+// today's sessions. Silence is the bug: a rejected filter must either apply or
+// 400, never be discarded.
+test("GET /api/sessions accepts date strings, not only epochs", async () => {
+  const all = JSON.parse((await get("/api/sessions?limit=500")).text);
+  assert.ok(all.sessions.length > 0, "fixtures produced sessions");
+
+  const none = JSON.parse(
+    (await get("/api/sessions?since=1990-01-01&until=1990-01-02&limit=500")).text,
+  );
+  assert.equal(none.sessions.length, 0, "a date window that excludes everything must empty the list");
+
+  // Epoch form still works — the parser widened, it did not swap.
+  const epoch = JSON.parse((await get("/api/sessions?since=0&limit=500")).text);
+  assert.equal(epoch.sessions.length, all.sessions.length);
+
+  const bad = await get("/api/sessions?since=not-a-date");
+  assert.equal(bad.status, 400, "unparseable dates are a client error, not a silent no-op");
+  assert.match(JSON.parse(bad.text).error, /Unrecognized date/);
+});
+
+test("GET /api/activity returns a gapless daily spine that scopes /api/sessions", async () => {
+  const a = JSON.parse((await get("/api/activity")).text);
+  assert.ok(Array.isArray(a.days) && a.days.length > 0);
+  assert.equal(a.minDate, a.days[0].date);
+  assert.equal(a.maxDate, a.days[a.days.length - 1].date);
+
+  // Gapless by construction: the brush maps x -> column index -> date, so one
+  // missing quiet day would shift every date to its left by one.
+  for (const d of a.days) assert.match(d.date, /^\d{4}-\d{2}-\d{2}$/);
+  for (let i = 1; i < a.days.length; i++) {
+    assert.ok(a.days[i].date > a.days[i - 1].date, "days ascend");
+    const prev = new Date(a.days[i - 1].date + "T00:00:00");
+    prev.setDate(prev.getDate() + 1);
+    const expected =
+      prev.getFullYear() +
+      "-" +
+      String(prev.getMonth() + 1).padStart(2, "0") +
+      "-" +
+      String(prev.getDate()).padStart(2, "0");
+    assert.equal(a.days[i].date, expected, "no day is skipped");
+  }
+
+  // Only the agent filter applies — the spine is the control you pick a scope
+  // WITH, so date-scoping it would shrink it to the window it just chose.
+  const claude = JSON.parse((await get("/api/activity?agent=claude")).text);
+  const sum = (x) => x.days.reduce((n, d) => n + d.sessions, 0);
+  assert.ok(sum(claude) > 0);
+  assert.ok(sum(claude) < sum(a), "codex sessions dropped from the spine");
+
+  // Round-trip: the range the spine reports must be the range that selects
+  // everything. If these disagree, dragging to full width would hide rows.
+  const full = JSON.parse(
+    (await get(`/api/sessions?since=${a.minDate}&until=${a.maxDate}&limit=500`)).text,
+  );
+  const unscoped = JSON.parse((await get("/api/sessions?limit=500")).text);
+  assert.equal(full.sessions.length, unscoped.sessions.length);
+});
+
 test("/api/usage and /api/analytics agree on one scope", async () => {
   const scope = "?agent=claude";
   const usage = JSON.parse((await get("/api/usage" + scope + "&granularity=total")).text);

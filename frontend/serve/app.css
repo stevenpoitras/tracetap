@@ -3270,6 +3270,70 @@ button.jr-bk:focus-visible { outline: 1px solid var(--bright); outline-offset: 2
    no longer needs to stretch to fill one. */
 .an-side .chart-box { margin-bottom: var(--sp-6); }
 
+/* -- analytics scope spine ------------------------------------------------ */
+/* Fleet-scale scope brush, replacing two <input type="date">. Same idiom as the
+   journey strip (.jr-strip) at session scale — columns as the unit, hit-tested
+   on X alone — but a RANGE rather than a single cursor, which changes what gets
+   painted: the selected BAND, not one column.
+   Every day fits (flex: 1 1 0, no scroll) because the drag maps clientX to a
+   column and a scrolled-out column has no honest x. */
+#an-spine-host { margin: var(--sp-3) 0 var(--sp-4); }
+.an-spine {
+  display: flex;
+  align-items: flex-end;
+  height: 46px;
+  padding-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  cursor: ew-resize;
+  user-select: none;
+  overflow: hidden;
+}
+.an-spine:focus-visible { outline: 1px solid var(--accent, #7f8fff); outline-offset: 2px; }
+.an-spine.empty {
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+}
+/* No gap between columns: at 400 days a 1px gutter is a third of the strip, and
+   a contiguous selection should read as one band rather than a picket fence. */
+.sp-col {
+  flex: 1 1 0;
+  min-width: 1px;
+  align-self: stretch;
+  display: flex;
+  align-items: flex-end;
+}
+.sp-bar {
+  display: block;
+  width: 100%;
+  /* An idle day is still a day you can drag across, so it keeps a baseline
+     tick rather than rendering as nothing. */
+  min-height: 1px;
+  background: var(--mid);
+  opacity: 0.55;
+  border-radius: 1px 1px 0 0;
+}
+.sp-col:hover .sp-bar { opacity: 0.9; }
+/* Background carries the range, bar carries the day. An outline per column
+   would draw thirty vertical rules across a selected month; and a zero-session
+   day inside the range has no bar to tint, so only the band can show it. */
+.sp-col.on { background: rgba(127, 143, 255, 0.16); }
+.sp-col.on .sp-bar { background: var(--accent, #7f8fff); opacity: 1; }
+.sp-axis {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-top: var(--sp-2);
+  color: var(--dim);
+  font-size: var(--fs-200);
+}
+.sp-axis-mid { color: var(--bright); }
+/* An empty result under a scope is an answer, so it gets the padding a row
+   would have had rather than collapsing the block to nothing. */
+.dim.pad { padding: var(--sp-4) 0; }
+
 /* Bottom tables: per-model, per-agent and top-tools are three narrow things
    that were stacked into 1177px of column. */
 .an-tables-grid {

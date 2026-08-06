@@ -5224,19 +5224,214 @@
       }).join("");
   }
 
+  // ------------------------------------------------------- the scope spine
+  /**
+   * The date range is picked by dragging a strip of daily activity, not by
+   * typing into two <input type="date">.
+   *
+   * Two reasons it is not a cosmetic swap. First, a date input asks you to
+   * already know when the thing you are looking for happened — but the question
+   * this pane answers is "when was the fleet busy", so the control should SHOW
+   * that and let you grab it. Second, the same scrub idiom already carries the
+   * per-session journey strip; reusing it means one gesture reads the same way
+   * at both zoom levels — a session's turns there, an agent fleet's days here.
+   *
+   * `an.since` / `an.until` stay the single source of truth as `YYYY-MM-DD`
+   * strings, so ISO ordering IS chronological ordering and range tests are
+   * plain string compares.
+   */
+  var anActivity = { days: [], minDate: "", maxDate: "", truncated: false };
+  /** Anchor index while dragging; null when not. */
+  var spineAnchor = null;
+
+  function anSpineHtml() {
+    var days = anActivity.days;
+    if (!days.length) {
+      return '<div class="an-spine empty"><span class="dim">no indexed activity yet</span></div>';
+    }
+    var peak = 0;
+    for (var i = 0; i < days.length; i++) if (days[i].sessions > peak) peak = days[i].sessions;
+    var cols = days
+      .map(function (d, i) {
+        // A day with activity never renders as nothing: a 1-session day next to
+        // a 40-session day is still a day you can grab.
+        var h = d.sessions ? Math.max(8, Math.round((d.sessions / peak) * 100)) : 0;
+        return (
+          '<div class="sp-col" data-i="' + i + '" data-date="' + esc(d.date) + '" title="' +
+          esc(d.date + " · " + d.sessions + " session" + (d.sessions === 1 ? "" : "s") +
+            (d.costUsd ? " · " + fmtCost(d.costUsd) : "")) + '">' +
+          '<span class="sp-bar" style="height:' + h + '%"></span>' +
+          "</div>"
+        );
+      })
+      .join("");
+    return (
+      '<div class="an-spine" id="an-spine" role="slider" tabindex="0"' +
+      ' aria-label="scope: drag across days to select a range"' +
+      ' aria-valuetext="' + esc(anScopeText()) + '">' + cols + "</div>" +
+      '<div class="sp-axis">' +
+      '<span>' + esc(anActivity.minDate) + (anActivity.truncated ? " (truncated)" : "") + "</span>" +
+      '<span class="sp-axis-mid">' + esc(anScopeText()) + "</span>" +
+      "<span>" + esc(anActivity.maxDate) + "</span>" +
+      "</div>"
+    );
+  }
+
+  function anScopeText() {
+    if (!an.since && !an.until) return "all time";
+    if (an.since && an.until) return an.since === an.until ? an.since : an.since + " → " + an.until;
+    return an.since ? "since " + an.since : "until " + an.until;
+  }
+
+  /** Repaint selection without rebuilding the columns — drags repaint per move. */
+  function paintSpineSelection() {
+    var spine = document.getElementById("an-spine");
+    if (!spine) return;
+    var lo = an.since || "";
+    var hi = an.until || "";
+    spine.querySelectorAll(".sp-col").forEach(function (c) {
+      var d = c.getAttribute("data-date");
+      var inRange = (!lo && !hi) ? false : (!lo || d >= lo) && (!hi || d <= hi);
+      c.classList.toggle("on", inRange);
+    });
+    spine.setAttribute("aria-valuetext", anScopeText());
+    var mid = document.querySelector(".sp-axis-mid");
+    if (mid) mid.textContent = anScopeText();
+  }
+
+  function loadActivity() {
+    var p = new URLSearchParams();
+    if (an.agent) p.set("agent", an.agent);
+    fetchJSON("/api/activity" + (p.toString() ? "?" + p : ""))
+      .then(function (d) {
+        anActivity = d;
+        var host = document.getElementById("an-spine-host");
+        if (!host) return;
+        host.innerHTML = anSpineHtml();
+        paintSpineSelection();
+      })
+      .catch(function () {
+        /* the spine is a convenience; analytics still answers without it */
+      });
+  }
+
+  /**
+   * Hit-test on X ALONE and snap to the nearest column, the same rule the
+   * journey strip learned the hard way: a fixed-y probe lands in the padding
+   * above every short bar, and most bars are short. Every x maps to a day,
+   * including one in a gutter or above an idle day.
+   */
+  function spineIndexFromPoint(clientX) {
+    var spine = document.getElementById("an-spine");
+    if (!spine) return null;
+    var cols = spine.querySelectorAll(".sp-col");
+    if (!cols.length) return null;
+    var best = null;
+    var bestGap = Infinity;
+    for (var i = 0; i < cols.length; i++) {
+      var r = cols[i].getBoundingClientRect();
+      if (clientX >= r.left && clientX <= r.right) return i;
+      var gap = clientX < r.left ? r.left - clientX : clientX - r.right;
+      if (gap < bestGap) {
+        bestGap = gap;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  /** Commit a range by index pair, in either drag direction. */
+  function setSpineRange(a, b) {
+    var days = anActivity.days;
+    if (!days.length) return;
+    var lo = Math.max(0, Math.min(a, b));
+    var hi = Math.min(days.length - 1, Math.max(a, b));
+    an.since = days[lo].date;
+    an.until = days[hi].date;
+  }
+
+  function bindSpine() {
+    var host = document.getElementById("an-spine-host");
+    if (!host) return;
+
+    // Delegated from the host, not bound to the strip: loadActivity() replaces
+    // the strip's markup wholesale, and a listener on a replaced node is a
+    // listener on nothing. The closest() guard keeps the axis labels below it
+    // selectable instead of turning a click on "all time" into a drag.
+    host.addEventListener("mousedown", function (e) {
+      if (!e.target.closest(".an-spine") || e.target.closest(".an-spine.empty")) return;
+      var i = spineIndexFromPoint(e.clientX);
+      if (i === null) return;
+      e.preventDefault(); // or the drag turns into a text selection
+      spineAnchor = i;
+      setSpineRange(i, i);
+      paintSpineSelection();
+    });
+
+    // Keyboard parity: the strip is focusable, so it has to be drivable. Arrows
+    // move the end of the range, shift+arrows move both ends together.
+    host.addEventListener("keydown", function (e) {
+      var days = anActivity.days;
+      if (!days.length) return;
+      var step = e.key === "ArrowLeft" ? -1 : e.key === "ArrowRight" ? 1 : 0;
+      if (!step) {
+        if (e.key === "Escape") {
+          an.since = "";
+          an.until = "";
+          afterScopeChange();
+          e.preventDefault();
+        }
+        return;
+      }
+      e.preventDefault();
+      var loIdx = indexOfDate(an.since) === -1 ? days.length - 1 : indexOfDate(an.since);
+      var hiIdx = indexOfDate(an.until) === -1 ? days.length - 1 : indexOfDate(an.until);
+      if (e.shiftKey) setSpineRange(loIdx + step, hiIdx + step);
+      else setSpineRange(loIdx, hiIdx + step);
+      afterScopeChange();
+    });
+  }
+
+  function indexOfDate(date) {
+    if (!date) return -1;
+    var days = anActivity.days;
+    for (var i = 0; i < days.length; i++) if (days[i].date === date) return i;
+    return -1;
+  }
+
+  // Bound ONCE, on document rather than on the strip, for two separate reasons.
+  // On document: a drag that wanders off the strip vertically is still a drag,
+  // and releasing outside it must commit rather than strand the pane mid-drag.
+  // Once: renderAnalytics() rebuilds the pane on every scope change, so binding
+  // these alongside the strip would stack a duplicate pair per render — and
+  // every duplicate re-fires afterScopeChange(), i.e. a second full page query.
+  document.addEventListener("mousemove", function (e) {
+    if (spineAnchor === null) return;
+    var i = spineIndexFromPoint(e.clientX);
+    if (i === null) return;
+    setSpineRange(spineAnchor, i);
+    paintSpineSelection();
+  });
+
+  document.addEventListener("mouseup", function () {
+    if (spineAnchor === null) return;
+    spineAnchor = null;
+    // Re-query ONCE, on release — not per mousemove, which would fire a request
+    // per pixel of drag.
+    afterScopeChange();
+  });
+
   function renderAnalytics() {
     current = { name: "analytics" };
     setView(
       '<div class="controls scope' + (anFiltered() ? " on" : "") + '" id="an-scope">' +
       '<span class="ctl-lbl">scope</span>' +
-      '<input id="an-since" type="date" value="' + esc(an.since) + '" title="since (inclusive)"/>' +
-      '<span class="ctl-sep">&rarr;</span>' +
-      '<input id="an-until" type="date" value="' + esc(an.until) + '" title="until (inclusive)"/>' +
       '<select id="an-agent" title="agent">' + anAgentOptions() + "</select>" +
       '<button type="button" class="btn" id="an-reset"' + (anFiltered() ? "" : " disabled") + ">reset</button>" +
       '<span class="spacer"></span>' +
-      '<span class="ctl-hint">applies to every figure on this page</span>' +
+      '<span class="ctl-hint">drag the spine to scope &middot; click one day &middot; applies to every figure on this page</span>' +
       "</div>" +
+      '<div id="an-spine-host">' + anSpineHtml() + "</div>" +
       '<div class="scope-line" id="an-scope-line">Loading&hellip;</div>' +
       // A single column of full-width blocks made a 3168px page out of content
       // that mostly wanted half the width: short wide rows with dead space on
@@ -5258,21 +5453,27 @@
       '<label class="check"><input id="an-breakdown" type="checkbox"' + (an.breakdown ? " checked" : "") + "/> per-model breakdown</label>" +
       "</div></div>" +
       '<div class="an-full" id="an-series"><div class="tbl-wrap"><table><tbody>' + skelRows(6, 8) + "</tbody></table></div></div>" +
-      '<div class="an-full" id="an-viz"></div>' +
+      // Two grid CHILDREN, not one full-width block holding its own 50/50
+      // `.split`. A nested split cannot line up with the 12-column track above
+      // it — 7c+6g vs 7/12 of the leftover after one gap — so the calendar's
+      // left edge and this row's right-hand chart sat at different x. Same
+      // track, same seam.
+      '<div class="an-wide" id="an-viz-main"></div>' +
+      '<div class="an-side" id="an-viz-aux"></div>' +
       '<div class="an-full" id="an-tables"></div>' +
       '<div class="an-full note" id="an-note"></div>' +
       "</div>"
     );
 
-    ["an-since", "an-until", "an-agent"].forEach(function (id) {
-      document.getElementById(id).addEventListener("change", onScopeControls);
-    });
+    document.getElementById("an-agent").addEventListener("change", onScopeControls);
     document.getElementById("an-reset").addEventListener("click", function () {
       an.since = "";
       an.until = "";
       an.agent = "";
       renderAnalytics();
     });
+    bindSpine();
+    loadActivity();
     ["an-gran", "an-breakdown"].forEach(function (id) {
       document.getElementById(id).addEventListener("change", onSeriesControls);
     });
@@ -5282,13 +5483,23 @@
 
   /** Scope changed - everything on the page has to be re-asked. */
   function onScopeControls() {
-    an.since = document.getElementById("an-since").value;
-    an.until = document.getElementById("an-until").value;
     an.agent = document.getElementById("an-agent").value;
+    afterScopeChange();
+    // The spine shows agent activity, so narrowing the agent reshapes it too.
+    loadActivity();
+  }
+
+  /**
+   * Shared tail of every scope change, whichever control made it. The spine and
+   * the agent select are two ways to move ONE scope; the chrome that reflects it
+   * is updated in one place so they cannot drift out of agreement.
+   */
+  function afterScopeChange() {
     var bar = document.getElementById("an-scope");
     if (bar) bar.classList.toggle("on", anFiltered());
     var reset = document.getElementById("an-reset");
     if (reset) reset.disabled = !anFiltered();
+    paintSpineSelection();
     loadAnalytics();
   }
 
@@ -5409,16 +5620,16 @@
         };
       });
     var strips = TracetapCharts.ttftStrips(a.perModel);
-    document.getElementById("an-viz").innerHTML = (tmItems.length || strips)
-      ? '<div class="split">' +
-        (tmItems.length
-          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.3</span>Spend by project</div><div id="tm"></div></div>'
-          : "") +
-        (strips
-          ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.4</span>TTFT distribution by model &middot; box p25&ndash;p75 &middot; tick p50 &middot; amber p95</div><div id="ts"></div></div>'
-          : "") +
-        "</div>"
+    var tmHtml = tmItems.length
+      ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.3</span>Spend by project</div><div id="tm"></div></div>'
       : "";
+    var tsHtml = strips
+      ? '<div class="chart-box"><div class="chart-title"><span class="fig">FIG.4</span>TTFT distribution by model &middot; box p25&ndash;p75 &middot; tick p50 &middot; amber p95</div><div id="ts"></div></div>'
+      : "";
+    // A lone chart takes the WIDE column, never the side one — otherwise a
+    // single figure would render at 5/12 with dead space beside it.
+    document.getElementById("an-viz-main").innerHTML = tmHtml || tsHtml;
+    document.getElementById("an-viz-aux").innerHTML = tmHtml ? tsHtml : "";
 
     var modelRows = a.perModel
       .map(function (m) {
@@ -5780,7 +5991,12 @@
   function loadRecentSessions() {
     var host = document.getElementById("an-recent");
     if (!host) return;
-    fetchJSON("/api/sessions?limit=6")
+    // Carries the pane scope. It did not, so the scope bar's promise that it
+    // "applies to every figure on this page" was false for exactly this block:
+    // pick a window in early August and the newest rows were still from today.
+    var p = anScopeParams();
+    p.set("limit", "6");
+    fetchJSON("/api/sessions?" + p)
       .then(function (d) {
         var rows = (d.sessions || [])
           .map(function (s) {
@@ -5800,11 +6016,18 @@
             );
           })
           .join("");
+        var head =
+          '<h2 class="sec">Jump back in <small>(newest first' +
+          (anFiltered() ? " in scope" : "") + " · " +
+          '<a href="#sessions">all sessions</a>)</small></h2>';
+        // Under a scope, an empty result is an ANSWER — "nothing ran in that
+        // window" — so it gets said. Unscoped it means an empty index, which
+        // the cards above already report; dropping the block is right there.
         host.innerHTML = rows
-          ? '<h2 class="sec">Jump back in <small>(newest first · ' +
-            '<a href="#sessions">all sessions</a>)</small></h2>' +
-            '<div class="an-recent">' + rows + "</div>"
-          : "";
+          ? head + '<div class="an-recent">' + rows + "</div>"
+          : anFiltered()
+            ? head + '<div class="dim pad">No sessions started in this scope.</div>'
+            : "";
       })
       .catch(function () {
         host.innerHTML = "";
