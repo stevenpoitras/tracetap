@@ -2262,10 +2262,18 @@ export class Store {
     // A uuid is positive identity: if it resolved and still produced no rows,
     // this conversation simply has no hooks, and guessing by clock would serve
     // a neighbouring session's under it.
-    if (session && !byId.length && !claudeSessionId) {
+    //
+    // A degenerate window cannot bound anything either. This used to widen a
+    // missing start to 0 and a missing end to MAX_SAFE_INTEGER, which is not a
+    // window but a scan of every hook ever captured — left to the cwd fence
+    // alone to sort out, and same-project neighbours pass that fence by design.
+    // An end at or before the start is the same bug with a subtler shape. No
+    // real window, no time join: an empty pane beats a plausible wrong one.
+    const hasRealWindow = !!session && session.startedAt > 0 && session.endedAt > session.startedAt;
+    if (session && hasRealWindow && !byId.length && !claudeSessionId) {
       const slack = 600; // 10 minutes — long tool calls can lag the wire window
-      const start = session.startedAt > 0 ? session.startedAt - slack : 0;
-      const end = session.endedAt > 0 ? session.endedAt + slack : Number.MAX_SAFE_INTEGER;
+      const start = session.startedAt - slack;
+      const end = session.endedAt + slack;
       byTime = this.db
         .prepare(
           `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
