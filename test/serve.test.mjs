@@ -186,11 +186,16 @@ before(async () => {
   );
 
   server = http.createServer((req, res) => handleRequest(store, req, res));
+  // fetch pools keep-alive sockets; Node's server drops an idle one after 5s.
+  // The synchronous store tests that run between HTTP tests can outlast that,
+  // so the next fetch reuses a socket the server is closing → ECONNRESET.
+  server.keepAliveTimeout = 60_000;
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
 after(async () => {
+  server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));
   try {
     store.close();
