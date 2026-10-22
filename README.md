@@ -557,12 +557,30 @@ Six views:
   rate, errors, cost) over every indexed session; the search box switches to
   ranked FTS5 hits (same engine as `tracetap search`). Click through to…
 - **Session detail** — flight-recorder for one session with five panes:
-  **Flow** (agent-loop graph), **Hooks** (Claude Code hook timeline + payloads),
+  **Trace**, **Hooks** (Claude Code hook timeline + payloads),
   **Context X-Ray** (window composition + new/carried/dropped vs prior call),
-  **Tool Tax** (declared vs invoked tools for this session's toolset),
-  and **Wire** (a turn spine — one row per turn, its tool calls / hooks /
-  compactions nested underneath — over a wall-clock time ribbon you can drag
-  to select a window, plus the transcript).
+  **Tool Tax** (declared vs invoked tools for this session's toolset), and
+  **Related** (sibling sessions from the same capture).
+
+  **Trace** is the session itself, at whichever grain the question needs. A
+  scrubbable strip across the top is the session silhouette (column height is
+  context size, fill is the cache-read / cache-write / fresh-input split), with
+  the focused turn opened up beneath it as what an LLM turn actually is —
+  something came in, the model did something, something went out. Below that, one
+  **filter bar** (kind chips + free-text query, with a *messages only* preset)
+  and a **grain switch**:
+
+  | Grain | What it is |
+  |---|---|
+  | **Turns** | one row per API call, events nested underneath, over a wall-clock time ribbon you can drag to select a window |
+  | **Stream** | every content block in one chronological chain — prompts, thinking, replies, calls, results, hooks |
+  | **Steps** | the full transcript text, with a tick minimap |
+
+  All three grains, plus the focused-turn anatomy, are filtered by that one bar,
+  so "show me only the tool results mentioning `rebase`" answers at every
+  resolution at once. Journey, Flow and Wire used to be separate tabs;
+  their URLs (`#session/<id>/journey`, `/flow`, `/wire`) still resolve, each
+  opening Trace at the corresponding grain.
 - **Analytics** — one pane for "where is my time and money going", from the
   snapshot down to the drill-down. A **scope bar** (since / until / agent) sits
   at the top and governs *everything* below it — cards, charts, tables and the

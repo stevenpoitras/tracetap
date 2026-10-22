@@ -768,16 +768,18 @@
       (m = h.match(
         new RegExp(
           "^session\\/([^/]+)(?:\\/(" +
-            SESSION_PANES.join("|") +
+            SESSION_PANES.concat(Object.keys(PANE_ALIASES)).join("|") +
             "))?(?:\\/step-(\\d+))?$",
         ),
       ))
     ) {
-      renderSession(
-        decodeURIComponent(m[1]),
-        m[3] ? Number(m[3]) : null,
-        m[2] || "journey",
-      );
+      var wantPane = m[2] || "trace";
+      var alias = PANE_ALIASES[wantPane];
+      if (alias) {
+        traceDensity = alias.density;
+        wantPane = alias.pane;
+      }
+      renderSession(decodeURIComponent(m[1]), m[3] ? Number(m[3]) : null, wantPane);
     } else if ((m = h.match(/^prompt\/(.+)$/)))
       renderPrompt(decodeURIComponent(m[1]));
     // #usage was folded into #analytics; keep old bookmarks working (replace,
@@ -914,6 +916,180 @@
    *
    * A turn is the unit of work, so it is the row. Its events hang under it.
    */
+  /**
+   * The ONE event vocabulary every density filters on.
+   *
+   * There used to be three. The spine knew `tool`/`hook`/`compaction`, the flow
+   * graph knew `user`/`thinking`/`assistant`/`tool_call`/`tool_result`/`hook`/
+   * `api_call`/`branch`, and the journey knew `tools`/`tool_result`/`skills`.
+   * That is why "show me just the messages" was impossible in the spine: a
+   * prompt or a reply was never an event there, it existed only as a flow node.
+   * So the vocabulary is defined once, every density emits it, and one filter
+   * bar drives all of them.
+   *
+   * Order is the order things happen inside a turn, which is also the order the
+   * chips read left to right.
+   */
+  var TRACE_KINDS = [
+    { key: "prompt", label: "prompt", hint: "what the user asked" },
+    { key: "thinking", label: "thinking", hint: "extended reasoning" },
+    { key: "reply", label: "reply", hint: "assistant text" },
+    { key: "tool_call", label: "tool call", hint: "what the model invoked" },
+    { key: "tool_result", label: "result", hint: "what came back" },
+    { key: "hook", label: "hook", hint: "harness hook fires" },
+    { key: "compaction", label: "compaction", hint: "transcript truncation" },
+  ];
+  var TRACE_KIND_ORDER = TRACE_KINDS.map(function (k) {
+    return k.key;
+  });
+  /** Message-grade kinds — what "just the messages" means as a preset. */
+  var MESSAGE_KINDS = ["prompt", "reply", "thinking"];
+
+  /**
+   * Flow-node kinds → the shared vocabulary.
+   *
+   * The flow graph is derived server-side (src/flow/derive.ts) and its names
+   * predate this vocabulary. Mapping at render time rather than renaming the
+   * derive output keeps the ATIF/API shape stable for other consumers.
+   */
+  var FLOW_KIND_MAP = {
+    user: "prompt",
+    assistant: "reply",
+    thinking: "thinking",
+    tool_call: "tool_call",
+    branch: "tool_call",
+    tool_result: "tool_result",
+    hook: "hook",
+    api_call: "api_call",
+  };
+
+  /**
+   * The one filter state, shared by every density of the Trace pane.
+   *
+   * Held at module scope rather than read off the DOM because two of the three
+   * densities RE-RENDER on interaction (the journey steps panel redraws on every
+   * scrub, the spine redraws on a data refresh). A filter that lived in the
+   * markup would be silently reset by the next redraw — which is what made the
+   * old journey lane filter feel like it kept forgetting itself.
+   *
+   * `kinds` empty means "everything", not "nothing": a filter bar with no chip
+   * pressed has to show the whole session, otherwise the pane opens blank.
+   */
+  var traceFilter = { kinds: {}, query: "" };
+
+  function traceActiveKinds() {
+    return Object.keys(traceFilter.kinds).filter(function (k) {
+      return traceFilter.kinds[k];
+    });
+  }
+
+  function traceFilterActive() {
+    return traceActiveKinds().length > 0 || !!traceFilter.query;
+  }
+
+  /** Does this kind survive the chip filter? */
+  function traceKindPasses(kind) {
+    var on = traceActiveKinds();
+    if (!on.length) return true;
+    return traceFilter.kinds[kind] === true;
+  }
+
+  /** Does this text survive the query box? Case-insensitive substring. */
+  function traceQueryPasses(text) {
+    if (!traceFilter.query) return true;
+    return String(text || "").toLowerCase().indexOf(traceFilter.query) !== -1;
+  }
+
+  function tracePasses(kind, text) {
+    return traceKindPasses(kind) && traceQueryPasses(text);
+  }
+
+  var TRACE_KIND_LABEL = {};
+  TRACE_KINDS.forEach(function (k) {
+    TRACE_KIND_LABEL[k.key] = k.label;
+  });
+  /** Display name for a kind; unknown kinds fall back to their raw key. */
+  function traceKindLabel(kind) {
+    return TRACE_KIND_LABEL[kind] || String(kind || "").replace(/_/g, " ");
+  }
+
+  /**
+   * The haystack the query box searches for one event.
+   *
+   * Label AND detail AND tool name, lowercased once at render time. Searching
+   * only the visible label would miss the body of every truncated row, and
+   * lowercasing per keystroke across 24k rows is what makes a filter feel slow.
+   */
+  function traceTextFor(e) {
+    return String(
+      (e.label || "") + " " + (e.tool || "") + " " + (e.detail || ""),
+    )
+      .slice(0, 4000)
+      .toLowerCase();
+  }
+
+  /** One-line preview for an event label. */
+  function evLine(s, n) {
+    var flat = String(s || "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
+      .replace(/\s+/g, " ").trim();
+    if (!flat) return "";
+    return flat.length <= (n || 96) ? flat : flat.slice(0, n || 96) + "…";
+  }
+
+  /**
+   * Is this user-role step something a PERSON typed?
+   *
+   * "User role" is a wire fact, not an authorship fact. Claude Code splices a
+   * lot of machinery into the transcript as user messages: hook stdout, tool
+   * results fed back, replayed tool narration after a compaction, injected file
+   * contents, serialized transcripts handed to auxiliary calls. Taking "nearest
+   * preceding user step" literally therefore labels all of that as THE PROMPT —
+   * on live sessions here that showed as `UserPromptSubmit hook additional
+   * context: …` and `Called the Read tool with the following input: …` sitting
+   * where the ask belongs.
+   *
+   * These are the same frames `src/store/title.ts` rejects when titling a
+   * session, kept deliberately in step with it — it is the tested set, and the
+   * two answering differently for one step is its own bug. Anything genuinely
+   * new belongs there first.
+   */
+  var TOOL_ECHO_RE = /^(called|result of calling) the \S+ tool\b/i;
+  // CASE-SENSITIVE on purpose: the event name is CamelCase, which is the only
+  // thing separating this from a person writing "the hook additional context is
+  // wrong, please fix".
+  var HOOK_OUTPUT_RE = /^[A-Z][A-Za-z]+ hook (success|failed|additional context)\b/;
+  var INJECTED_FILE_RE = /^contents of \/\S+\s*:/i;
+  var TRANSCRIPT_TAG_RE = /^<\/?transcript>$/;
+
+  function isUserAsk(st) {
+    if (!st || st.role !== "user") return false;
+    var raw = String(st.message || "").trim();
+    if (!raw) return false;
+    // A one-key envelope keyed by a TOOL is the previous turn's output being fed
+    // back, not an ask. `{"user": "..."}` is the one key that can hold one.
+    if (raw.charAt(0) === "{") {
+      var parsed = null;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (_) {
+        // Several envelopes concatenated — a transcript dump handed to an
+        // auxiliary call (permission check, title generation), never a person.
+        return false;
+      }
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        var keys = Object.keys(parsed);
+        if (keys.length === 1 && keys[0] !== "user") return false;
+      }
+    }
+    var text = stepText(st).trim();
+    if (!text) return false;
+    if (TRANSCRIPT_TAG_RE.test(text)) return false;
+    if (TOOL_ECHO_RE.test(text)) return false;
+    if (HOOK_OUTPUT_RE.test(text)) return false;
+    if (INJECTED_FILE_RE.test(text)) return false;
+    return true;
+  }
+
   function buildTurns(reqs, hooks, steps, compactSeqs) {
     var byStep = {};
     // The nearest USER step at or before each index — i.e. the prompt that
@@ -921,8 +1097,16 @@
     // on many sessions that step is empty (the indexer stores the placeholder
     // "<block>no" and no tool fields), so the agent side alone leaves every row
     // blank. What was actually said is on the user side, one step earlier.
+    //
+    // Tracked TWICE, and the second one is the point. `prevUser` is the nearest
+    // user-ROLE step, which is a wire fact and includes everything the harness
+    // splices in as a user message. `prevAsk` is the nearest step a PERSON
+    // actually typed. Keeping both means the honest answer is available without
+    // regressing anything that legitimately wants "whatever came in last".
     var prevUser = {};
+    var prevAsk = {};
     var lastUser = null;
+    var lastAsk = null;
     (steps || [])
       .slice()
       .sort(function (a, b) {
@@ -931,8 +1115,15 @@
       .forEach(function (st) {
         byStep[st.stepIndex] = st;
         if (st.role === "user") lastUser = st;
+        if (isUserAsk(st)) lastAsk = st;
         prevUser[st.stepIndex] = lastUser;
+        prevAsk[st.stepIndex] = lastAsk;
       });
+    // The prompt step of the PREVIOUS turn. A run of turns driven by one user
+    // message all resolve `prevUser` to the same step object, and emitting a
+    // `prompt` event on every one of them would report 40 prompts for a session
+    // where the user typed twice. Emit it on the turn where it CHANGES.
+    var lastPromptStep = null;
     return (reqs || []).map(function (r, i) {
       var next = reqs[i + 1];
       // Hooks are timestamped, not seq-tagged, so a turn owns the hooks that
@@ -941,6 +1132,56 @@
       // label, so a mis-attributed hook is at least visible as such.
       var evs = [];
       var st = r.agentStepIndex != null ? byStep[r.agentStepIndex] : null;
+      var promptStep = r.agentStepIndex != null ? prevUser[r.agentStepIndex] : null;
+      var askStep = r.agentStepIndex != null ? prevAsk[r.agentStepIndex] : null;
+
+      // --- message-grade events ------------------------------------------
+      // These three are why the flow pane existed. With them on the turn, the
+      // spine and the flow graph are the same data at two grains rather than
+      // two views that each know something the other cannot show.
+      // Keyed on the ASK, not on any user-role step: a run of turns interleaved
+      // with hook output and fed-back tool results would otherwise emit a fresh
+      // "prompt" every time that machinery changed, reporting dozens of prompts
+      // for one thing the person typed.
+      if (askStep && askStep !== lastPromptStep) {
+        var ptext = stepText(askStep);
+        if (String(ptext || "").trim()) {
+          evs.push({
+            kind: "prompt",
+            label: evLine(ptext),
+            detail: ptext,
+            n: String(ptext).length,
+            stepIndex: askStep.stepIndex,
+          });
+        }
+      }
+      if (askStep) lastPromptStep = askStep;
+      if (st && String(st.reasoning || "").trim()) {
+        evs.push({
+          kind: "thinking",
+          label: evLine(st.reasoning),
+          detail: st.reasoning,
+          n: String(st.reasoning).length,
+          stepIndex: st.stepIndex,
+        });
+      }
+      // The indexer stores a `<block>no…` PLACEHOLDER for a step with no text,
+      // so the test is a prefix test, not equality — comparing whole strings let
+      // every placeholder through as a "reply" with no content.
+      if (
+        st &&
+        String(st.message || "").trim() &&
+        String(st.message).indexOf(EMPTY_STEP_MESSAGE) !== 0
+      ) {
+        evs.push({
+          kind: "reply",
+          label: evLine(st.message),
+          detail: st.message,
+          n: String(st.message).length,
+          stepIndex: st.stepIndex,
+        });
+      }
+
       if (st && st.toolName) {
         // `toolName` is space-joined and `toolInput` newline-joined, ONE entry
         // per tool_use block on the step — so a step that called three tools
@@ -951,13 +1192,35 @@
         var inputs = String(st.toolInput || "").split("\n");
         names.forEach(function (name, k) {
           evs.push({
-            kind: "tool",
+            kind: "tool_call",
             label: name + toolArgHint(inputs[k]),
             detail: inputs[k] || "",
             // The observation is stitched across ALL of the step's calls, so it
             // can only be attributed when there was exactly one to attribute to.
             n: names.length === 1 ? String(st.observation || "").length : null,
+            stepIndex: st.stepIndex,
+            tool: name,
           });
+        });
+      }
+      // What came BACK. Its own event kind rather than a number hanging off the
+      // call, because "show me only the results" and "show me only the calls"
+      // are different questions and the spine could answer neither.
+      //
+      // Attribution is honest about its limit: the indexer stitches one
+      // observation string per STEP, so a step with three calls gets one result
+      // event covering all three rather than three guesses split on newlines.
+      if (st && String(st.observation || "").trim()) {
+        var obsNames = String(st.toolName || "").trim().split(/\s+/).filter(Boolean);
+        evs.push({
+          kind: "tool_result",
+          label:
+            (obsNames.length === 1 ? obsNames[0] + " → " : "tool output · ") +
+            fmtTok(String(st.observation).length) + " chars",
+          detail: st.observation,
+          n: String(st.observation).length,
+          stepIndex: st.stepIndex,
+          tool: obsNames.length === 1 ? obsNames[0] : null,
         });
       }
       // The LAST turn used to have no upper bound, so every hook that fired
@@ -1003,16 +1266,24 @@
           n: c.from - c.to,
         });
       }
-      var prompt = r.agentStepIndex != null ? prevUser[r.agentStepIndex] : null;
+      var prompt = promptStep;
       return {
         seq: r.seq,
         req: r,
         agent: r.isSubagent ? r.agentLabel || "subagent (unnamed)" : "main thread",
-        summary: turnSummary(st, prompt),
+        // The ask, with the raw user-side step as fallback. `turnSummary` only
+        // reaches for this when the turn has no tools and no text of its own, and
+        // in that case the row should quote the person, not the hook stdout that
+        // happened to arrive most recently.
+        summary: turnSummary(st, askStep || prompt),
         // Kept whole (not just summarised) because the journey view shows the
         // turn's anatomy: what came IN, what the model did, what went OUT.
         step: st || null,
         prompt: prompt || null,
+        // What a PERSON asked, as opposed to whatever arrived last on the user
+        // side. Often the same step; when it differs, `prompt` is harness
+        // machinery and `ask` is the thing worth quoting.
+        ask: askStep || null,
         events: evs,
       };
     });
@@ -1645,7 +1916,7 @@
    */
   var JOURNEY_H = 132;
 
-  function journeyHtml(turns) {
+  function journeyHtml(turns, insert) {
     if (!turns.length) return '<div class="dim">No wire data for this session.</div>';
     var maxCtx = 1;
     turns.forEach(function (t) {
@@ -1705,12 +1976,17 @@
       '<h2 class="sec">Worth looking at <small>(' + insights.length +
       " · click to jump)</small></h2>" +
       '<div class="jr-insights">' + chips + "</div>" +
-      '<h2 class="sec">Journey <small>(' + turns.length +
+      '<h2 class="sec">Session <small>(' + turns.length +
       " turns · drag or ←→ to scrub · height is context, fill is cache split)</small></h2>" +
       '<div class="jr-strip" id="jr-strip" style="height:' + JOURNEY_H + 'px">' +
       cols + "</div>" +
       '<input class="jr-range" id="jr-range" type="range" min="0" max="' +
       (turns.length - 1) + '" value="0" step="1" aria-label="Scrub turns">' +
+      // `insert` is where the filter bar goes: BELOW the strip, which is a
+      // silhouette of the whole session and is deliberately never filtered, and
+      // ABOVE the focused turn, which is. A control has to sit above everything
+      // it changes, or it reads as applying to the strip too.
+      (insert || "") +
       '<div class="jr-detail" id="jr-detail"></div>'
     );
   }
@@ -1741,8 +2017,15 @@
       inKind = "tool results from turn " + prevTurn.seq;
       inText = fedBack;
     } else {
-      inKind = t.prompt ? "prompt · transcript step " + t.prompt.stepIndex : "";
-      inText = stepText(t.prompt);
+      // The ask when there is one, and say so; otherwise whatever the harness
+      // put on the user side, labelled as the injected context it is rather than
+      // as a prompt.
+      var src = t.ask || t.prompt;
+      inKind = src
+        ? (t.ask ? "prompt" : "injected context") +
+          " · transcript step " + src.stepIndex
+        : "";
+      inText = stepText(src);
     }
     var inBody =
       kv("transcript", r.transcriptItems + " items") +
@@ -1767,7 +2050,7 @@
       (hooks.length ? kv("hooks fired", hooks.length) : "");
 
     var tools = t.events.filter(function (e) {
-      return e.kind === "tool";
+      return e.kind === "tool_call";
     });
     var said = t.step ? stepText(t.step) : "";
     var outBody =
@@ -1837,103 +2120,97 @@
    * whole reason 211 of them are captured per session.
    */
   function journeyStepsHtml(t) {
-    var inputs = t.step ? String(t.step.toolInput || "").split("\n") : [];
-    // Carry the ORIGINAL position with each event. `inputs` is indexed by
-    // position in the UNFILTERED tool list, so filtering the array without
-    // keeping the index would pair every surviving call with another call's
-    // arguments — wrong, and wrong in a way that reads as correct.
-    var allTools = [];
-    t.events.forEach(function (e, i) {
-      if (e.kind === "tool") allTools.push({ e: e, i: allTools.length });
-    });
-    var lane = journeyLaneFilter;
-    var laneKind = lane ? LANE_STEPS[lane] : null;
-    var tools = allTools.filter(function (x) {
-      if (!laneKind) return true;
-      if (laneKind === "skill") return /skill/i.test(x.e.label || "");
-      return true;
-    });
-    var hooks = t.events.filter(function (e) {
-      return e.kind === "hook";
+    // EVERY event kind, in the order it happened, not just tools and hooks. The
+    // panel used to skip prompts, thinking and replies entirely, so the anatomy
+    // of a turn was missing the three things the turn is mostly MADE of, and
+    // "messages only" had nothing to show here.
+    var all = t.events;
+    var kept = all.filter(function (e) {
+      return tracePasses(e.kind, traceTextFor(e));
     });
 
-    var toolHtml = tools.length
-      ? tools
-          .map(function (x) {
-            var e = x.e;
-            var arg = inputs[x.i] || e.detail || "";
-            var pretty = arg;
-            try {
-              pretty = JSON.stringify(JSON.parse(arg), null, 2);
-            } catch (_) {
-              /* not JSON — show it raw */
-            }
-            return (
-              '<details class="jr-step-row"' + (tools.length === 1 ? " open" : "") + ">" +
-              "<summary><span class=\"jr-badge tool\">tool</span>" +
-              '<span class="jr-step-name">' + esc(e.label) + "</span></summary>" +
-              '<pre class="jr-pre">' + esc(clip(pretty, 6000)) + "</pre>" +
-              "</details>"
-            );
-          })
-          .join("")
-      : "";
-
-    var obs = t.step ? String(t.step.observation || "") : "";
-    var obsHtml = obs.trim()
-      ? '<details class="jr-step-row"><summary><span class="jr-badge result">result</span>' +
-        '<span class="jr-step-name">tool output · ' + fmtTok(obs.length) +
-        " chars</span></summary>" +
-        '<pre class="jr-pre">' + esc(clip(obs, 6000)) + "</pre></details>"
-      : "";
-
-    var hookHtml = hooks
+    var body = kept
       .map(function (e) {
-        var h = e.hook || null;
+        var raw = e.detail || "";
+        var pretty = raw;
+        try {
+          pretty = JSON.stringify(JSON.parse(raw), null, 2);
+        } catch (_) {
+          /* not JSON — show it raw */
+        }
         var meta = [];
+        var h = e.hook || null;
         if (h) {
           if (h.decision) meta.push("decision " + h.decision);
           if (h.outcome) meta.push(h.outcome);
           if (h.exitCode != null) meta.push("exit " + h.exitCode);
         }
-        if (e.n != null) meta.push(fmtDur(e.n));
+        if (e.n != null) {
+          meta.push(e.kind === "hook" ? fmtDur(e.n) : fmtTok(e.n) + " chars");
+        }
+        // Open by default when there is only one thing to read: a single
+        // collapsed row is a click that tells you nothing you did not know.
         return (
-          '<details class="jr-step-row"><summary>' +
-          '<span class="jr-badge hook">hook</span>' +
-          '<span class="jr-step-name">' + esc(e.label) + "</span>" +
-          '<span class="jr-step-meta">' + esc(meta.join(" · ")) + "</span></summary>" +
-          '<pre class="jr-pre">' + esc(clip(e.detail || "{}", 4000)) + "</pre></details>"
+          '<details class="jr-step-row"' + (kept.length === 1 ? " open" : "") + ">" +
+          '<summary><span class="jr-badge ' + esc(e.kind) + '">' +
+          esc(traceKindLabel(e.kind)) + "</span>" +
+          '<span class="jr-step-name">' + esc(e.label || "—") + "</span>" +
+          (meta.length
+            ? '<span class="jr-step-meta">' + esc(meta.join(" · ")) + "</span>"
+            : "") +
+          "</summary>" +
+          '<pre class="jr-pre">' + esc(clip(pretty || "(no payload recorded)", 6000)) +
+          "</pre></details>"
         );
       })
       .join("");
 
-    var body = toolHtml + obsHtml + hookHtml;
+    var filtered = kept.length !== all.length;
     return (
       '<div class="jr-panel">' +
-      '<div class="jr-head">STEPS &mdash; ' + tools.length + " tool call" +
-      (tools.length === 1 ? "" : "s") +
-      (lane && tools.length !== allTools.length ? " of " + allTools.length : "") +
-      " · " + hooks.length + " hook" +
-      (hooks.length === 1 ? "" : "s") + "</div>" +
-      (lane
-        ? '<div class="jr-filter"><span class="jr-filter-lab">filtered to</span>' +
+      '<div class="jr-head">STEPS &mdash; ' + kept.length +
+      (filtered ? " of " + all.length : "") + " event" +
+      (kept.length === 1 ? "" : "s") + "</div>" +
+      (filtered
+        ? '<div class="jr-filter"><span class="jr-filter-lab">filtered</span>' +
           '<button type="button" class="jr-filter-chip" data-lane-clear="1">' +
-          esc(lane) + ' <span aria-hidden="true">✕</span></button>' +
-          '<span class="dim">hooks stay listed — they are what triggered these calls</span>' +
+          esc(traceFilterSummary()) + ' <span aria-hidden="true">✕</span></button>' +
           "</div>"
         : "") +
-      (body || '<div class="dim">This turn recorded no tool calls and no hooks.</div>') +
+      (body ||
+        (all.length
+          ? '<div class="dim">Nothing on this turn matches the filter.</div>'
+          : '<div class="dim">This turn recorded no events.</div>')) +
       "</div>"
     );
   }
 
+  /** Human-readable summary of what the filter is currently restricted to. */
+  function traceFilterSummary() {
+    var on = traceActiveKinds().map(traceKindLabel);
+    var bits = [];
+    if (on.length) bits.push(on.join(" + "));
+    if (traceFilter.query) bits.push('"' + traceFilter.query + '"');
+    return bits.join(" · ") || "all";
+  }
+
   var BUCKET_ORDER = ["system", "tools", "skills", "user", "assistant", "tool_result"];
 
-  // Which lanes are BACKED BY STEPS this pane can show. Only these are
-  // clickable; the rest render inert rather than fake-clickable, because a
-  // control that looks live and does nothing is worse than no control at all.
-  var LANE_STEPS = { tools: "tool", tool_result: "tool", skills: "skill" };
-  var journeyLaneFilter = null;
+  /**
+   * Context bucket → the event kind that bucket is made of.
+   *
+   * Clicking "tools · 87K" in the composition table now filters the whole pane
+   * to tool calls, because the bucket and the event kind are finally the same
+   * vocabulary. `system` and `skills` stay inert: they are context the harness
+   * injects, not events the agent emitted, so there is nothing to filter TO —
+   * and a control that looks live and does nothing is worse than no control.
+   */
+  var BUCKET_KIND = {
+    tools: "tool_call",
+    tool_result: "tool_result",
+    user: "prompt",
+    assistant: "reply",
+  };
 
   /**
    * What the context is MADE OF at this turn, and what changed since the last.
@@ -2009,14 +2286,16 @@
       .map(function (k) {
         var post = cur[k] || 0;
         var pre = prev ? prev[k] || 0 : 0;
-        var lane = LANE_STEPS[k];
-        var on = journeyLaneFilter === k;
+        var lane = BUCKET_KIND[k];
+        var on = !!lane && traceFilter.kinds[lane] === true;
         return (
           "<button type=\"button\" class=\"jr-bk jr-bk-row" +
           (lane ? " is-lane" : "") + (on ? " on" : "") + "\"" +
-          (lane ? ' data-lane="' + esc(k) + '"' : " disabled") +
+          (lane ? ' data-lane="' + esc(lane) + '"' : " disabled") +
           (lane ? ' aria-pressed="' + (on ? "true" : "false") + '"' : "") +
-          (lane ? ' title="show only the ' + esc(k) + ' steps in this turn"' : "") +
+          (lane
+            ? ' title="filter the whole pane to ' + esc(traceKindLabel(lane)) + ' events"'
+            : ' title="' + esc(k) + ' is injected context, not an event — nothing to filter to"') +
           ">" +
           '<span class="jr-bk-name">' + esc(k) + "</span>" +
           barFor(k, pre, post) +
@@ -2055,6 +2334,130 @@
     );
   }
 
+  /**
+   * The filter bar: kind chips, a text query, and a live count of what survived.
+   *
+   * Counts come from the DATA, not from the DOM, so a chip reads "hook 211" even
+   * while the current view is filtered down to four rows — a count that changed
+   * as you filtered would make it impossible to tell what the session contains
+   * from what you are currently looking at.
+   *
+   * Only kinds PRESENT in the session get a chip. A chip for a kind with zero
+   * rows is a control that does nothing, and the old journey lane filter proved
+   * how confusing that is.
+   */
+  function traceFilterBarHtml(turns) {
+    var counts = {};
+    turns.forEach(function (t) {
+      t.events.forEach(function (e) {
+        counts[e.kind] = (counts[e.kind] || 0) + 1;
+      });
+    });
+    var present = TRACE_KINDS.filter(function (k) {
+      return counts[k.key];
+    });
+    if (!present.length) return "";
+
+    var chips = present
+      .map(function (k) {
+        var on = traceFilter.kinds[k.key] === true;
+        return (
+          '<button type="button" class="turn-filter" data-turn-filter="' +
+          esc(k.key) + '" aria-pressed="' + (on ? "true" : "false") +
+          '" title="' + esc(k.hint) + '">' +
+          esc(k.label) + " <small>" + counts[k.key] + "</small></button>"
+        );
+      })
+      .join("");
+
+    // "just the messages" is the request this bar exists to answer, so it is a
+    // one-click preset rather than three chips the user has to know to combine.
+    var hasMessages = MESSAGE_KINDS.some(function (k) {
+      return counts[k];
+    });
+    var presets =
+      (hasMessages
+        ? '<button type="button" class="turn-preset" data-turn-preset="messages">' +
+          "messages only</button>"
+        : "") +
+      '<button type="button" class="turn-preset" data-turn-preset="all">' +
+      "reset</button>";
+
+    return (
+      '<div class="turn-filters" id="trace-filters">' +
+      '<span class="turn-filter-lab">show</span>' +
+      chips +
+      '<span class="turn-filter-sep"></span>' +
+      presets +
+      '<label class="turn-q"><span class="sr-only">Filter by text</span>' +
+      '<input type="search" id="trace-q" placeholder="filter text…" ' +
+      'value="' + esc(traceFilter.query) + '" autocomplete="off"></label>' +
+      '<span class="turn-count" id="trace-count"></span>' +
+      '<span class="turn-legend">' +
+      '<i class="seg-read"></i>cache read<i class="seg-write"></i>cache write' +
+      '<i class="seg-fresh"></i>fresh input</span>' +
+      "</div>"
+    );
+  }
+
+  /**
+   * Which grain of the trace is on screen. Module scope, so switching to Hooks
+   * and back does not silently reset you to the overview.
+   */
+  var traceDensity = "turns";
+  var TRACE_DENSITIES = [
+    { key: "turns", label: "Turns", hint: "one row per API call, events nested" },
+    { key: "stream", label: "Stream", hint: "every content block in order" },
+    { key: "steps", label: "Steps", hint: "full transcript text" },
+  ];
+
+  /**
+   * The Trace pane: one session, three grains, one filter.
+   *
+   * ACROSS (the strip) and DOWN (the focused turn) are always on screen, because
+   * they are the two axes a session HAS and they cost one screenful between them.
+   * The grain below them is switchable, because "which call was slow", "what did
+   * it think" and "what exactly did the tool print" are the same content read at
+   * three resolutions — not three different pages.
+   */
+  function tracePaneHtml(turns, flow, steps) {
+    if (!turns.length && !steps.length) {
+      return '<div class="empty-pane">No wire data indexed for this session.</div>';
+    }
+    function densityBtn(d) {
+      return (
+        '<button type="button" class="trace-density' +
+        (traceDensity === d.key ? " active" : "") +
+        '" data-trace-density="' + esc(d.key) + '" title="' + esc(d.hint) + '">' +
+        esc(d.label) + "</button>"
+      );
+    }
+    function densitySection(key, body) {
+      return (
+        '<div class="trace-grain' + (traceDensity === key ? " active" : "") +
+        '" id="trace-grain-' + esc(key) + '">' + body + "</div>"
+      );
+    }
+    return (
+      // The filter bar is threaded INTO the strip block rather than appended
+      // after it, so it lands between the (unfiltered) silhouette and the
+      // (filtered) focused turn.
+      journeyHtml(turns, traceFilterBarHtml(turns)) +
+      '<div class="trace-switch"><span class="trace-switch-lab">grain</span>' +
+      TRACE_DENSITIES.map(densityBtn).join("") +
+      "</div>" +
+      densitySection("turns", turnSpineHtml(turns)) +
+      densitySection("stream", renderFlowPane(flow)) +
+      densitySection(
+        "steps",
+        '<h2 class="sec">Transcript <small>(' + steps.length +
+          " steps)</small></h2>" +
+          '<div class="steps">' + steps.map(stepCard).join("") + "</div>" +
+          minimapHtml(steps),
+      )
+    );
+  }
+
   function turnSpineHtml(turns) {
     if (!turns.length) return '<div class="dim">No wire data for this session.</div>';
     var maxCtx = 1;
@@ -2062,27 +2465,6 @@
       var c = (t.req.promptTokens || 0) + (t.req.cacheRead || 0) + (t.req.cacheCreation || 0);
       if (c > maxCtx) maxCtx = c;
     });
-    var kinds = {};
-    turns.forEach(function (t) {
-      t.events.forEach(function (e) {
-        kinds[e.kind] = (kinds[e.kind] || 0) + 1;
-      });
-    });
-    var filters = Object.keys(kinds)
-      .sort()
-      .map(function (k) {
-        return (
-          '<button type="button" class="turn-filter" data-turn-filter="' +
-          esc(k) +
-          '" aria-pressed="false">' +
-          esc(k) +
-          " <small>" +
-          kinds[k] +
-          "</small></button>"
-        );
-      })
-      .join("");
-
     // Repeat suppression. A workflow fan-out is dozens of calls that genuinely
     // share one prompt, and printing it on all of them is honest but hides the
     // rows that DIFFER inside a wall of identical sentences. Ditto marks turn
@@ -2116,8 +2498,14 @@
           .map(function (e, j) {
             return (
               '<div class="turn-ev ev-' + esc(e.kind) + '" data-ev-kind="' + esc(e.kind) +
+              // The text the query box matches against. Held in an attribute
+              // rather than read from `textContent` because the label is a
+              // 96-char preview while the DETAIL is what the user is searching
+              // for — "filter: rebase" has to find a Bash call whose visible
+              // label was truncated before the word.
+              '" data-trace-text="' + esc(traceTextFor(e)) +
               '" data-inspect="ev:' + t.seq + ":" + j + '" tabindex="0">' +
-              '<span class="ev-kind">' + esc(e.kind) + "</span>" +
+              '<span class="ev-kind">' + esc(traceKindLabel(e.kind)) + "</span>" +
               '<span class="ev-label">' + esc(e.label) + "</span>" +
               '<span class="ev-n">' + (e.n == null ? "" : esc(String(e.n))) + "</span>" +
               "</div>"
@@ -2129,6 +2517,9 @@
           // The window predicate reads these off the DOM rather than a parallel
           // array, so a re-render can never leave the two out of step.
           '<div class="turn" data-turn="' + t.seq + '" data-from="' + span.from +
+          // The turn's OWN searchable text, so a query matches the row whose
+          // summary mentions the term even when its events do not.
+          '" data-trace-text="' + esc(String(t.summary || "").toLowerCase()) +
           '" data-to="' + span.to + '">' +
           '<div class="turn-row" data-inspect="ctp:' + t.seq + '" tabindex="0">' +
           '<span class="turn-caret" data-expand="' + t.seq + '">' +
@@ -2160,11 +2551,9 @@
       " · \u2191\u2193 move · \u2192 expand · \u2190 collapse · click for detail)</small></h2>" +
       timeRibbonHtml(turns) +
       uniform +
-      '<div class="turn-filters">' + filters +
-      '<span class="turn-legend">' +
-      '<i class="seg-read"></i>cache read<i class="seg-write"></i>cache write' +
-      '<i class="seg-fresh"></i>fresh input</span>' +
-      "</div>" +
+      // NOTE: no filter row here. It is rendered by the Trace pane ABOVE the
+      // grain switch, because one bar has to survive switching grain and a bar
+      // owned by the spine could only ever filter the spine.
       // The header is a `.turn-row` so it inherits the grid verbatim — a second
       // template would drift out of alignment the first time a column changed.
       // The header lives INSIDE the scroll container and sticks. Outside it, the
@@ -2480,19 +2869,23 @@
     ) {
       activatePane(pane);
       if (stepN != null) {
-        activatePane("wire");
-        setTimeout(function () {
-          flashStep(stepN);
-        }, 30);
+        showTraceStep(stepN);
       }
       return;
     }
-    current = { name: "session", arg: id, pane: pane || "journey" };
+    // A different session gets a clean filter. Chips are only drawn for kinds
+    // the session contains, so a kind left pressed from the last one could
+    // blank every grain with no visible chip to un-press. A refresh of the SAME
+    // session keeps it — that is the forgetting the filter state exists to stop.
+    if (current.name !== "session" || current.arg !== id) {
+      traceFilter = { kinds: {}, query: "" };
+    }
+    current = { name: "session", arg: id, pane: pane || "trace" };
     setView(skeleton({ cards: 8, rows: 6 }));
     fetchJSON("/api/session/" + encodeURIComponent(id))
       .then(function (data) {
         if (current.name !== "session" || current.arg !== id) return;
-        drawSession(data, stepN, current.pane || "journey");
+        drawSession(data, stepN, current.pane || "trace");
       })
       .catch(fail);
   }
@@ -2608,7 +3001,7 @@
       compactionCard(compactionList, data.recordedCompactions);
     recordedForPane = data.recordedCompactions || null;
 
-    var pane = initialPane || "journey";
+    var pane = initialPane || "trace";
     function subnavBtn(name, label, count) {
       return (
         '<button type="button" class="subnav-btn' +
@@ -2677,31 +3070,33 @@
       // The title block above stays full-width on purpose: it is the page
       // header, and narrowing it would re-wrap a 120-character title and push
       // the row you just clicked down the page.
-      '<div class="session-body' + (pane === "journey" ? " no-inspector" : "") + '">' +
+      // The inspector rail stays up on Trace. The old Journey pane hid it and ran
+      // full-width, but Trace has clickable event rows in all three densities and
+      // clicking one has to put its payload SOMEWHERE.
+      '<div class="session-body">' +
       '<div class="session-main">' +
       '<div class="cards">' +
       cards +
       "</div>" +
       sectionErrorBanner(data.sectionErrors) +
       '<nav class="session-subnav" id="session-subnav">' +
-      subnavBtn("journey", "Journey") +
-      subnavBtn("flow", "Flow") +
+      // Journey, Flow and Wire were three tabs over ONE session at three grains:
+      // per-turn silhouette, per-content-block chain, per-turn table + transcript.
+      // Every number and every row in two of them was reachable from the third,
+      // so switching tabs mostly meant re-finding the turn you were already on.
+      // They are one pane now, with a density switch inside it and one filter bar
+      // above it — the grain changes, the place does not.
+      subnavBtn("trace", "Trace") +
       subnavBtn("hooks", "Hooks", signalHooks(hooks).length) +
       subnavBtn("xray", "Context X-Ray") +
       subnavBtn("tools", "Tool Tax") +
-      subnavBtn("wire", "Wire") +
       subnavBtn("related", "Related", siblings.length || null) +
       "</nav>" +
       '<div class="session-panes">' +
       '<section class="session-pane' +
-      (pane === "journey" ? " active" : "") +
-      '" id="pane-journey">' +
-      journeyHtml(turnsForPane) +
-      "</section>" +
-      '<section class="session-pane' +
-      (pane === "flow" ? " active" : "") +
-      '" id="pane-flow">' +
-      renderFlowPane(flow) +
+      (pane === "trace" ? " active" : "") +
+      '" id="pane-trace">' +
+      tracePaneHtml(turnsForPane, flow, steps) +
       "</section>" +
       '<section class="session-pane' +
       (pane === "hooks" ? " active" : "") +
@@ -2719,28 +3114,6 @@
       // Filled in by loadToolTax once /tools responds — same lazy contract as
       // the context timeline.
       '<div id="tooltax-host"><div class="dim">loading tool tax…</div></div>' +
-      "</section>" +
-      '<section class="session-pane' +
-      (pane === "wire" ? " active" : "") +
-      '" id="pane-wire">' +
-      // The spine REPLACES what used to sit here rather than sitting above it:
-      // FIG.1 (transcript items per call), FIG.2 (token flow per call) and the
-      // request waterfall were three renderings of the same 18 calls, and
-      // adding a fourth is not consolidation. Every number they carried is on
-      // a spine row or one click into the inspector — context read, duration,
-      // compaction, and the cache read/write/fresh/output split.
-      //
-      // What genuinely died with the waterfall is TIME OVERLAP: it was the only
-      // view showing calls running concurrently. That returns with the range
-      // selector, which needs a time axis anyway.
-      turnSpineHtml(turnsForPane) +
-      '<h2 class="sec">Transcript <small>(' +
-      steps.length +
-      " steps)</small></h2>" +
-      '<div class="steps">' +
-      steps.map(stepCard).join("") +
-      "</div>" +
-      minimapHtml(steps) +
       "</section>" +
       '<section class="session-pane' +
       (pane === "related" ? " active" : "") +
@@ -2769,24 +3142,45 @@
         return contextStripHtml(turnsForPane, stripT0, stripSpan, w);
       });
     }
-    // The journey opens on turn 0 rather than on an empty detail panel: the
-    // pane should show a worked example of what it is before you touch it.
+    // Trace opens on turn 0 rather than on an empty detail panel: the pane
+    // should show a worked example of what it is before you touch it.
     setJourney(0);
     bindSessionInteractions(reqs, compactSeqs, steps);
     bindSessionPanes(s.sessionId, reqs);
-    if (stepN != null) {
-      activatePane("wire");
-      setTimeout(function () {
-        flashStep(stepN);
-      }, 30);
-    }
+    // The filter survives a re-render (a live index update redraws the pane), so
+    // re-apply it rather than leaving fresh markup unfiltered under a bar that
+    // still shows chips pressed.
+    applyTurnFilters();
+    if (stepN != null) showTraceStep(stepN);
+  }
+
+  /**
+   * Reveal a transcript step from a `#…/step-N` deep link.
+   *
+   * Steps only exist in the Steps grain, so the link has to switch grain as well
+   * as pane — landing on Trace's overview and flashing an element inside a hidden
+   * container is a link that silently does nothing.
+   */
+  function showTraceStep(stepN) {
+    activatePane("trace");
+    traceDensity = "steps";
+    document.querySelectorAll("[data-trace-density]").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-trace-density") === "steps");
+    });
+    document.querySelectorAll(".trace-grain").forEach(function (g) {
+      g.classList.toggle("active", g.id === "trace-grain-steps");
+    });
+    applyTurnFilters();
+    setTimeout(function () {
+      flashStep(stepN);
+    }, 30);
   }
 
   /**
    * The inspector is shared, but what it can describe is NOT.
    *
    * The panes have different scopes, and this is a property of the data, not a
-   * layout choice: Context X-Ray and Wire are per API call (215 distinct
+   * layout choice: Context X-Ray and Trace are per API call (215 distinct
    * context sizes across 224 calls), while Tool Tax is per TOOLSET — one
    * toolset covered all 224 calls of the session this was found on, and the
    * `tools` bucket had exactly one distinct value throughout. A dead-tool
@@ -2847,8 +3241,11 @@
     // shared turn over the pane's remembered cursor, which is what "the same
     // thing, another view" has to mean.
     reselectInPane(false);
-    var body = document.querySelector(".session-body");
-    if (body) body.classList.toggle("no-inspector", name === "journey");
+    // No pane hides the inspector rail any more, so nothing is toggled here.
+    // Journey was the only one that did, and Trace — which inherited its strip —
+    // has clickable rows in every grain, so a click always has somewhere to put
+    // its payload. `.no-inspector` is written nowhere and styled nowhere.
+    //
     // A hidden pane measures 0 wide, so a chart registered while it was down
     // could never lay itself out. Re-fit on the way up; `fitChart` no-ops when
     // the width is unchanged, so this costs nothing on repeat visits.
@@ -3003,9 +3400,32 @@
       // answering with numbers. `.payload` already wraps and scrolls at 40vh.
       var t = turnForSeq(p.seq);
       var lines = [];
-      if (t && t.prompt) lines.push("PROMPT", String(t.prompt), "");
-      if (t && t.step && t.step.message) {
-        lines.push("RESPONSE", String(t.step.message), "");
+      // `t.prompt` is the user STEP, not its text — `String()` on it printed
+      // "[object Object]" where the ask should be. `stepText` is the accessor
+      // (the anatomy panel two hundred lines up already uses it), and it also
+      // unwraps the envelope and strips the <command-name>/<system-reminder>
+      // scaffolding, so the inspector and the anatomy finally quote the same
+      // words instead of two different renderings of one step.
+      //
+      // `t.ask` first: what a person typed. `t.prompt` is only whatever arrived
+      // last on the user side, which on hook-heavy sessions is `UserPromptSubmit
+      // hook additional context: …` and after a compaction is Claude Code
+      // re-narrating its own tool calls. Falling back to it is still useful —
+      // something did come in — but the heading has to stop claiming it is a
+      // prompt, because mislabelled scaffolding is worse than an absent field.
+      var askText = t ? stepText(t.ask) : "";
+      // Tested on the TEXT, not on the step: a step that exists but resolves to
+      // an empty ask (a placeholder, or pure harness scaffolding) would print a
+      // "PROMPT" heading with nothing under it.
+      if (askText) {
+        lines.push("PROMPT", clip(askText, 20000), "");
+      } else {
+        var inbound = t ? stepText(t.prompt) : "";
+        if (inbound) lines.push("CONTEXT IN (no user prompt on this turn)", clip(inbound, 20000), "");
+      }
+      var replyText = t && t.step ? String(t.step.message || "") : "";
+      if (replyText && replyText.indexOf(EMPTY_STEP_MESSAGE) !== 0) {
+        lines.push("RESPONSE", clip(replyText, 20000), "");
       }
       if (lines.length) lines.push("METRICS");
       lines = lines.concat([
@@ -3172,7 +3592,10 @@
       if (!e) return;
       Inspector.show(id, {
         kind: e.kind,
-        title: "turn " + seq + " · " + e.label,
+        // `t.seq`, not a bare `seq`: there is no `seq` in this scope, so the
+        // title expression threw a ReferenceError and clicking ANY event row
+        // opened nothing at all.
+        title: "turn " + t.seq + " · " + e.label,
         body:
           "agent          " + t.agent + "\n" +
           "at             " + new Date(t.req.ts * 1000).toLocaleTimeString() + "\n" +
@@ -3783,10 +4206,84 @@
       setTurnExpanded(seq, box.hidden);
       return;
     }
+    var dens = e.target.closest && e.target.closest("[data-trace-density]");
+    if (dens) {
+      traceDensity = dens.getAttribute("data-trace-density");
+      document.querySelectorAll("[data-trace-density]").forEach(function (b) {
+        b.classList.toggle(
+          "active",
+          b.getAttribute("data-trace-density") === traceDensity,
+        );
+      });
+      document.querySelectorAll(".trace-grain").forEach(function (g) {
+        g.classList.toggle("active", g.id === "trace-grain-" + traceDensity);
+      });
+      // The grain that just came up may have been laid out at zero width while
+      // hidden, and its rows were filtered by a pass that ran before it existed.
+      applyTurnFilters();
+      fitCharts();
+      return;
+    }
+    var preset = e.target.closest && e.target.closest("[data-turn-preset]");
+    if (preset) {
+      var which = preset.getAttribute("data-turn-preset");
+      traceFilter.kinds = {};
+      if (which === "messages") {
+        MESSAGE_KINDS.forEach(function (k) {
+          traceFilter.kinds[k] = true;
+        });
+      } else {
+        // "reset" clears the text box too. A reset that left a stale query
+        // behind looks like the button is broken.
+        traceFilter.query = "";
+        var q = document.getElementById("trace-q");
+        if (q) q.value = "";
+      }
+      syncTraceChips();
+      redrawTraceFilter();
+      return;
+    }
     var f = e.target.closest && e.target.closest("[data-turn-filter]");
     if (!f) return;
-    f.setAttribute("aria-pressed", f.getAttribute("aria-pressed") === "true" ? "false" : "true");
+    var key = f.getAttribute("data-turn-filter");
+    traceFilter.kinds[key] = !traceFilter.kinds[key];
+    if (!traceFilter.kinds[key]) delete traceFilter.kinds[key];
+    syncTraceChips();
+    redrawTraceFilter();
+  });
+
+  /** Push `traceFilter.kinds` back onto the chips' pressed state. */
+  function syncTraceChips() {
+    document.querySelectorAll("[data-turn-filter]").forEach(function (b) {
+      b.setAttribute(
+        "aria-pressed",
+        traceFilter.kinds[b.getAttribute("data-turn-filter")] === true ? "true" : "false",
+      );
+    });
+  }
+
+  /**
+   * Re-apply the filter everywhere it has an effect.
+   *
+   * The DOM densities are filtered in place; the journey's steps panel is
+   * RE-RENDERED, because it decides what to draw from `traceFilter` at render
+   * time rather than drawing everything and hiding rows. Both spellings are
+   * needed: a panel rebuilt on every scrub cannot rely on hidden flags set once.
+   */
+  function redrawTraceFilter() {
     applyTurnFilters();
+    if (turnsForPane.length) setJourney(journeyIdx);
+  }
+
+  // Debounced: the biggest indexed session here is 1,176 turns and ~4,700
+  // events, and re-running the pass on every keystroke made the box feel like it
+  // was dropping characters. 120ms is below the threshold where typing feels
+  // laggy but well above one keystroke.
+  var runTraceQuery = debounce(redrawTraceFilter, 120);
+  document.addEventListener("input", function (e) {
+    if (!e.target || e.target.id !== "trace-q") return;
+    traceFilter.query = String(e.target.value || "").trim().toLowerCase();
+    runTraceQuery();
   });
 
   /** Selected time window from the ribbon brush, or null for the whole session. */
@@ -3800,24 +4297,31 @@
    * ran last silently undoes the other; they have to be ANDed in one pass.
    */
   function applyTurnFilters() {
-    var on = {};
-    var anyKind = false;
-    document.querySelectorAll("[data-turn-filter]").forEach(function (b) {
-      if (b.getAttribute("aria-pressed") === "true") {
-        on[b.getAttribute("data-turn-filter")] = 1;
-        anyKind = true;
-      }
-    });
+    // The chips are the SOURCE for `traceFilter.kinds`, written on click, so the
+    // pass reads state rather than the DOM. The journey's steps panel re-renders
+    // from that same state on every scrub, which is how one bar filters a view
+    // that redraws itself and a view that does not.
+    var anyKind = traceActiveKinds().length > 0;
+    var filtering = traceFilterActive();
     var r = turnRange;
     var total = 0;
     var shownTurns = 0;
+    var shownEvents = 0;
+    var totalEvents = 0;
     document.querySelectorAll(".turn").forEach(function (t) {
       total++;
       var shown = 0;
       t.querySelectorAll("[data-ev-kind]").forEach(function (ev) {
-        var vis = !anyKind || on[ev.getAttribute("data-ev-kind")] === 1;
+        totalEvents++;
+        var vis = tracePasses(
+          ev.getAttribute("data-ev-kind"),
+          ev.getAttribute("data-trace-text"),
+        );
         ev.hidden = !vis;
-        if (vis) shown++;
+        if (vis) {
+          shown++;
+          shownEvents++;
+        }
       });
       // OVERLAP, not containment: a call that straddles the edge of the window
       // did run during it, and dropping it would understate what was in flight.
@@ -3826,12 +4330,41 @@
         (+t.getAttribute("data-to") >= r.from && +t.getAttribute("data-from") <= r.to);
       // Filtering EVENTS also filters TURNS: a turn with nothing left to show is
       // noise when you have asked "show me only the compactions".
-      t.hidden = !inWindow || (anyKind && shown === 0);
+      //
+      // The query box filters turns by their own summary too, so a text search
+      // finds the turn whose PROMPT matched even when the matching event is not
+      // one of the kinds currently shown.
+      var ownText = (t.getAttribute("data-trace-text") || "");
+      var textOnlyHit = !anyKind && traceQueryPasses(ownText);
+      t.hidden = !inWindow || (filtering && shown === 0 && !textOnlyHit);
       if (!t.hidden) {
         shownTurns++;
-        if (anyKind && shown) setTurnExpanded(t.getAttribute("data-turn"), true);
+        if (filtering && shown) setTurnExpanded(t.getAttribute("data-turn"), true);
       }
     });
+    // Stream density: flat rows, no turn grouping, same predicate.
+    document.querySelectorAll("[data-trace-node]").forEach(function (n) {
+      n.hidden = !tracePasses(
+        n.getAttribute("data-trace-kind"),
+        n.getAttribute("data-trace-text"),
+      );
+    });
+    // Steps density: a step is a BUNDLE of kinds, so it survives if any of its
+    // kinds is showing — hiding a step because one of its four parts was
+    // filtered out would drop content the user explicitly asked to see.
+    document.querySelectorAll("[data-trace-kinds]").forEach(function (s) {
+      var mine = (s.getAttribute("data-trace-kinds") || "").split(" ").filter(Boolean);
+      var kindOk = !anyKind || mine.some(traceKindPasses);
+      s.hidden = !(kindOk && traceQueryPasses(s.getAttribute("data-trace-text")));
+    });
+    var countEl = document.getElementById("trace-count");
+    if (countEl) {
+      countEl.textContent = filtering
+        ? shownEvents + " of " + totalEvents + " events · " +
+          shownTurns + " of " + total + " turns"
+        : total + (total === 1 ? " turn" : " turns") + " · " + totalEvents + " events";
+      countEl.classList.toggle("on", filtering);
+    }
     document.querySelectorAll(".ribbon-bar").forEach(function (b) {
       b.classList.toggle(
         "out",
@@ -4059,19 +4592,26 @@
 
   document.addEventListener("click", function (e) {
     if (!e.target.closest) return;
-    // Lane -> steps filter. Toggling re-renders the detail through the same
-    // path a scrub takes, so there is one render and no second code path to
-    // drift.
+    // A context-bucket row is now just another spelling of a kind chip: it
+    // writes the SHARED filter, so clicking "tools" in the composition table and
+    // pressing the "tool call" chip land in the same state and the two controls
+    // can never disagree about what is filtered.
     var laneBtn = e.target.closest("[data-lane]");
     if (laneBtn) {
       var k = laneBtn.getAttribute("data-lane");
-      journeyLaneFilter = journeyLaneFilter === k ? null : k;
-      setJourney(journeyIdx);
+      if (traceFilter.kinds[k]) delete traceFilter.kinds[k];
+      else traceFilter.kinds[k] = true;
+      syncTraceChips();
+      redrawTraceFilter();
       return;
     }
     if (e.target.closest("[data-lane-clear]")) {
-      journeyLaneFilter = null;
-      setJourney(journeyIdx);
+      traceFilter.kinds = {};
+      traceFilter.query = "";
+      var qbox = document.getElementById("trace-q");
+      if (qbox) qbox.value = "";
+      syncTraceChips();
+      redrawTraceFilter();
       return;
     }
     var step = e.target.closest("[data-jr-step]");
@@ -4350,16 +4890,31 @@
       "</aside></div>"
     );
   }
+  /**
+   * The Stream density: every content block in one chronological chain.
+   *
+   * This was the Flow pane. It is the FINEST grain of the same session the spine
+   * shows per-turn and the anatomy shows per-turn-opened-up, which is why all
+   * three now live behind one density switch instead of three tabs.
+   */
   function renderFlowPane(flow) {
     var nodes = (flow && flow.nodes) || [];
     if (!nodes.length) {
-      return '<div class="empty-pane">No flow nodes yet — index a session with transcript steps.</div>';
+      return '<div class="empty-pane">No stream nodes yet — index a session with transcript steps.</div>';
     }
     var html =
       '<div class="flow-layout"><div class="flow-graph" id="flow-graph">';
     nodes.forEach(function (n, i) {
       var lane = n.lane ? " lane-" + Math.min(n.lane, 3) : "";
       var err = n.errored ? " errored" : "";
+      // Mapped into the shared vocabulary so ONE filter drives this density too.
+      // The server's names are left alone (other consumers read them); the
+      // translation happens here, at the edge.
+      var tk = FLOW_KIND_MAP[n.kind] || n.kind;
+      var text = (String(n.label || "") + " " +
+        (n.detail ? JSON.stringify(n.detail) : n.detailPreview || ""))
+        .slice(0, 4000)
+        .toLowerCase();
       html +=
         '<div class="flow-node kind-' +
         esc(n.kind) +
@@ -4367,6 +4922,10 @@
         err +
         '" data-kind="' +
         esc(n.kind) +
+        '" data-trace-node="1" data-trace-kind="' +
+        esc(tk) +
+        '" data-trace-text="' +
+        esc(text) +
         '" data-label="' +
         esc(n.label) +
         '" data-node-id="' +
@@ -4392,12 +4951,16 @@
         i +
         '">' +
         '<span class="flow-kind">' +
-        esc(n.kind.replace("_", " ")) +
+        esc(traceKindLabel(tk)) +
         "</span>" +
         '<span class="flow-label">' +
         esc(n.label) +
         "</span>" +
         "</div>";
+      // The connector is decorative and must not survive its neighbours being
+      // filtered out: a chain of edges with no nodes between them reads as
+      // missing content rather than as hidden content. Filtering hides the node,
+      // and CSS hides an edge adjacent to a hidden node.
       if (i < nodes.length - 1)
         html += '<div class="flow-edge" aria-hidden="true"></div>';
     });
@@ -4446,6 +5009,12 @@
         timelineForPane = tl;
         host.innerHTML = renderContextTimeline(tl);
         if (compEl) compEl.innerHTML = renderCompactionNav(tl);
+        // Trace's CONTEXT panel reads `timelineForPane` for its bucket
+        // composition, and it was already drawn — before this fetch resolved —
+        // so it rendered the "timeline has not loaded" fallback and kept showing
+        // it until the user happened to scrub to another turn. Redraw the focused
+        // turn now that the data it needs exists.
+        if (turnsForPane.length) setJourney(journeyIdx);
         // The auto-loaded x-ray resolved before this markup existed, so there
         // was nothing to mark selected at the time. Re-apply it now.
         markXraySelection(currentXraySeq);
@@ -5061,12 +5630,33 @@
         "</pre></details>";
     }
     if (!body) body = '<div class="step-body dim">(empty step)</div>';
+    // A step is a BUNDLE — it can hold a prompt, thinking, a reply, calls and
+    // results at once — so it advertises every kind it contains and survives the
+    // filter if any one of them is showing. Hiding a step because one of its four
+    // parts was filtered out would drop content the user asked to see.
+    var kinds = [];
+    if (st.role === "user" && String(st.message || "").trim()) kinds.push("prompt");
+    if (String(st.reasoning || "").trim()) kinds.push("thinking");
+    if (st.role !== "user" && String(st.message || "").trim()) kinds.push("reply");
+    if (String(st.toolName || "").trim()) kinds.push("tool_call");
+    if (String(st.observation || "").trim()) kinds.push("tool_result");
+    var haystack = (
+      String(st.message || "") + " " + String(st.reasoning || "") + " " +
+      String(st.toolName || "") + " " + String(st.toolInput || "") + " " +
+      String(st.observation || "")
+    )
+      .slice(0, 6000)
+      .toLowerCase();
     return (
       '<div class="step ' +
       roleClass +
       (st.errored ? " errored" : "") +
       '" id="step-' +
       st.stepIndex +
+      '" data-trace-kinds="' +
+      esc(kinds.join(" ")) +
+      '" data-trace-text="' +
+      esc(haystack) +
       '">' +
       head +
       body +
@@ -5231,15 +5821,11 @@
     );
   }
 
-  function clip(s, n) {
-    s = String(s);
-    return s.length > n
-      ? s.slice(0, n) +
-          "\n… (" +
-          (s.length - n) +
-          " more chars — see wire report)"
-      : s;
-  }
+  // `clip` lives at the top of the file, next to the journey panels that need
+  // its newline-preserving behaviour. A SECOND `function clip` used to sit here;
+  // both were in the same IIFE scope, so this one won for every caller and the
+  // journey silently lost its <system-reminder> stripping — the panels were
+  // quoting harness chatter as if the user had typed it.
 
   // ------------------------------------------------- analytics (merged pane)
   /**
@@ -7023,7 +7609,23 @@
   // A turn stays selected as you cross panes, so "what did the context look
   // like on this call" and "what did the wire do on this call" are one
   // keystroke apart instead of a click, a scroll and a hunt.
-  var SESSION_PANES = ["journey", "flow", "hooks", "xray", "tools", "wire", "related"];
+  var SESSION_PANES = ["trace", "hooks", "xray", "tools", "related"];
+  /**
+   * Retired pane names → where they went.
+   *
+   * Journey, Flow and Wire are one "trace" pane now. Bookmarks and links in
+   * older notes still spell the old names, and the session route regex is built
+   * from SESSION_PANES — an unrecognised pane makes the WHOLE route miss and
+   * silently drops the user on the session list, which reads as "the link is
+   * broken" rather than "that tab was renamed". So the aliases stay routable,
+   * and each one also says which grain to open at.
+   */
+  var PANE_ALIASES = {
+    journey: { pane: "trace", density: "turns" },
+    flow: { pane: "trace", density: "stream" },
+    // Wire was the turn spine over the time ribbon — that is the Turns grain.
+    wire: { pane: "trace", density: "turns" },
+  };
   var selectedSeq = null;
   // Where you were in each pane. Returning a pane to its first row every time
   // makes LEFT/RIGHT feel like it discards your place, which defeats the point
@@ -7106,18 +7708,13 @@
     if (!vertical && !horizontal) return false;
 
     if (horizontal) {
-      // On the journey, LEFT/RIGHT scrubs. It is the pane's ONLY axis, so
-      // taking the arrows here costs nothing and reading a session by holding
-      // → is the interaction the view exists for. The pane switch keeps its
-      // other spelling (the subnav) and every other pane is unaffected.
-      if (current.pane === "journey" && turnsForPane.length) {
-        e.preventDefault();
-        setJourney(journeyIdx + (k === "ArrowRight" ? 1 : -1));
-        return true;
-      }
       // On a turn row, LEFT/RIGHT means expand/collapse rather than change
       // pane — drilling into the thing you have selected is the nearer
       // meaning, and the pane switch is still there once it is collapsed.
+      //
+      // This is tested BEFORE the scrub now that both live in one pane: a
+      // selected row is the more specific target, and scrubbing the strip out
+      // from under the row you just opened is not what → meant.
       var sel = Inspector.selected() || "";
       if (sel.indexOf("ctp:") === 0) {
         var seq = sel.slice(4);
@@ -7126,7 +7723,15 @@
           return true;
         }
       }
-      var cur = SESSION_PANES.indexOf(current.pane || "journey");
+      // Otherwise LEFT/RIGHT scrubs the strip — reading a session by holding →
+      // is the interaction it exists for. The pane switch keeps its other
+      // spelling (the subnav) and every other pane is unaffected.
+      if (current.pane === "trace" && turnsForPane.length) {
+        e.preventDefault();
+        setJourney(journeyIdx + (k === "ArrowRight" ? 1 : -1));
+        return true;
+      }
+      var cur = SESSION_PANES.indexOf(current.pane || "trace");
       if (cur < 0) cur = 0;
       var step = k === "ArrowRight" ? 1 : SESSION_PANES.length - 1;
       e.preventDefault();
@@ -7491,4 +8096,60 @@
   connectSSE();
   loadMeta();
   route();
+
+  /**
+   * Test hook — the browser never takes this branch.
+   *
+   * This file is served as an inline <script>, so there is no module boundary a
+   * test could import through, and for a long time that meant the dashboard's
+   * 7.9k lines had NO automated coverage at all: three latent bugs (a
+   * ReferenceError on every event click, a duplicate `clip` that silently
+   * disabled system-reminder stripping, a timeline that never refreshed the
+   * panel that consumed it) all shipped and survived because nothing could call
+   * these functions outside a browser.
+   *
+   * Exposing the pure pieces — the event model and the filter predicate — lets
+   * `node --test` assert them against real fixtures. Everything here is a
+   * function or a value that needs no live DOM.
+   */
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+      buildTurns: buildTurns,
+      stepCard: stepCard,
+      turnSpineHtml: turnSpineHtml,
+      renderFlowPane: renderFlowPane,
+      journeyStepsHtml: journeyStepsHtml,
+      traceFilterBarHtml: traceFilterBarHtml,
+      traceTextFor: traceTextFor,
+      traceKindLabel: traceKindLabel,
+      // The step→text accessor. Exported because the inspector printed
+      // "[object Object]" for a whole release by calling `String()` on the step
+      // instead, and a test can only catch that by asserting the accessor is
+      // what turns a step into words.
+      stepText: stepText,
+      isUserAsk: isUserAsk,
+      // The filter PASS, not just the predicate. It reads and writes a live DOM,
+      // so the test drives it against a constructed element graph — the same
+      // code path a click takes, which is the only way to catch a selector that
+      // no longer matches the markup it was written for.
+      applyTurnFilters: applyTurnFilters,
+      setTurnRange: setTurnRange,
+      tracePasses: tracePasses,
+      traceFilterSummary: traceFilterSummary,
+      TRACE_KINDS: TRACE_KINDS,
+      MESSAGE_KINDS: MESSAGE_KINDS,
+      FLOW_KIND_MAP: FLOW_KIND_MAP,
+      BUCKET_KIND: BUCKET_KIND,
+      SESSION_PANES: SESSION_PANES,
+      PANE_ALIASES: PANE_ALIASES,
+      /** Mutate the shared filter the way the chips and query box do. */
+      setFilter: function (kinds, query) {
+        traceFilter.kinds = {};
+        (kinds || []).forEach(function (k) {
+          traceFilter.kinds[k] = true;
+        });
+        traceFilter.query = String(query || "").toLowerCase();
+      },
+    };
+  }
 })();
