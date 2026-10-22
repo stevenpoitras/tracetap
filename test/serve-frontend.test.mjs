@@ -617,3 +617,20 @@ test("a turn separates what a person asked from what merely came in", () => {
   assert.equal(prompts.length, 1);
   assert.match(prompts[0].detail, /fix the flaky test/);
 });
+
+test("placeholder steps are not counted as messages", () => {
+  const html = app.stepCard(
+    step({ stepIndex: 9, role: "agent", message: "<block>no content", toolName: "Bash" }),
+  );
+  const kinds = html.match(/data-trace-kinds="([^"]*)"/)[1].split(" ");
+  assert.ok(!kinds.includes("reply"), "a placeholder must not survive messages-only as a reply");
+  assert.ok(kinds.includes("tool_call"));
+});
+
+test("stepBody keeps the whole ask; stepText is the one-line label", () => {
+  const long = "line one\n" + "x".repeat(500);
+  const st = step({ stepIndex: 1, role: "user", message: JSON.stringify({ user: long }) });
+  assert.equal(app.stepBody(st), long, "the inspector needs the full prompt, line breaks intact");
+  assert.ok(app.stepText(st).length <= 200);
+  assert.equal(app.stepBody(step({ stepIndex: 2, role: "agent", message: "<block>no" })), "");
+});

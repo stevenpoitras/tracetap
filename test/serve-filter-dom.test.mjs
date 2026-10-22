@@ -55,8 +55,14 @@ class El {
     }
     return this;
   }
+  get parentNode() {
+    return this.parent;
+  }
   getAttribute(n) {
     return n in this.attrs ? String(this.attrs[n]) : null;
+  }
+  hasAttribute(n) {
+    return n in this.attrs;
   }
   setAttribute(n, v) {
     this.attrs[n] = String(v);
@@ -344,4 +350,38 @@ test("the time window and the kind filter are ANDed in one pass", () => {
 
   d.app.setTurnRange(null);
   d.app.setFilter([], "");
+});
+
+test("stream edges bridge hidden nodes instead of leaving stubs", () => {
+  const { app, root } = loadApp();
+  const chain = new El({ classes: ["flow-chain"] });
+  const node = (kind, text) =>
+    new El({
+      classes: ["flow-node"],
+      attrs: { "data-trace-node": "1", "data-trace-kind": kind, "data-trace-text": text },
+    });
+  const edge = () => new El({ classes: ["flow-edge"] });
+  const a = node("prompt", "ask");
+  const b = node("tool_call", "bash");
+  const c = node("reply", "done");
+  const e1 = edge();
+  const e2 = edge();
+  chain.append(a, e1, b, e2, c);
+  root.append(chain);
+
+  app.setFilter([], "");
+  app.applyTurnFilters();
+  assert.ok(visible(e1) && visible(e2), "unfiltered chain lost a connector");
+
+  // Hiding the middle node: one connector joins prompt→reply, no stub either side.
+  app.setFilter(["prompt", "reply"], "");
+  app.applyTurnFilters();
+  assert.ok(!visible(b));
+  assert.equal([e1, e2].filter(visible).length, 1, "expected exactly one bridging edge");
+
+  // Hiding the tail: nothing dangles off the last visible node.
+  app.setFilter(["prompt", "tool_call"], "");
+  app.applyTurnFilters();
+  assert.ok(visible(e1) && !visible(e2), "edge into a hidden tail must go");
+  app.setFilter([], "");
 });

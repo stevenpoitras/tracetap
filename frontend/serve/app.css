@@ -1632,7 +1632,7 @@ h1 {
    with them. A column of orphaned edge stubs reads as content that failed to
    render rather than as content deliberately hidden. */
 .flow-node[hidden] { display: none; }
-.flow-node[hidden] + .flow-edge { display: none; }
+.flow-edge[hidden] { display: none; }
 .step[hidden] { display: none; }
 .payload {
   margin: 0;

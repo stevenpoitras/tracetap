@@ -1144,7 +1144,7 @@
       // "prompt" every time that machinery changed, reporting dozens of prompts
       // for one thing the person typed.
       if (askStep && askStep !== lastPromptStep) {
-        var ptext = stepText(askStep);
+        var ptext = stepBody(askStep);
         if (String(ptext || "").trim()) {
           evs.push({
             kind: "prompt",
@@ -1343,6 +1343,16 @@
    * the spine, it just does not need its tags.
    */
   function stepText(st) {
+    return oneLine(stepBody(st), 200);
+  }
+
+  /**
+   * The same unwrapped text as `stepText`, at full length and with its line
+   * breaks. `stepText` is a ROW label (one line, 200 chars); the inspector and
+   * the filter haystack need the whole ask, or a long prompt is cut at 200 chars
+   * and the query can only ever match its opening.
+   */
+  function stepBody(st) {
     if (!st) return "";
     var raw = String(st.message || "");
     if (!raw || raw.indexOf(EMPTY_STEP_MESSAGE) === 0) return "";
@@ -1367,8 +1377,10 @@
       .replace(/<command-args>\s*/g, " ")
       .replace(/<\/command-args>/g, "")
       .replace(/<\/?local-command-stdout>/g, "")
-      .replace(/<\/?transcript>/g, "");
-    return label + oneLine(raw, 200);
+      .replace(/<\/?transcript>/g, "")
+      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
+      .trim();
+    return raw ? label + raw : "";
   }
 
   /**
@@ -2868,6 +2880,9 @@
       document.getElementById("pane-" + pane)
     ) {
       activatePane(pane);
+      // A legacy alias (#…/flow) has already set traceDensity in route(); the
+      // grain on screen has to follow it, not stay on whatever was open.
+      if (pane === "trace") syncTraceDensity();
       if (stepN != null) {
         showTraceStep(stepN);
       }
@@ -3413,14 +3428,14 @@
       // re-narrating its own tool calls. Falling back to it is still useful —
       // something did come in — but the heading has to stop claiming it is a
       // prompt, because mislabelled scaffolding is worse than an absent field.
-      var askText = t ? stepText(t.ask) : "";
+      var askText = t ? stepBody(t.ask) : "";
       // Tested on the TEXT, not on the step: a step that exists but resolves to
       // an empty ask (a placeholder, or pure harness scaffolding) would print a
       // "PROMPT" heading with nothing under it.
       if (askText) {
         lines.push("PROMPT", clip(askText, 20000), "");
       } else {
-        var inbound = t ? stepText(t.prompt) : "";
+        var inbound = t ? stepBody(t.prompt) : "";
         if (inbound) lines.push("CONTEXT IN (no user prompt on this turn)", clip(inbound, 20000), "");
       }
       var replyText = t && t.step ? String(t.step.message || "") : "";
@@ -4209,19 +4224,7 @@
     var dens = e.target.closest && e.target.closest("[data-trace-density]");
     if (dens) {
       traceDensity = dens.getAttribute("data-trace-density");
-      document.querySelectorAll("[data-trace-density]").forEach(function (b) {
-        b.classList.toggle(
-          "active",
-          b.getAttribute("data-trace-density") === traceDensity,
-        );
-      });
-      document.querySelectorAll(".trace-grain").forEach(function (g) {
-        g.classList.toggle("active", g.id === "trace-grain-" + traceDensity);
-      });
-      // The grain that just came up may have been laid out at zero width while
-      // hidden, and its rows were filtered by a pass that ran before it existed.
-      applyTurnFilters();
-      fitCharts();
+      syncTraceDensity();
       return;
     }
     var preset = e.target.closest && e.target.closest("[data-turn-preset]");
@@ -4296,6 +4299,23 @@
    * want to hide turns. Letting each write `hidden` directly means whichever
    * ran last silently undoes the other; they have to be ANDed in one pass.
    */
+  /** Show the grain `traceDensity` names: its switch button and its panel. */
+  function syncTraceDensity() {
+    document.querySelectorAll("[data-trace-density]").forEach(function (b) {
+      b.classList.toggle(
+        "active",
+        b.getAttribute("data-trace-density") === traceDensity,
+      );
+    });
+    document.querySelectorAll(".trace-grain").forEach(function (g) {
+      g.classList.toggle("active", g.id === "trace-grain-" + traceDensity);
+    });
+    // The grain that just came up may have been laid out at zero width while
+    // hidden, and its rows were filtered by a pass that ran before it existed.
+    applyTurnFilters();
+    fitCharts();
+  }
+
   function applyTurnFilters() {
     // The chips are the SOURCE for `traceFilter.kinds`, written on click, so the
     // pass reads state rather than the DOM. The journey's steps panel re-renders
@@ -4343,11 +4363,30 @@
       }
     });
     // Stream density: flat rows, no turn grouping, same predicate.
+    var flowChains = [];
     document.querySelectorAll("[data-trace-node]").forEach(function (n) {
       n.hidden = !tracePasses(
         n.getAttribute("data-trace-kind"),
         n.getAttribute("data-trace-text"),
       );
+      if (flowChains.indexOf(n.parentNode) < 0) flowChains.push(n.parentNode);
+    });
+    // Connectors are decorative: show exactly one between consecutive VISIBLE
+    // nodes, so a filtered chain bridges its gaps instead of leaving stubs on
+    // either side of a hidden node.
+    flowChains.forEach(function (chain) {
+      var seen = false;
+      var pending = null;
+      Array.prototype.forEach.call(chain.children, function (c) {
+        if (c.classList.contains("flow-edge")) {
+          c.hidden = true;
+          if (seen && !pending) pending = c;
+        } else if (c.hasAttribute("data-trace-node") && !c.hidden) {
+          if (pending) pending.hidden = false;
+          pending = null;
+          seen = true;
+        }
+      });
     });
     // Steps density: a step is a BUNDLE of kinds, so it survives if any of its
     // kinds is showing — hiding a step because one of its four parts was
@@ -4960,7 +4999,7 @@
       // The connector is decorative and must not survive its neighbours being
       // filtered out: a chain of edges with no nodes between them reads as
       // missing content rather than as hidden content. Filtering hides the node,
-      // and CSS hides an edge adjacent to a hidden node.
+      // and applyTurnFilters keeps one edge between each pair of visible nodes.
       if (i < nodes.length - 1)
         html += '<div class="flow-edge" aria-hidden="true"></div>';
     });
@@ -5635,9 +5674,13 @@
     // filter if any one of them is showing. Hiding a step because one of its four
     // parts was filtered out would drop content the user asked to see.
     var kinds = [];
-    if (st.role === "user" && String(st.message || "").trim()) kinds.push("prompt");
+    // The indexer's `<block>no` placeholder is not a message — buildTurns
+    // already skips it, and messages-only must not keep tool-only steps by it.
+    var said = String(st.message || "").trim();
+    if (said.indexOf(EMPTY_STEP_MESSAGE) === 0) said = "";
+    if (st.role === "user" && said) kinds.push("prompt");
     if (String(st.reasoning || "").trim()) kinds.push("thinking");
-    if (st.role !== "user" && String(st.message || "").trim()) kinds.push("reply");
+    if (st.role !== "user" && said) kinds.push("reply");
     if (String(st.toolName || "").trim()) kinds.push("tool_call");
     if (String(st.observation || "").trim()) kinds.push("tool_result");
     var haystack = (
@@ -8127,6 +8170,7 @@
       // instead, and a test can only catch that by asserting the accessor is
       // what turns a step into words.
       stepText: stepText,
+      stepBody: stepBody,
       isUserAsk: isUserAsk,
       // The filter PASS, not just the predicate. It reads and writes a live DOM,
       // so the test drives it against a constructed element graph — the same
