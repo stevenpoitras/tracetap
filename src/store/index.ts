@@ -2262,10 +2262,16 @@ export class Store {
     // A uuid is positive identity: if it resolved and still produced no rows,
     // this conversation simply has no hooks, and guessing by clock would serve
     // a neighbouring session's under it.
-    if (session && !byId.length && !claudeSessionId) {
+    // The window must be real, too: with no timestamps (0..0) the old fallback
+    // bounds became 0..MAX_SAFE_INTEGER — every hook ever captured — and the cwd
+    // fence passes cwd-less hooks by design, so nothing else holds the line. A
+    // point or inverted window would still open ±slack into a net around
+    // whatever ran nearby, so it counts as no window either.
+    const hasWindow = !!session && session.startedAt > 0 && session.endedAt > session.startedAt;
+    if (session && hasWindow && !byId.length && !claudeSessionId) {
       const slack = 600; // 10 minutes — long tool calls can lag the wire window
-      const start = session.startedAt > 0 ? session.startedAt - slack : 0;
-      const end = session.endedAt > 0 ? session.endedAt + slack : Number.MAX_SAFE_INTEGER;
+      const start = session.startedAt - slack;
+      const end = session.endedAt + slack;
       byTime = this.db
         .prepare(
           `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
