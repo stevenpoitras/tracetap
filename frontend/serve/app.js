@@ -1023,9 +1023,32 @@
   function traceTextFor(e) {
     return String(
       (e.label || "") + " " + (e.tool || "") + " " + (e.detail || ""),
-    )
-      .slice(0, 4000)
-      .toLowerCase();
+    ).toLowerCase();
+  }
+
+  /**
+   * What the query box searches, held in JS rather than in the markup.
+   *
+   * It used to ride on each row as a `data-trace-text` attribute, capped at
+   * 4000–6000 chars to keep the page from ballooning — 3.4 MB of attribute text
+   * on an 1170-turn session even so — and the cap meant a word past the cut in
+   * a long tool result could never be found. Rows now carry a short
+   * `data-trace-key`; the full lowercased text lives here, keyed the same way.
+   * Keys are stable per row (`ev:<seq>:<j>`, `node:<id>`, `step:<n>`), so a
+   * re-render overwrites rather than accumulates; a new session clears it.
+   */
+  var traceHay = {};
+
+  function traceHayAttr(key, text) {
+    traceHay[key] = String(text || "").toLowerCase();
+    return ' data-trace-key="' + esc(key) + '"';
+  }
+
+  /** The searchable text of a row: its keyed haystack, or an inline attribute. */
+  function traceTextOf(el) {
+    var key = el.getAttribute("data-trace-key");
+    if (key != null && Object.prototype.hasOwnProperty.call(traceHay, key)) return traceHay[key];
+    return el.getAttribute("data-trace-text") || "";
   }
 
   /** One-line preview for an event label. */
@@ -1993,7 +2016,7 @@
       " · click to jump)</small></h2>" +
       '<div class="jr-insights">' + chips + "</div>" +
       '<h2 class="sec">Session <small>(' + turns.length +
-      " turns · drag or ←→ to scrub · height is context, fill is cache split)</small></h2>" +
+      " turns · drag or ←→ to scrub · shift+←→ switches pane · height is context, fill is cache split)</small></h2>" +
       '<div class="jr-strip" id="jr-strip" style="height:' + JOURNEY_H + 'px">' +
       cols + "</div>" +
       '<input class="jr-range" id="jr-range" type="range" min="0" max="' +
@@ -2408,7 +2431,7 @@
       '<label class="turn-q"><span class="sr-only">Filter by text</span>' +
       '<input type="search" id="trace-q" placeholder="filter text…" ' +
       'value="' + esc(traceFilter.query) + '" autocomplete="off"></label>' +
-      '<span class="turn-count" id="trace-count"></span>' +
+      '<span class="turn-count" id="trace-count" aria-live="polite"></span>' +
       '<span class="turn-legend">' +
       '<i class="seg-read"></i>cache read<i class="seg-write"></i>cache write' +
       '<i class="seg-fresh"></i>fresh input</span>' +
@@ -2444,6 +2467,7 @@
       return (
         '<button type="button" class="trace-density' +
         (traceDensity === d.key ? " active" : "") +
+        '" aria-pressed="' + (traceDensity === d.key ? "true" : "false") +
         '" data-trace-density="' + esc(d.key) + '" title="' + esc(d.hint) + '">' +
         esc(d.label) + "</button>"
       );
@@ -2514,13 +2538,13 @@
           .map(function (e, j) {
             return (
               '<div class="turn-ev ev-' + esc(e.kind) + '" data-ev-kind="' + esc(e.kind) +
-              // The text the query box matches against. Held in an attribute
-              // rather than read from `textContent` because the label is a
-              // 96-char preview while the DETAIL is what the user is searching
-              // for — "filter: rebase" has to find a Bash call whose visible
-              // label was truncated before the word.
-              '" data-trace-text="' + esc(traceTextFor(e)) +
-              '" data-inspect="ev:' + t.seq + ":" + j + '" tabindex="0">' +
+              // The text the query box matches against. Not read from
+              // `textContent` because the label is a 96-char preview while the
+              // DETAIL is what the user is searching for — "filter: rebase" has
+              // to find a Bash call whose visible label was truncated before
+              // the word. Held in `traceHay`, not in the markup.
+              '"' + traceHayAttr("ev:" + t.seq + ":" + j, traceTextFor(e)) +
+              ' data-inspect="ev:' + t.seq + ":" + j + '" tabindex="0">' +
               '<span class="ev-kind">' + esc(traceKindLabel(e.kind)) + "</span>" +
               '<span class="ev-label">' + esc(e.label) + "</span>" +
               '<span class="ev-n">' + (e.n == null ? "" : esc(String(e.n))) + "</span>" +
@@ -2898,6 +2922,7 @@
     // session keeps it — that is the forgetting the filter state exists to stop.
     if (current.name !== "session" || current.arg !== id) {
       traceFilter = { kinds: {}, query: "" };
+      traceHay = {};
     }
     current = { name: "session", arg: id, pane: pane || "trace" };
     setView(skeleton({ cards: 8, rows: 6 }));
@@ -3166,9 +3191,10 @@
     setJourney(0);
     bindSessionInteractions(reqs, compactSeqs, steps);
     bindSessionPanes(s.sessionId, reqs);
-    // The filter survives a re-render (a live index update redraws the pane), so
-    // re-apply it rather than leaving fresh markup unfiltered under a bar that
-    // still shows chips pressed.
+    // Filter state lives in `traceFilter`, not in the markup, so fresh markup is
+    // filtered here rather than shown whole under a bar with chips pressed. (A
+    // live index update does NOT reach this: route() on the open session only
+    // re-activates the pane — see renderSession — so the data is not refetched.)
     applyTurnFilters();
     if (stepN != null) showTraceStep(stepN);
   }
@@ -3183,13 +3209,7 @@
   function showTraceStep(stepN) {
     activatePane("trace");
     traceDensity = "steps";
-    document.querySelectorAll("[data-trace-density]").forEach(function (b) {
-      b.classList.toggle("active", b.getAttribute("data-trace-density") === "steps");
-    });
-    document.querySelectorAll(".trace-grain").forEach(function (g) {
-      g.classList.toggle("active", g.id === "trace-grain-steps");
-    });
-    applyTurnFilters();
+    syncTraceDensity();
     setTimeout(function () {
       flashStep(stepN);
     }, 30);
@@ -4205,8 +4225,8 @@
   }
 
   /** Expand or collapse one turn. */
-  function setTurnExpanded(seq, open) {
-    var turn = document.querySelector('.turn[data-turn="' + seq + '"]');
+  function setTurnExpanded(seq, open, turnEl) {
+    var turn = turnEl || document.querySelector('.turn[data-turn="' + seq + '"]');
     if (!turn) return false;
     var box = turn.querySelector(".turn-events");
     var caret = turn.querySelector(".turn-caret");
@@ -4221,8 +4241,12 @@
     if (c) {
       e.stopPropagation();
       var seq = c.getAttribute("data-expand");
-      var box = c.closest(".turn").querySelector(".turn-events");
-      setTurnExpanded(seq, box.hidden);
+      var turnEl = c.closest(".turn");
+      var box = turnEl.querySelector(".turn-events");
+      // A turn the user opened or closed by hand is theirs: clearing the filter
+      // must not collapse it.
+      turnEl._autoOpen = false;
+      setTurnExpanded(seq, box.hidden, turnEl);
       return;
     }
     var dens = e.target.closest && e.target.closest("[data-trace-density]");
@@ -4306,10 +4330,9 @@
   /** Show the grain `traceDensity` names: its switch button and its panel. */
   function syncTraceDensity() {
     document.querySelectorAll("[data-trace-density]").forEach(function (b) {
-      b.classList.toggle(
-        "active",
-        b.getAttribute("data-trace-density") === traceDensity,
-      );
+      var on = b.getAttribute("data-trace-density") === traceDensity;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-pressed", on ? "true" : "false");
     });
     document.querySelectorAll(".trace-grain").forEach(function (g) {
       g.classList.toggle("active", g.id === "trace-grain-" + traceDensity);
@@ -4339,7 +4362,7 @@
         totalEvents++;
         var vis = tracePasses(
           ev.getAttribute("data-ev-kind"),
-          ev.getAttribute("data-trace-text"),
+          traceTextOf(ev),
         );
         ev.hidden = !vis;
         if (vis) {
@@ -4358,21 +4381,32 @@
       // The query box filters turns by their own summary too, so a text search
       // finds the turn whose PROMPT matched even when the matching event is not
       // one of the kinds currently shown.
-      var ownText = (t.getAttribute("data-trace-text") || "");
+      var ownText = traceTextOf(t);
       var textOnlyHit = !anyKind && traceQueryPasses(ownText);
       t.hidden = !inWindow || (filtering && shown === 0 && !textOnlyHit);
-      if (!t.hidden) {
-        shownTurns++;
-        if (filtering && shown) setTurnExpanded(t.getAttribute("data-turn"), true);
+      if (!t.hidden) shownTurns++;
+      // Filtering opens the turns it matched so the hits are visible; clearing
+      // it closes exactly those again. Without the bookkeeping, one search left
+      // a 1,000-turn spine fully expanded with no way back but collapsing each.
+      var seq = t.getAttribute("data-turn");
+      if (!t.hidden && filtering && shown) {
+        if (!t._autoOpen && setTurnExpanded(seq, true, t)) t._autoOpen = true;
+      } else if (t._autoOpen) {
+        setTurnExpanded(seq, false, t);
+        t._autoOpen = false;
       }
     });
     // Stream density: flat rows, no turn grouping, same predicate.
     var flowChains = [];
+    var totalNodes = 0;
+    var shownNodes = 0;
     document.querySelectorAll("[data-trace-node]").forEach(function (n) {
       n.hidden = !tracePasses(
         n.getAttribute("data-trace-kind"),
-        n.getAttribute("data-trace-text"),
+        traceTextOf(n),
       );
+      totalNodes++;
+      if (!n.hidden) shownNodes++;
       if (flowChains.indexOf(n.parentNode) < 0) flowChains.push(n.parentNode);
     });
     // Connectors are decorative: show exactly one between consecutive VISIBLE
@@ -4395,17 +4429,38 @@
     // Steps density: a step is a BUNDLE of kinds, so it survives if any of its
     // kinds is showing — hiding a step because one of its four parts was
     // filtered out would drop content the user explicitly asked to see.
+    var totalSteps = 0;
+    var shownSteps = 0;
     document.querySelectorAll("[data-trace-kinds]").forEach(function (s) {
       var mine = (s.getAttribute("data-trace-kinds") || "").split(" ").filter(Boolean);
       var kindOk = !anyKind || mine.some(traceKindPasses);
-      s.hidden = !(kindOk && traceQueryPasses(s.getAttribute("data-trace-text")));
+      s.hidden = !(kindOk && traceQueryPasses(traceTextOf(s)));
+      totalSteps++;
+      if (!s.hidden) shownSteps++;
     });
     var countEl = document.getElementById("trace-count");
     if (countEl) {
-      countEl.textContent = filtering
-        ? shownEvents + " of " + totalEvents + " events · " +
-          shownTurns + " of " + total + " turns"
-        : total + (total === 1 ? " turn" : " turns") + " · " + totalEvents + " events";
+      // The count speaks for the grain on screen. Quoting spine events while
+      // the Stream is showing told the user a number they could not see.
+      var unit = function (n, one, many) {
+        return n === 1 ? one : many;
+      };
+      var text;
+      if (traceDensity === "stream") {
+        text = filtering
+          ? shownNodes + " of " + totalNodes + " blocks"
+          : totalNodes + " " + unit(totalNodes, "block", "blocks");
+      } else if (traceDensity === "steps") {
+        text = filtering
+          ? shownSteps + " of " + totalSteps + " steps"
+          : totalSteps + " " + unit(totalSteps, "step", "steps");
+      } else {
+        text = filtering
+          ? shownEvents + " of " + totalEvents + " events · " +
+            shownTurns + " of " + total + " turns"
+          : total + " " + unit(total, "turn", "turns") + " · " + totalEvents + " events";
+      }
+      countEl.textContent = text;
       countEl.classList.toggle("on", filtering);
     }
     document.querySelectorAll(".ribbon-bar").forEach(function (b) {
@@ -4954,10 +5009,8 @@
       // The server's names are left alone (other consumers read them); the
       // translation happens here, at the edge.
       var tk = FLOW_KIND_MAP[n.kind] || n.kind;
-      var text = (String(n.label || "") + " " +
-        (n.detail ? JSON.stringify(n.detail) : n.detailPreview || ""))
-        .slice(0, 4000)
-        .toLowerCase();
+      var text = String(n.label || "") + " " +
+        (n.detail ? JSON.stringify(n.detail) : n.detailPreview || "");
       html +=
         '<div class="flow-node kind-' +
         esc(n.kind) +
@@ -4967,9 +5020,9 @@
         esc(n.kind) +
         '" data-trace-node="1" data-trace-kind="' +
         esc(tk) +
-        '" data-trace-text="' +
-        esc(text) +
-        '" data-label="' +
+        '"' +
+        traceHayAttr("node:" + (n.id != null ? n.id : i), text) +
+        ' data-label="' +
         esc(n.label) +
         '" data-node-id="' +
         esc(n.id) +
@@ -5691,9 +5744,7 @@
       String(st.message || "") + " " + String(st.reasoning || "") + " " +
       String(st.toolName || "") + " " + String(st.toolInput || "") + " " +
       String(st.observation || "")
-    )
-      .slice(0, 6000)
-      .toLowerCase();
+    );
     return (
       '<div class="step ' +
       roleClass +
@@ -5702,9 +5753,9 @@
       st.stepIndex +
       '" data-trace-kinds="' +
       esc(kinds.join(" ")) +
-      '" data-trace-text="' +
-      esc(haystack) +
-      '">' +
+      '"' +
+      traceHayAttr("step:" + st.stepIndex, haystack) +
+      ">" +
       head +
       body +
       "</div>"
@@ -7754,6 +7805,20 @@
     var horizontal = k === "ArrowRight" || k === "ArrowLeft";
     if (!vertical && !horizontal) return false;
 
+    if (horizontal && e.shiftKey) {
+      // SHIFT+LEFT/RIGHT always switches pane. Plain LEFT/RIGHT is taken on
+      // Trace (expand a row, scrub the strip), which left the default pane
+      // with no keyboard way out.
+      var from = SESSION_PANES.indexOf(current.pane || "trace");
+      if (from < 0) from = 0;
+      e.preventDefault();
+      activatePane(
+        SESSION_PANES[(from + (k === "ArrowRight" ? 1 : SESSION_PANES.length - 1)) % SESSION_PANES.length],
+      );
+      setTimeout(reselectInPane, 0);
+      return true;
+    }
+
     if (horizontal) {
       // On a turn row, LEFT/RIGHT means expand/collapse rather than change
       // pane — drilling into the thing you have selected is the nearer
@@ -8072,6 +8137,8 @@
       ["j / k", "move row cursor"],
       ["↵", "open focused row"],
       ["1-" + TABS.length, "switch view"],
+      ["← / →", "session: scrub the strip, or expand a turn"],
+      ["⇧← / ⇧→", "session: switch pane"],
       ["esc", "back / close"],
       ["?", "this overlay"],
     ];
@@ -8168,6 +8235,7 @@
       journeyStepsHtml: journeyStepsHtml,
       traceFilterBarHtml: traceFilterBarHtml,
       traceTextFor: traceTextFor,
+      traceTextOf: traceTextOf,
       traceKindLabel: traceKindLabel,
       // The step→text accessor. Exported because the inspector printed
       // "[object Object]" for a whole release by calling `String()` on the step

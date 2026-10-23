@@ -307,6 +307,13 @@ test("context buckets map only to kinds that are really events", () => {
   assert.equal(app.BUCKET_KIND.skills, undefined);
 });
 
+/** The haystack a rendered row would hand the filter pass, looked up by its key. */
+function hayFor(html, keyPrefix) {
+  const m = html.match(new RegExp('data-trace-key="(' + keyPrefix + '[^"]*)"'));
+  assert.ok(m, `no row keyed ${keyPrefix}…`);
+  return app.traceTextOf({ getAttribute: (n) => (n === "data-trace-key" ? m[1] : null) });
+}
+
 test("spine rows carry the attributes the filter pass reads", () => {
   const steps = [
     step({ stepIndex: 0, role: "user", message: "find the bug" }),
@@ -316,7 +323,9 @@ test("spine rows carry the attributes the filter pass reads", () => {
   const html = app.turnSpineHtml(turns);
   assert.match(html, /data-ev-kind="prompt"/);
   assert.match(html, /data-ev-kind="tool_call"/);
-  assert.match(html, /data-trace-text="/, "events must carry a search haystack");
+  assert.match(hayFor(html, "ev:1:1"), /npm test/, "events must carry a search haystack");
+  // The turn's short summary may stay inline; the event detail must not.
+  assert.ok(!/data-ev-kind="[^"]*"[^>]*data-trace-text=/.test(html), "event haystacks must not ride in the markup");
   assert.match(html, /data-inspect="ev:1:0"/);
 });
 
@@ -331,7 +340,7 @@ test("stream nodes carry a mapped kind and a haystack", () => {
   assert.match(html, /data-trace-node="1"/);
   assert.match(html, /data-trace-kind="prompt"/, "user node must map to prompt");
   assert.match(html, /data-trace-kind="reply"/, "assistant node must map to reply");
-  assert.match(html, /data-trace-text="[^"]*hello there/);
+  assert.match(hayFor(html, "node:n1"), /hello there/);
 });
 
 test("step cards advertise every kind they bundle", () => {
@@ -351,7 +360,15 @@ test("step cards advertise every kind they bundle", () => {
   assert.deepEqual(kinds, ["reply", "thinking", "tool_call", "tool_result"]);
   // The id is what a `#…/step-N` deep link flashes.
   assert.match(html, /id="step-4"/);
-  assert.match(html, /data-trace-text="[^"]*thought about it/);
+  assert.match(hayFor(html, "step:4"), /thought about it/);
+});
+
+test("the haystack is not capped: a word deep in a long result is findable", () => {
+  const long = "x".repeat(9000) + " needle";
+  const html = app.stepCard(step({ stepIndex: 7, role: "agent", toolName: "Bash", observation: long }));
+  assert.match(hayFor(html, "step:7"), /needle$/);
+  const ev = { kind: "tool_result", label: "out", detail: long };
+  assert.match(app.traceTextFor(ev), /needle$/);
 });
 
 test("a user step is a prompt, not a reply", () => {
