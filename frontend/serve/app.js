@@ -4236,6 +4236,23 @@
     return true;
   }
 
+  /**
+   * Expand or collapse a turn because the USER asked to (click or ←/→).
+   *
+   * Two flags keep the filter's auto-expansion from fighting the user:
+   * `_autoOpen` marks a turn the filter itself opened (and so may close again),
+   * `_userSet` marks one the user has touched since the filter came on, which
+   * the filter then leaves alone in both directions. Both are dropped when the
+   * filter clears, so the next search starts from whatever is on screen.
+   */
+  function userSetTurnExpanded(seq, open, turnEl) {
+    var turn = turnEl || document.querySelector('.turn[data-turn="' + seq + '"]');
+    if (!setTurnExpanded(seq, open, turn)) return false;
+    turn._userSet = true;
+    turn._autoOpen = false;
+    return true;
+  }
+
   document.addEventListener("click", function (e) {
     var c = e.target.closest && e.target.closest("[data-expand]");
     if (c) {
@@ -4243,10 +4260,7 @@
       var seq = c.getAttribute("data-expand");
       var turnEl = c.closest(".turn");
       var box = turnEl.querySelector(".turn-events");
-      // A turn the user opened or closed by hand is theirs: clearing the filter
-      // must not collapse it.
-      turnEl._autoOpen = false;
-      setTurnExpanded(seq, box.hidden, turnEl);
+      userSetTurnExpanded(seq, box.hidden, turnEl);
       return;
     }
     var dens = e.target.closest && e.target.closest("[data-trace-density]");
@@ -4388,12 +4402,23 @@
       // Filtering opens the turns it matched so the hits are visible; clearing
       // it closes exactly those again. Without the bookkeeping, one search left
       // a 1,000-turn spine fully expanded with no way back but collapsing each.
+      // Only a turn that was CLOSED is claimed: one already open was the user's
+      // before the filter came on and must stay open after it goes. And a turn
+      // the user has toggled since is theirs (see userSetTurnExpanded).
       var seq = t.getAttribute("data-turn");
-      if (!t.hidden && filtering && shown) {
-        if (!t._autoOpen && setTurnExpanded(seq, true, t)) t._autoOpen = true;
-      } else if (t._autoOpen) {
-        setTurnExpanded(seq, false, t);
+      if (!filtering) {
+        if (t._autoOpen) setTurnExpanded(seq, false, t);
         t._autoOpen = false;
+        t._userSet = false;
+      } else if (!t._userSet) {
+        var box = t.querySelector(".turn-events");
+        var isOpen = !!box && !box.hidden;
+        if (!t.hidden && shown) {
+          if (!isOpen && setTurnExpanded(seq, true, t)) t._autoOpen = true;
+        } else if (t._autoOpen) {
+          setTurnExpanded(seq, false, t);
+          t._autoOpen = false;
+        }
       }
     });
     // Stream density: flat rows, no turn grouping, same predicate.
@@ -7830,7 +7855,7 @@
       var sel = Inspector.selected() || "";
       if (sel.indexOf("ctp:") === 0) {
         var seq = sel.slice(4);
-        if (setTurnExpanded(seq, k === "ArrowRight")) {
+        if (userSetTurnExpanded(seq, k === "ArrowRight")) {
           e.preventDefault();
           return true;
         }
@@ -8250,6 +8275,7 @@
       // no longer matches the markup it was written for.
       applyTurnFilters: applyTurnFilters,
       setTurnRange: setTurnRange,
+      userSetTurnExpanded: userSetTurnExpanded,
       tracePasses: tracePasses,
       traceFilterSummary: traceFilterSummary,
       TRACE_KINDS: TRACE_KINDS,

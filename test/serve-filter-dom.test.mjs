@@ -385,3 +385,40 @@ test("stream edges bridge hidden nodes instead of leaving stubs", () => {
   assert.ok(visible(e1) && !visible(e2), "edge into a hidden tail must go");
   app.setFilter([], "");
 });
+
+const isOpen = (t) => !t.children.find((c) => c.classes.has("turn-events")).hidden;
+
+test("clearing the filter closes only the turns the filter opened", () => {
+  const d = build();
+  // The user had t2 open before searching; t1 was closed.
+  d.app.userSetTurnExpanded("2", true, d.t2);
+  d.app.setFilter([], ""); // a pass with no filter drops the user mark, like a fresh view
+  d.app.applyTurnFilters();
+  assert.ok(isOpen(d.t2) && !isOpen(d.t1));
+
+  d.app.setFilter(["prompt", "reply"], "");
+  d.app.applyTurnFilters();
+  assert.ok(isOpen(d.t1), "the filter opens the matching turn it found closed");
+
+  d.app.setFilter([], "");
+  d.app.applyTurnFilters();
+  assert.ok(!isOpen(d.t1), "the turn the filter opened closes again");
+  assert.ok(isOpen(d.t2), "a turn open before the search must stay open after it");
+});
+
+test("a turn the user closes mid-search stays closed on the next pass", () => {
+  const d = build();
+  d.app.setFilter(["prompt"], "");
+  d.app.applyTurnFilters();
+  assert.ok(isOpen(d.t1));
+  d.app.userSetTurnExpanded("1", false, d.t1); // click or ← on the row
+  d.app.setFilter(["prompt"], "rebase"); // the user keeps typing
+  d.app.applyTurnFilters();
+  assert.ok(!isOpen(d.t1), "the next pass re-opened a turn the user just closed");
+
+  // And one they open by hand mid-search is not closed when the filter clears.
+  d.app.userSetTurnExpanded("2", true, d.t2);
+  d.app.setFilter([], "");
+  d.app.applyTurnFilters();
+  assert.ok(isOpen(d.t2), "clearing the filter collapsed a turn the user opened");
+});
