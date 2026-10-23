@@ -63,6 +63,11 @@ const NOISE_PREFIXES = [
   // A WebFetch result echoed back as a user message; titled 1 session
   // "Web page content: --- > ## Documentation Index > Fetch the complete…".
   "web page content:",
+  // The desktop app's away-recap request, and the IDE telling the model which
+  // file is open. Both are user-role and both showed up as the "prompt" of
+  // turns in the serve Trace pane once it began reading this list.
+  "the user stepped away and is coming back",
+  "the user opened the file ",
 ];
 
 /**

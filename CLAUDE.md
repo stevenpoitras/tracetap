@@ -58,7 +58,7 @@ Three related lenses over "what's actually filling the context window":
 
 ### Flow (`src/flow/derive.ts`)
 
-Derives an agent-loop graph (user → thinking/actions → hooks → tool results; node kinds: user/thinking/assistant/tool_call/tool_result/hook/api_call) purely from already-indexed steps + hooks + request rows — no additional capture needed. Consumed by `serve`'s Flow view.
+Derives an agent-loop graph (user → thinking/actions → hooks → tool results; node kinds: user/thinking/assistant/tool_call/tool_result/hook/api_call) purely from already-indexed steps + hooks + request rows — no additional capture needed. Consumed by the **Stream** grain of `serve`'s Trace pane (`frontend/serve/app.js`: `renderFlowPane`), which maps these node kinds into the shared filter vocabulary via `FLOW_KIND_MAP`.
 
 ### Hooks capture (`src/hooks/`)
 

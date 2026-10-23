@@ -1352,7 +1352,7 @@ h1 {
   text-align: center;
 }
 
-/* -- session subnav (Flow / Hooks / X-Ray / Wire) ------------------------- */
+/* -- session subnav (Trace / Hooks / X-Ray / Tool Tax / Related) ---------- */
 .session-subnav {
   display: flex;
   gap: 2px;
@@ -1427,10 +1427,9 @@ h1 {
    it is laid out in three columns that want the width. Reserving 400px for a
    panel that can only ever say "select a row" is 20% of the viewport spent on
    an instruction that does not apply. */
-.session-body.no-inspector {
-  grid-template-columns: minmax(0, 1fr);
-}
-.session-body.no-inspector .inspector { display: none; }
+/* `.no-inspector` used to run the Journey pane full-width. Trace has clickable
+   rows in every grain, so the rail is never hidden and the class is never
+   written — the rules that styled it are gone with it. */
 /* The same argument applies to a rail that is merely CLOSED. Until a row is
    selected the panel can only say "select a row", and it was saying it in a
    400px column on five panes — so a spine got 1516px of a 1990px window and
@@ -1599,24 +1598,26 @@ h1 {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Same hue per kind as the spine's `.ev-*` and the anatomy's `.jr-badge.*`
+   (see the note above `.ev-hook`): user = prompt, assistant = reply. */
 .flow-node.kind-user {
-  border-left: 3px solid var(--accent);
+  border-left: 3px solid var(--green);
 }
 .flow-node.kind-thinking {
-  border-left: 3px solid var(--accent2);
+  border-left: 3px solid #8b8ba0;
 }
 .flow-node.kind-assistant {
-  border-left: 3px solid var(--green);
+  border-left: 3px solid var(--accent);
 }
 .flow-node.kind-tool_call,
 .flow-node.kind-branch {
-  border-left: 3px solid var(--amber);
+  border-left: 3px solid var(--purple, #a78bfa);
 }
 .flow-node.kind-tool_result {
-  border-left: 3px solid var(--teal);
+  border-left: 3px solid var(--mid);
 }
 .flow-node.kind-hook {
-  border-left: 3px solid #f472b6;
+  border-left: 3px solid var(--teal, #2dd4bf);
 }
 .flow-node.kind-api_call {
   border-left: 3px solid var(--mid);
@@ -1627,6 +1628,12 @@ h1 {
   margin: 0 0 0 18px;
   background: var(--muted);
 }
+/* Filtering hides NODES; the connectors between them are decorative and must go
+   with them. A column of orphaned edge stubs reads as content that failed to
+   render rather than as content deliberately hidden. */
+.flow-node[hidden] { display: none; }
+.flow-edge[hidden] { display: none; }
+.step[hidden] { display: none; }
 .payload {
   margin: 0;
   padding: 10px;
@@ -2268,12 +2275,112 @@ tr[data-inspect]:focus-visible {
 }
 
 /* Turn spine: one row per turn, its events nested underneath. */
+/* ---------------------------------------------------------------- trace filter
+   One bar for the whole Trace pane. It sits ABOVE the grain switch, because it
+   filters every grain — a bar that scrolled away with the spine would leave the
+   Stream and Steps grains looking unfiltered while they were not. */
 .turn-filters {
   display: flex;
   gap: 6px;
   margin-bottom: 8px;
   flex-wrap: wrap;
+  align-items: center;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bg);
+  padding: 6px 0;
 }
+.turn-filter-lab,
+.trace-switch-lab {
+  font-family: var(--font-chrome);
+  font-size: var(--fs-100);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+}
+.turn-filter-sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 0 2px;
+}
+.turn-preset {
+  font-family: var(--font-chrome);
+  font-size: var(--fs-100);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--mid);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.turn-preset:hover { color: var(--bright); border-color: var(--border-strong); }
+.turn-q { display: flex; align-items: center; }
+.turn-q input {
+  font-family: var(--font-chrome);
+  font-size: var(--fs-200);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  min-width: 14ch;
+}
+.turn-q input:focus {
+  outline: none;
+  border-color: var(--accent);
+  color: var(--bright);
+}
+.turn-count {
+  font-family: var(--font-chrome);
+  font-size: var(--fs-100);
+  color: var(--dim);
+  margin-left: auto;
+}
+/* The count changes meaning when a filter is on ("4 of 4700") so it changes
+   colour with it — otherwise a filtered view and a whole session read the same. */
+.turn-count.on { color: var(--accent); }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------- grain switch
+   Journey / Flow / Wire were three tabs; they are three GRAINS of one pane now.
+   Styled as a segmented control rather than as tabs, because switching grain is
+   changing resolution on the thing you are already looking at, not navigating
+   somewhere else. */
+.trace-switch {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 10px 0 8px;
+}
+.trace-density {
+  font-family: var(--font-chrome);
+  font-size: var(--fs-200);
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.trace-density:hover { color: var(--text); }
+.trace-density.active {
+  color: var(--bright);
+  border-color: var(--accent);
+  background: var(--surface);
+}
+.trace-grain { display: none; }
+.trace-grain.active { display: block; }
 .turn-filter {
   font-family: var(--font-chrome);
   font-size: var(--fs-100);
@@ -2478,9 +2585,22 @@ tr[data-inspect]:focus-visible {
   letter-spacing: 0.08em;
   color: var(--dim);
 }
+/* ONE hue per event kind, used by every grain: the spine's `.ev-*` chips, the
+   anatomy's `.jr-badge`, and the Stream's `.flow-node`. A tool call that is
+   purple in one grain and teal in another makes the three views look like three
+   different datasets. */
 .ev-hook .ev-kind { color: var(--teal, #2dd4bf); }
 .ev-compaction .ev-kind { color: var(--amber); }
-.ev-tool .ev-kind { color: var(--purple, #a78bfa); }
+.ev-tool_call .ev-kind { color: var(--purple, #a78bfa); }
+.ev-tool_result .ev-kind { color: var(--mid); }
+.ev-prompt .ev-kind { color: var(--green); }
+.ev-reply .ev-kind { color: var(--accent); }
+.ev-thinking .ev-kind { color: #8b8ba0; }
+/* The message kinds carry the text of the session, so their labels get the
+   readable weight — the numbers beside them are already dim. */
+.ev-prompt .ev-label,
+.ev-reply .ev-label { color: var(--bright); }
+.ev-thinking .ev-label { font-style: italic; }
 .ev-label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3043,9 +3163,16 @@ button.xray-seg:focus-visible {
   border-radius: 3px;
   border: 1px solid var(--border-strong);
 }
-.jr-badge.tool { color: #5eead4; border-color: rgba(94, 234, 212, 0.4); }
-.jr-badge.result { color: var(--mid); }
-.jr-badge.hook { color: var(--amber); border-color: rgba(251, 191, 36, 0.4); }
+/* Keyed by the SHARED kind names, so the badge in the anatomy panel and the chip
+   in the spine are the same word in the same colour. `tool`/`result` were the old
+   private spelling and are gone with it. */
+.jr-badge.tool_call { color: #a78bfa; border-color: rgba(167, 139, 250, 0.4); }
+.jr-badge.tool_result { color: var(--mid); }
+.jr-badge.hook { color: var(--teal, #2dd4bf); border-color: rgba(45, 212, 191, 0.4); }
+.jr-badge.prompt { color: var(--green); border-color: rgba(74, 222, 128, 0.4); }
+.jr-badge.reply { color: var(--accent); border-color: rgba(127, 143, 255, 0.45); }
+.jr-badge.thinking { color: #8b8ba0; }
+.jr-badge.compaction { color: var(--amber); border-color: rgba(251, 191, 36, 0.4); }
 .jr-step-name {
   min-width: 0;
   flex: 1 1 auto;
