@@ -253,3 +253,12 @@ test("activityTitle names the tool mix, ordered by count then name", () => {
   assert.equal(activityTitle({ Bash: 0 }), "");
   assert.equal(activityTitle(undefined), "");
 });
+
+test("desktop-app recaps and IDE open-file notes are not asks", () => {
+  assert.equal(isNoiseStep("The user stepped away and is coming back. Recap in under 40 words"), true);
+  assert.equal(
+    isNoiseStep("The user opened the file /Users/x/a.ts in the IDE. This may or may not be related"),
+    true,
+  );
+  assert.equal(isNoiseStep("open the file a.ts and fix the bug"), false);
+});

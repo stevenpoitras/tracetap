@@ -1063,6 +1063,10 @@
 
   function isUserAsk(st) {
     if (!st || st.role !== "user") return false;
+    // The server's verdict, from the same skip list that titles sessions
+    // (src/store/title.ts). The local checks below are the fallback for a
+    // payload that predates the `noise` field.
+    if (st.noise === true) return false;
     var raw = String(st.message || "").trim();
     if (!raw) return false;
     // A one-key envelope keyed by a TOOL is the previous turn's output being fed

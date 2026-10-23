@@ -443,6 +443,12 @@ test("GET /api/session/<id> returns transcript, requests, hooks, flow, compactio
   const body = JSON.parse(r.text);
   assert.equal(body.session.sessionId, id);
   assert.ok(body.steps.length >= 3, "transcript steps expected");
+  // Every user step carries the server's noise verdict (title.ts's skip list),
+  // so the page has one source for "did a person type this".
+  const userSteps = body.steps.filter((s) => s.role === "user");
+  assert.ok(userSteps.length > 0);
+  for (const s of userSteps) assert.equal(typeof s.noise, "boolean", "user step missing noise flag");
+  assert.ok(body.steps.filter((s) => s.role !== "user").every((s) => !("noise" in s)));
   assert.ok(body.requests.length >= 2, "per-pair wire rows expected");
   assert.equal(body.requests[0].seq, 0);
   assert.ok(Array.isArray(body.compactions));

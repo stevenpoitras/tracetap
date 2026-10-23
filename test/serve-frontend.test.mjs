@@ -634,3 +634,22 @@ test("stepBody keeps the whole ask; stepText is the one-line label", () => {
   assert.ok(app.stepText(st).length <= 200);
   assert.equal(app.stepBody(step({ stepIndex: 2, role: "agent", message: "<block>no" })), "");
 });
+
+test("the server's noise verdict outranks the local skip list", () => {
+  // The output-style banner is not on the page's own list; the server's is
+  // authoritative, which is what stops it being reported as a prompt each turn.
+  const banner = "Explanatory output style is active. Remember to follow the specific guidelines for this style.";
+  assert.equal(app.isUserAsk(step({ role: "user", message: banner, noise: true })), false);
+  assert.equal(app.isUserAsk(step({ role: "user", message: "fix the bug", noise: false })), true);
+
+  const steps = [
+    step({ stepIndex: 0, role: "user", message: "fix the bug", noise: false }),
+    step({ stepIndex: 1, toolName: "Bash", toolInput: "{}" }),
+    step({ stepIndex: 2, role: "user", message: banner, noise: true }),
+    step({ stepIndex: 3, message: "done" }),
+  ];
+  const turns = app.buildTurns([req({ seq: 0, agentStepIndex: 1 }), req({ seq: 1, agentStepIndex: 3 })], [], steps, {});
+  const prompts = turns.flatMap((t) => t.events).filter((e) => e.kind === "prompt");
+  assert.equal(prompts.length, 1, "a harness banner must not become a second prompt");
+  assert.match(prompts[0].detail, /fix the bug/);
+});
