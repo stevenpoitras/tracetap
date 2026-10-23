@@ -98,20 +98,39 @@ test("a session with no window does not fall back to scanning every hook", () =>
   }
 });
 
-test("an end at or before the start is treated as no window", () => {
+test("an end before the start is treated as no window", () => {
   const { dir, store: s, session } = makeClaudeStore("tracetap-hookinv-");
   try {
     seedForeignHook(dir, s);
     const { startedAt } = s.getSession(session.sessionId);
 
-    // Equal bounds: a single-instant "window". The ±10 min slack would still
-    // open it into a 20-minute net that catches whatever ran nearby.
-    setWindow(s, session.sessionId, startedAt, startedAt);
-    assert.equal(s.listHooksForSession(session.sessionId).length, 0, "a point is not a window");
-
-    // Inverted bounds: the same bug with a subtler shape.
+    // Inverted bounds are corrupt data, not a time range.
     setWindow(s, session.sessionId, startedAt, startedAt - 60);
     assert.equal(s.listHooksForSession(session.sessionId).length, 0, "an inverted window is none");
+  } finally {
+    s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a single-call session (start == end) still gets its hooks", () => {
+  const { dir, store: s, session } = makeClaudeStore("tracetap-hookpoint-");
+  try {
+    seedForeignHook(dir, s);
+    const { startedAt } = s.getSession(session.sessionId);
+
+    // One API call stamps every step with the same time, so a one-call session
+    // is always a point. Rejecting it emptied the Hooks pane for every such
+    // session while the Stream grain still showed them.
+    setWindow(s, session.sessionId, startedAt, startedAt);
+    const rows = s.listHooksForSession(session.sessionId);
+    assert.ok(rows.length > 0, "a point window must still match hooks within the slack");
+    const flowHooks = s.sessionFlow(session.sessionId).nodes.filter((n) => n.kind === "hook");
+    assert.equal(
+      flowHooks.length > 0,
+      rows.length > 0,
+      "the Hooks pane and the Flow graph must agree on whether the session has hooks",
+    );
   } finally {
     s.close();
     fs.rmSync(dir, { recursive: true, force: true });
