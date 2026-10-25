@@ -1,4 +1,5 @@
 import type { HookRow } from "../hooks/types";
+import { isNoiseStep } from "../store/title";
 
 /** Minimal step shape (matches store StepText). */
 export interface FlowStepInput {
@@ -60,6 +61,14 @@ export interface FlowNode {
   detailPreview?: string;
   detailChars?: number;
   errored?: boolean;
+  /**
+   * On `user` nodes only: the harness wrote this, not a person — slash-command
+   * caveats and stdout, hook output, fed-back tool results. Same verdict
+   * (`isNoiseStep`, src/store/title.ts) that /api/session stamps on steps, so
+   * the Stream grain and the Turns grain agree on what a "prompt" is. Absent
+   * rather than `false` on every other node, to keep the payload small.
+   */
+  noise?: boolean;
 }
 
 export interface FlowEdge {
@@ -77,6 +86,9 @@ function preview(text: string, n = 72): string {
   const flat = (text || "").replace(/\s+/g, " ").trim();
   return flat.length <= n ? flat : flat.slice(0, n) + "…";
 }
+
+/** The indexer's placeholder for a step with no extractable text (app.js mirrors it). */
+const EMPTY_STEP_MESSAGE = "<block>no";
 
 const BRANCH_TOOLS = /^(Task|Agent|task|agent|BestOfNRunner|best-of-n)/i;
 
@@ -144,6 +156,12 @@ export function deriveFlow(opts: {
 
     if (step.role === "user" || step.role === "system") {
       const id = `step-${step.stepIndex}`;
+      // The indexer's `<block>no…` placeholder (a step it could not extract
+      // text from) is not an ask either; isNoiseStep already covers "". The
+      // page applies the same rule to steps, so all three grains agree.
+      const msg = String(step.message ?? "");
+      const noise =
+        step.role === "user" && (isNoiseStep(msg) || msg.trim().startsWith(EMPTY_STEP_MESSAGE));
       nodes.push({
         id,
         kind: step.role === "system" ? "assistant" : "user",
@@ -151,6 +169,7 @@ export function deriveFlow(opts: {
         stepIndex: step.stepIndex,
         parentId: lastId,
         detail: { message: step.message },
+        ...(noise ? { noise: true } : {}),
       });
       link(id);
       continue;
