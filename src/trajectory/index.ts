@@ -137,41 +137,43 @@ export function buildTrajectory(group: PairGroup): Trajectory {
 function buildOne(adapter: AgentAdapter, sessionId: string, pairs: RawPair[]): Trajectory {
   const steps: Step[] = [];
   const toolCallStepById = new Map<string, Step>();
-  // Per-category cursors over the resent transcript. User prompts and
+  // Each replayed category is tracked independently. User prompts and
   // tool_results are reliably replayed in every subsequent request, but some
   // agents (e.g. Gemini) omit reasoning parts from history — so a single
   // positional cursor over ALL request items would drift by the number of
-  // dropped items and misattribute observations. Tracking each replayed
-  // category independently is robust to that: assistant text, reasoning and
+  // dropped items and misattribute observations. Assistant text, reasoning and
   // tool_call items are sourced from the responses below and skipped here.
-  let userCursor = 0; // user messages already turned into steps
-  let resultCursor = 0; // tool_results already stitched as observations
+  //
+  // Neither tracker is a monotonic positional cursor: real Claude sessions
+  // RESET the resent transcript (auto-compaction re-sends just the summary,
+  // `/clear` starts over), and a high-water-mark cursor silently dropped every
+  // prompt and tool_result after the first reset until the new transcript
+  // outgrew the old one.
+  const users = new UserMessageTracker();
+  const results = new ToolResultTracker();
 
   for (const pair of pairs) {
     const reqItems = adapter.parseRequestItems(pair);
     const ts = requestTimestamp(pair);
 
-    let userSeen = 0;
-    let resultSeen = 0;
-    for (const item of reqItems) {
-      if (item.kind === "message" && item.role === "user") {
-        userSeen++;
-        if (userSeen > userCursor && item.text.trim()) {
-          steps.push(makeUserStep(item.text, ts));
-        }
-      } else if (item.kind === "tool_result") {
-        resultSeen++;
-        if (resultSeen > resultCursor) {
-          stitchObservation(toolCallStepById, steps, item.sourceCallId, item.content);
-        }
-      }
+    const resultItems: { sourceCallId: string; content: string }[] = [];
+    for (const item of reqItems) if (item.kind === "tool_result") resultItems.push(item);
+
+    // Results first, as before: they answer calls from the PREVIOUS response,
+    // and a new user prompt in this request follows them in the transcript.
+    for (const r of results.fresh(resultItems)) {
+      stitchObservation(r.step, toolCallStepById, steps, r.sourceCallId, r.content);
     }
-    userCursor = Math.max(userCursor, userSeen);
-    resultCursor = Math.max(resultCursor, resultSeen);
+    for (const text of users.fresh(reqItems)) {
+      if (text.trim()) steps.push(makeUserStep(text, ts));
+    }
 
     const resp = adapter.parseResponse(pair);
     if (resp.items.length > 0 || resp.usage) {
-      steps.push(registerAgentStep(resp.items, resp.usage, ts, toolCallStepById));
+      const step = registerAgentStep(resp.items, resp.usage, ts, toolCallStepById);
+      results.registerCalls(step);
+      users.observeResponse(resp.items);
+      steps.push(step);
     }
   }
 
@@ -229,13 +231,195 @@ function makeUserStep(text: string, timestamp: number): Step {
   return { index: 0, role: "user", message: text, toolCalls: [], timestamp };
 }
 
+/**
+ * Decides which user messages in a request's resent transcript are NEW.
+ *
+ * Rule: the new user messages are the ones after the request's ANCHOR — the
+ * last assistant-side item (assistant text, reasoning, tool_call) in it that we
+ * saw come back in a captured response under this key. Everything before the
+ * anchor was already in the transcript when that response was produced, so its
+ * prompts were emitted then (or predate the capture). Without any recognised
+ * anchor every user message is new: the first call, a capture that began
+ * mid-session (its replayed history is all we will ever see of it), a
+ * compaction summary, a `/clear`, a subagent's first call.
+ *
+ * This is stateless with respect to transcript SHAPE, which is the point: it
+ * does not care whether the transcript grew, shrank or reset, nor whether
+ * several lineages (parallel same-type subagents sharing system+model)
+ * interleave under one conversation key. Anchoring on captured responses rather
+ * than on any assistant item matters for Gemini, which omits reasoning from
+ * history, and for a response that was never captured.
+ *
+ * One stateful guard against replays: tails are remembered per anchor, and
+ * only the part past an already-emitted tail is new. With an anchor, that
+ * covers a retried request (the first attempt got no reply). Without one, the
+ * longest prefix shared with ANY earlier anchorless tail is skipped — this
+ * collapses identical or prefix-growing single-shot side calls, at the cost
+ * of not re-emitting an identical prompt typed again after `/clear`.
+ */
+class UserMessageTracker {
+  private known = new Set<string>();
+  private tails = new Map<string, TailEntry[]>();
+  private last: TailEntry | null = null;
+
+  observeResponse(items: WireItem[]): void {
+    if (this.last && items.length > 0) this.last.answered = true;
+    this.last = null;
+    for (const it of items) {
+      const sig = anchorSignature(it);
+      if (sig) this.known.add(sig);
+    }
+  }
+
+  /** The user-message texts in `items` to emit as new user steps. */
+  fresh(items: WireItem[]): string[] {
+    this.last = null;
+    let anchor = -1;
+    let sig = "";
+    for (let i = items.length - 1; i >= 0; i--) {
+      const s = anchorSignature(items[i]);
+      if (s && this.known.has(s)) {
+        anchor = i;
+        sig = s;
+        break;
+      }
+    }
+    const tail: string[] = [];
+    // Assistant output after the anchor that we never saw come back (a reply
+    // replayed with different text, an uncaptured response): the transcript
+    // moved on from the anchor, so an earlier tail it extends was emitted.
+    let movedOn = false;
+    for (let i = anchor + 1; i < items.length; i++) {
+      const it = items[i];
+      if (it.kind === "message" && it.role === "user") tail.push(it.text);
+      else if (anchorSignature(it)) movedOn = true;
+    }
+    if (tail.length === 0) return tail;
+
+    const key = anchor < 0 ? "none" : anchor + "@" + sig;
+    let seen = this.tails.get(key);
+    if (!seen) this.tails.set(key, (seen = []));
+    let skip = 0;
+    for (const prior of seen) {
+      const p = prior.tail;
+      if (anchor < 0) {
+        // No anchor: a fresh transcript. Single-shot side calls (Claude Code's
+        // auto-mode security monitor, classifiers) re-send a growing prefix of
+        // context blocks each call, and parallel subagents share a header —
+        // only what is past the longest prefix already emitted is new.
+        skip = Math.max(skip, commonPrefix(p, tail));
+        continue;
+      }
+      // A prior tail that got a reply, replayed with no sign of that reply, is
+      // a rewind to before that reply, not a retry: its prompts are new again.
+      if (prior.answered && !movedOn) continue;
+      if (p.length > skip && p.length <= tail.length && isPrefix(p, tail)) skip = p.length;
+    }
+    const entry: TailEntry = { tail, answered: false };
+    seen.push(entry);
+    this.last = entry;
+    return tail.slice(skip);
+  }
+}
+
+interface TailEntry {
+  tail: string[];
+  answered: boolean;
+}
+
+/** Identity of an assistant-side item, for matching a request item to a response. */
+function anchorSignature(it: WireItem): string | null {
+  if (it.kind === "tool_call") return it.id ? "c:" + it.id + ":" + it.name : null;
+  if (it.kind === "message" && it.role === "assistant") return it.text ? "m:" + it.text : null;
+  if (it.kind === "reasoning") return it.text ? "r:" + it.text : null;
+  return null;
+}
+
+function commonPrefix(a: string[], b: string[]): number {
+  const n = Math.min(a.length, b.length);
+  let k = 0;
+  while (k < n && a[k] === b[k]) k++;
+  return k;
+}
+
+function isPrefix(a: string[], b: string[]): boolean {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Decides which tool_results in a request's resent transcript are NEW, by
+ * the tool calls still awaiting a result rather than by position — so a
+ * transcript reset (compaction, `/clear`) can't hide the results that follow
+ * it, and a carried tail can't re-stitch results already attached.
+ *
+ * Ids are not always unique (Gemini falls back to the function NAME when a
+ * call has no id), so a call id maps to a FIFO of awaiting steps, and of the
+ * `n` results carrying an id in one request only the trailing `pending` ones
+ * are new: a resent transcript replays old results before new ones.
+ * Limitation: with name-as-id, two interleaved lineages calling the same tool
+ * share one FIFO, so a result can land on the other lineage's call of that
+ * name. Unique ids (Anthropic, OpenAI, Devin, Gemini with ids) are unaffected.
+ *
+ * Results whose id never matched a captured call (capture began mid-session)
+ * still attach best-effort, once per id; results with no id at all are keyed
+ * by their ordinal and content.
+ */
+class ToolResultTracker {
+  private pending = new Map<string, Step[]>();
+  private everCalled = new Set<string>();
+  private orphansSeen = new Set<string>();
+
+  registerCalls(step: Step): void {
+    for (const tc of step.toolCalls) {
+      if (!tc.id) continue;
+      this.everCalled.add(tc.id);
+      let q = this.pending.get(tc.id);
+      if (!q) this.pending.set(tc.id, (q = []));
+      q.push(step);
+    }
+  }
+
+  fresh(
+    items: { sourceCallId: string; content: string }[],
+  ): { step: Step | null; sourceCallId: string; content: string }[] {
+    const total = new Map<string, number>();
+    for (const it of items) total.set(it.sourceCallId, (total.get(it.sourceCallId) ?? 0) + 1);
+    const seenSoFar = new Map<string, number>();
+    const awaiting = new Map<string, number>();
+    for (const [id] of total) awaiting.set(id, this.pending.get(id)?.length ?? 0);
+
+    const out: { step: Step | null; sourceCallId: string; content: string }[] = [];
+    let emptyOrdinal = 0;
+    for (const it of items) {
+      const id = it.sourceCallId;
+      const ordinal = seenSoFar.get(id) ?? 0;
+      seenSoFar.set(id, ordinal + 1);
+      if (id && this.everCalled.has(id)) {
+        const n = total.get(id)!;
+        if (ordinal >= n - awaiting.get(id)!) {
+          const step = this.pending.get(id)!.shift() ?? null;
+          out.push({ step, sourceCallId: id, content: it.content });
+        }
+        continue;
+      }
+      const key = id ? "id:" + id : "empty:" + emptyOrdinal++ + ":" + it.content;
+      if (this.orphansSeen.has(key)) continue;
+      this.orphansSeen.add(key);
+      out.push({ step: null, sourceCallId: id, content: it.content });
+    }
+    return out;
+  }
+}
+
 function stitchObservation(
+  matched: Step | null,
   toolCallStepById: Map<string, Step>,
   steps: Step[],
   sourceCallId: string,
   content: string,
 ): void {
-  let step = toolCallStepById.get(sourceCallId);
+  let step = matched ?? toolCallStepById.get(sourceCallId);
   if (!step) {
     // Best-effort fallback: attach to the most recent agent step so result
     // content is never lost (well-formed logs always have a match).

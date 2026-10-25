@@ -443,7 +443,11 @@ const SORTABLE_COLUMNS = new Set([
 // reasoning as 9 — the rows already on disk were written by the old rule and
 // indexFile will not revisit a log whose content hash is unchanged, so without
 // a bump one real capture keeps 125 non-calls inside a session's waterfall.
-const SCHEMA_VERSION = 10;
+// 11: the trajectory walker no longer loses prompts and tool_results after a
+// resent-transcript reset (compaction, /clear). Steps already on disk were
+// built by the old high-water-mark cursor — one real session kept 9 of its
+// prompts and 37 of 1147 observations — and unchanged logs are never revisited.
+const SCHEMA_VERSION = 11;
 
 /**
  * How long after a `PreCompact` hook its compacted call may arrive, and how far
