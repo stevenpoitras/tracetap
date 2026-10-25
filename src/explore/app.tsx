@@ -261,7 +261,7 @@ export function ExploreApp(props: ExploreAppProps): React.ReactElement {
     (session: SessionSummary | undefined): boolean => {
       if (!session) return false;
       try {
-        const loaded = loadSessionTrajectory(session.sourcePath, session.sessionId);
+        const loaded = loadSessionTrajectory(session.sourcePath, session.conversationKey);
         if (!loaded) {
           setMessage(`No trajectory could be rebuilt from ${session.sourcePath}`);
           return false;
@@ -494,7 +494,7 @@ export function ExploreApp(props: ExploreAppProps): React.ReactElement {
         setTailInfo(null);
         setMode(traj ? "timeline" : "list");
       } else if (current) {
-        startTail(current.sourcePath, current.sessionId);
+        startTail(current.sourcePath, current.conversationKey);
       }
       return;
     }
