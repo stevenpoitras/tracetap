@@ -220,6 +220,13 @@ export interface SessionSummary {
   /** Parsed tool-usage histogram (tool name → call count). */
   toolHistogram: Record<string, number>;
   sourcePath: string;
+  /**
+   * The key this session's pairs group under in `sourcePath` — what
+   * `conversationIdOf` / `Trajectory.sessionId` return when the log is
+   * re-read. Usually equal to `sessionId`; differs when the id was suffixed to
+   * keep it unique across sources.
+   */
+  conversationKey: string;
   /** Number of agent turns (agent-role steps) in the session. */
   turns: number;
   /** Number of steps flagged as errored. */
@@ -419,7 +426,12 @@ const SORTABLE_COLUMNS = new Set([
 // reasoning as 9 — the rows already on disk were written by the old rule and
 // indexFile will not revisit a log whose content hash is unchanged, so without
 // a bump one real capture keeps 125 non-calls inside a session's waterfall.
-const SCHEMA_VERSION = 10;
+// 11: session ids are unique per source. A conversation key is a hash of what
+// the wire carries (system prompt + model for Claude), so two unrelated logs
+// with no system prompt shared one id, and the insert's delete-by-id let the
+// last-indexed log silently erase the other. The losers are gone from the rows
+// on disk, and only a full rebuild brings them back.
+const SCHEMA_VERSION = 11;
 
 /**
  * How long after a `PreCompact` hook its compacted call may arrive, and how far
@@ -711,7 +723,12 @@ export class Store {
         -- ~/.claude/projects/<slug>/<uuid>.jsonl, where compactions are
         -- RECORDED rather than inferred. Null for non-Claude agents and for
         -- logs captured before the header existed.
-        claude_session_id   TEXT
+        claude_session_id   TEXT,
+        -- The adapter's conversationKey for this session's pairs. Equal to
+        -- session_id except when that key was already held by a different
+        -- source, in which case session_id carries a per-source suffix (see
+        -- resolveSessionId). Re-reading the source log filters on THIS.
+        conversation_key    TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source_path);
       CREATE INDEX IF NOT EXISTS idx_sessions_agent  ON sessions(agent);
@@ -897,7 +914,8 @@ export class Store {
       this.deleteSourceRows(sourcePath);
       let sessions = 0;
       let steps = 0;
-      for (const group of groups) {
+      for (const keyed of groups) {
+        const group = { ...keyed, sessionId: this.resolveSessionId(keyed.sessionId, sourcePath, contentHash) };
         const traj = buildTrajectory(group);
         steps += this.insertTrajectory(
           traj,
@@ -906,6 +924,7 @@ export class Store {
           contentHash,
           opts?.projectCwd,
           spawns,
+          keyed.sessionId,
         );
         sessions += 1;
       }
@@ -935,6 +954,27 @@ export class Store {
     // never deleted here (a prompt seen once remains a known version).
   }
 
+  /**
+   * The session id a conversation from `sourcePath` is stored under.
+   *
+   * Normally the adapter's conversation key itself, so URLs stay what they have
+   * always been. But that key is a hash of wire content, not an identity: two
+   * unrelated logs with no system prompt (a reconstructed transcript, a one-call
+   * quota probe) both reduce to the model alone. When a DIFFERENT source already
+   * holds the key, this one gets a suffix derived from its path — stable across
+   * re-indexes of either file, and the first claimant keeps the bare key.
+   *
+   * A holder with the same content hash is a byte-identical copy of this log,
+   * the same conversation, so it is replaced rather than shown twice.
+   */
+  private resolveSessionId(key: string, sourcePath: string, contentHash: string): string {
+    const holder = this.db
+      .prepare("SELECT source_path, content_hash FROM sessions WHERE session_id = ?")
+      .get(key) as { source_path: string | null; content_hash: string | null } | undefined;
+    if (!holder || holder.source_path === sourcePath || holder.content_hash === contentHash) return key;
+    return `${key}~${sha256Hex(sourcePath).slice(0, 10)}`;
+  }
+
   private insertTrajectory(
     traj: Trajectory,
     group: PairGroup,
@@ -942,6 +982,7 @@ export class Store {
     contentHash: string,
     projectCwdOverride: string | undefined,
     spawns: AgentSpawn[],
+    conversationKey: string,
   ): number {
     const stats = analyze(traj, this.prices ? { prices: this.prices } : {});
 
@@ -957,8 +998,9 @@ export class Store {
     const endedAt = Number.isFinite(maxTs) ? maxTs : 0;
     const claudeSessionId = claudeSessionIdOf(group);
 
-    // A trajectory's session_id is its own; clear any prior rows for it (e.g.
-    // the same conversation re-captured in a different file) before inserting.
+    // A trajectory's session_id is its own; clear any prior rows for it (a
+    // byte-identical copy of this log indexed from another path — see
+    // resolveSessionId, which suffixes every other cross-source match).
     this.db.prepare("DELETE FROM steps_fts WHERE session_id = ?").run(traj.sessionId);
     this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(traj.sessionId);
     this.db.prepare("DELETE FROM requests WHERE session_id = ?").run(traj.sessionId);
@@ -969,8 +1011,9 @@ export class Store {
         `INSERT INTO sessions(
            session_id, agent, model, project_cwd, started_at, ended_at, duration_ms,
            total_in_tokens, total_out_tokens, cache_read, cache_creation, cost_usd,
-           tool_histogram_json, source_path, content_hash, claude_session_id
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           tool_histogram_json, source_path, content_hash, claude_session_id,
+           conversation_key
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         traj.sessionId,
@@ -989,6 +1032,7 @@ export class Store {
         sourcePath,
         contentHash,
         claudeSessionId,
+        conversationKey,
       );
 
     const insStep = this.db.prepare(
@@ -1578,6 +1622,7 @@ export class Store {
         s.cost_usd            AS costUsd,
         s.tool_histogram_json AS toolHistogramJson,
         s.source_path         AS sourcePath,
+        s.conversation_key    AS conversationKey,
         (SELECT COUNT(*) FROM steps_fts f WHERE f.session_id = s.session_id AND f.role = 'agent') AS turns,
         (SELECT COUNT(*) FROM steps_fts f WHERE f.session_id = s.session_id AND f.error_flag = '1') AS errorCount
       FROM sessions s
@@ -1625,6 +1670,7 @@ export class Store {
         agentCast: casts.get(String(r.sessionId))?.cast ?? [],
         unnamedAgentCalls: casts.get(String(r.sessionId))?.unnamed ?? 0,
         sourcePath: String(r.sourcePath ?? ""),
+        conversationKey: String(r.conversationKey ?? r.sessionId),
         turns: Number(r.turns ?? 0),
         errorCount: Number(r.errorCount ?? 0),
         ...(match ? { match } : {}),
@@ -2362,6 +2408,7 @@ export class Store {
   private loadSessionPairs(sessionId: string): RawPair[] | null {
     const session = this.getSession(sessionId);
     if (!session?.sourcePath) return null;
+    const key = session.conversationKey;
     // Pairs in the file may span multiple conversation groups, so this session's
     // are selected AS THEY PARSE rather than by grouping the whole file and
     // discarding the rest — one live 888 MB log held 40 conversations, and the
@@ -2372,7 +2419,7 @@ export class Store {
     try {
       pairs = parseJsonlFile<RawPair>(
         session.sourcePath,
-        (p) => conversationIdOf(p) === sessionId,
+        (p) => conversationIdOf(p) === key,
       ).records;
     } catch {
       return null;
