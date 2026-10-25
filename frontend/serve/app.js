@@ -5414,6 +5414,14 @@
         currentXrayNote = summary;
         xrayForPane = x;
         if (viewEl) {
+          // The render. This line went missing in the observatory merge (the
+          // "keep the previous numbers dimmed while loading" change replaced it
+          // instead of preceding it), and nothing else draws the table: the
+          // pane kept its first-load skeleton forever while the status line
+          // above it happily reported the fetched totals. Segment rows carry
+          // `data-inspect="seg:<i>"`, so the shared inspector delegation
+          // handles clicks — no per-row binding is needed here.
+          viewEl.innerHTML = xrayHead(seq, summary) + drawXray(x);
           viewEl.classList.remove("is-stale");
           viewEl
             .querySelectorAll(".btn-xray[data-seq]")
@@ -8274,6 +8282,12 @@
       // code path a click takes, which is the only way to catch a selector that
       // no longer matches the markup it was written for.
       applyTurnFilters: applyTurnFilters,
+      // The X-Ray load path and its renderer, separately. `drawXray` was
+      // correct for months while nothing called it — the pane showed its
+      // skeleton forever — and only driving `loadXray` through a resolved
+      // fetch can tell a working renderer from an orphaned one.
+      loadXray: loadXray,
+      drawXray: drawXray,
       setTurnRange: setTurnRange,
       userSetTurnExpanded: userSetTurnExpanded,
       tracePasses: tracePasses,
