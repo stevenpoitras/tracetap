@@ -115,8 +115,14 @@ export interface SearchHit {
 
 export interface IndexFileResult {
   sourcePath: string;
-  /** True when the file was unchanged since last index (watermark hit). */
+  /**
+   * True when nothing was written: the file was unchanged since last index
+   * (watermark hit), or it is a byte-identical copy of another log (see
+   * `duplicateOf`).
+   */
   skipped: boolean;
+  /** Set when the file was skipped as a copy: the log whose rows stand for it. */
+  duplicateOf?: string;
   /** Number of sessions (trajectories) written for this file. */
   sessions: number;
   /** Number of steps indexed for this file. */
@@ -223,8 +229,8 @@ export interface SessionSummary {
   /**
    * The key this session's pairs group under in `sourcePath` — what
    * `conversationIdOf` / `Trajectory.sessionId` return when the log is
-   * re-read. Usually equal to `sessionId`; differs when the id was suffixed to
-   * keep it unique across sources.
+   * re-read. Equal to `sessionId` except for a weak key, whose id is suffixed
+   * with its source to keep it unique across logs.
    */
   conversationKey: string;
   /** Number of agent turns (agent-role steps) in the session. */
@@ -457,7 +463,8 @@ const SORTABLE_COLUMNS = new Set([
 // 12: session ids are unique per source. A conversation key is a hash of what
 // the wire carries (system prompt + model for Claude), so two unrelated logs
 // with no system prompt shared one id, and the insert's delete-by-id let the
-// last-indexed log silently erase the other. The losers are gone from the rows
+// last-indexed log silently erase the other. Weak keys now carry their source
+// path (sessionIdFor), and byte-identical copies index once. The losers are gone from the rows
 // on disk, and only a full rebuild brings them back — including for indexes
 // already rebuilt at 11, which were rebuilt under the old id rule.
 const SCHEMA_VERSION = 12;
@@ -595,6 +602,24 @@ function projectCwdFor(sourcePath: string): string {
  *
  * @returns the uuid, or null for non-Claude agents and pre-header captures.
  */
+/**
+ * The session id a conversation group from `sourcePath` is stored under: a pure
+ * function of the two, so it never depends on what else is indexed or in what
+ * order — a rebuild reproduces every id, and `#session/<id>` links survive it.
+ *
+ * A strong key (a system prompt, a harness-issued session id) stays bare, so
+ * those URLs are what they have always been. A weak key is a hash of inputs
+ * too generic to name a conversation: every system-less Claude call on one
+ * model shares it, so unrelated logs collided and the last indexed erased the
+ * rest. Those get the source path folded in. The trade-off: a weak-key
+ * session's id changes if its log is moved or renamed, and the same weak-key
+ * conversation captured into two differing logs shows twice instead of once.
+ */
+function sessionIdFor(group: PairGroup, sourcePath: string): string {
+  if (!group.weakKey) return group.sessionId;
+  return `${group.sessionId}~${sha256Hex(sourcePath).slice(0, 10)}`;
+}
+
 function claudeSessionIdOf(group: PairGroup): string | null {
   const counts = new Map<string, number>();
   for (const pair of group.pairs) {
@@ -754,9 +779,9 @@ export class Store {
         -- logs captured before the header existed.
         claude_session_id   TEXT,
         -- The adapter's conversationKey for this session's pairs. Equal to
-        -- session_id except when that key was already held by a different
-        -- source, in which case session_id carries a per-source suffix (see
-        -- resolveSessionId). Re-reading the source log filters on THIS.
+        -- session_id except for weak keys, where session_id carries a
+        -- per-source suffix (see sessionIdFor). Re-reading the source log
+        -- filters on THIS.
         conversation_key    TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source_path);
@@ -923,6 +948,27 @@ export class Store {
     // parsing so the common "unchanged" answer costs one read and no JSON.
     const contentHash = hashFile(sourcePath);
 
+    // Byte-identical copies (a backup, a log copied between projects) are one
+    // capture and must count once. Weak keys are scoped by path, so without
+    // this a copy would index as a second session and double its spend. The
+    // smallest path is the canonical one, whatever the index order: a copy
+    // that sorts after an indexed twin is skipped, and one that sorts before
+    // takes over from it. A skipped copy writes no watermark, so it is checked
+    // again on every pass and indexes normally once its twin's content moves on.
+    const twins = (
+      this.db
+        .prepare("SELECT source_path FROM files WHERE content_hash = ? AND source_path <> ?")
+        .all(contentHash, sourcePath) as { source_path: string }[]
+    ).map((r) => r.source_path);
+    const canonical = twins.filter((t) => t < sourcePath).sort()[0];
+    if (canonical) {
+      this.db.transaction(() => {
+        this.deleteSourceRows(sourcePath);
+        this.db.prepare("DELETE FROM files WHERE source_path = ?").run(sourcePath);
+      })();
+      return { sourcePath, skipped: true, sessions: 0, steps: 0, duplicateOf: canonical };
+    }
+
     const prior = this.db
       .prepare("SELECT content_hash FROM files WHERE source_path = ?")
       .get(sourcePath) as { content_hash: string } | undefined;
@@ -940,11 +986,16 @@ export class Store {
     const spawns = spawnIndex(pairs as unknown as IdentityPair[]);
 
     const run = this.db.transaction(() => {
+      // This log now stands for any later-sorting twins.
+      for (const twin of twins) {
+        this.deleteSourceRows(twin);
+        this.db.prepare("DELETE FROM files WHERE source_path = ?").run(twin);
+      }
       this.deleteSourceRows(sourcePath);
       let sessions = 0;
       let steps = 0;
       for (const keyed of groups) {
-        const group = { ...keyed, sessionId: this.resolveSessionId(keyed.sessionId, sourcePath, contentHash) };
+        const group = { ...keyed, sessionId: sessionIdFor(keyed, sourcePath) };
         const traj = buildTrajectory(group);
         steps += this.insertTrajectory(
           traj,
@@ -983,27 +1034,6 @@ export class Store {
     // never deleted here (a prompt seen once remains a known version).
   }
 
-  /**
-   * The session id a conversation from `sourcePath` is stored under.
-   *
-   * Normally the adapter's conversation key itself, so URLs stay what they have
-   * always been. But that key is a hash of wire content, not an identity: two
-   * unrelated logs with no system prompt (a reconstructed transcript, a one-call
-   * quota probe) both reduce to the model alone. When a DIFFERENT source already
-   * holds the key, this one gets a suffix derived from its path — stable across
-   * re-indexes of either file, and the first claimant keeps the bare key.
-   *
-   * A holder with the same content hash is a byte-identical copy of this log,
-   * the same conversation, so it is replaced rather than shown twice.
-   */
-  private resolveSessionId(key: string, sourcePath: string, contentHash: string): string {
-    const holder = this.db
-      .prepare("SELECT source_path, content_hash FROM sessions WHERE session_id = ?")
-      .get(key) as { source_path: string | null; content_hash: string | null } | undefined;
-    if (!holder || holder.source_path === sourcePath || holder.content_hash === contentHash) return key;
-    return `${key}~${sha256Hex(sourcePath).slice(0, 10)}`;
-  }
-
   private insertTrajectory(
     traj: Trajectory,
     group: PairGroup,
@@ -1027,9 +1057,10 @@ export class Store {
     const endedAt = Number.isFinite(maxTs) ? maxTs : 0;
     const claudeSessionId = claudeSessionIdOf(group);
 
-    // A trajectory's session_id is its own; clear any prior rows for it (a
-    // byte-identical copy of this log indexed from another path — see
-    // resolveSessionId, which suffixes every other cross-source match).
+    // A trajectory's session_id is its own; clear any prior rows for it. Only a
+    // strong key can be held by another source (weak ones carry this path, and
+    // byte-identical copies never get here): the same session captured into two
+    // differing logs, e.g. a copy taken mid-capture. That stays last-indexed-wins.
     this.db.prepare("DELETE FROM steps_fts WHERE session_id = ?").run(traj.sessionId);
     this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(traj.sessionId);
     this.db.prepare("DELETE FROM requests WHERE session_id = ?").run(traj.sessionId);

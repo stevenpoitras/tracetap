@@ -62,6 +62,13 @@ export class GeminiAdapter implements AgentAdapter {
     return "gemini:" + djb2(model + "|" + system + "|" + firstUser.slice(0, 200));
   }
 
+  weakConversationKey(pair: RawPair): boolean {
+    // Without a system instruction only the model and an opening prompt as
+    // generic as "hi" are left to tell conversations apart.
+    const body = pair?.request?.body ?? {};
+    return !systemInstructionToText(body.systemInstruction ?? body.system_instruction).trim();
+  }
+
   parseRequestItems(pair: RawPair): WireItem[] {
     const body = pair?.request?.body ?? {};
     const contents: any[] = Array.isArray(body.contents) ? body.contents : [];

@@ -51,6 +51,12 @@ export class OpenAIAdapter implements AgentAdapter {
     return "codex:h:" + djb2(model + "|" + firstUser.slice(0, 200));
   }
 
+  weakConversationKey(pair: RawPair): boolean {
+    // prompt_cache_key is Codex's per-session id. The fallback is the model plus
+    // the opening prompt, which unrelated sessions can share.
+    return !pair?.request?.body?.prompt_cache_key;
+  }
+
   parseRequestItems(pair: RawPair): WireItem[] {
     const body = pair?.request?.body ?? {};
     const input: any[] = Array.isArray(body.input) ? body.input : [];

@@ -51,6 +51,12 @@ export class AnthropicAdapter implements AgentAdapter {
     return "claude:" + djb2(JSON.stringify({ system, model }));
   }
 
+  weakConversationKey(pair: RawPair): boolean {
+    // With no system prompt the key is the model alone: a reconstructed
+    // transcript and a one-call quota probe on the same model share it.
+    return systemIsEmpty(pair?.request?.body?.system);
+  }
+
   parseRequestItems(pair: RawPair): WireItem[] {
     const body = pair?.request?.body ?? {};
     const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
@@ -353,6 +359,17 @@ function normalizeSystemForGrouping(system: any): any {
     });
   }
   return system;
+}
+
+function systemIsEmpty(system: any): boolean {
+  if (system == null) return true;
+  if (typeof system === "string") return system.trim() === "";
+  if (Array.isArray(system)) {
+    return system.every(
+      (b) => !b || typeof b !== "object" || (b.type === "text" && !String(b.text ?? "").trim()),
+    );
+  }
+  return false;
 }
 
 function djb2(str: string): string {
