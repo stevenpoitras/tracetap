@@ -186,11 +186,16 @@ before(async () => {
   );
 
   server = http.createServer((req, res) => handleRequest(store, req, res));
+  // fetch pools keep-alive sockets; Node's server drops an idle one after 5s.
+  // The synchronous store tests that run between HTTP tests can outlast that,
+  // so the next fetch reuses a socket the server is closing → ECONNRESET.
+  server.keepAliveTimeout = 60_000;
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
 after(async () => {
+  server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));
   try {
     store.close();
@@ -438,6 +443,12 @@ test("GET /api/session/<id> returns transcript, requests, hooks, flow, compactio
   const body = JSON.parse(r.text);
   assert.equal(body.session.sessionId, id);
   assert.ok(body.steps.length >= 3, "transcript steps expected");
+  // Every user step carries the server's noise verdict (title.ts's skip list),
+  // so the page has one source for "did a person type this".
+  const userSteps = body.steps.filter((s) => s.role === "user");
+  assert.ok(userSteps.length > 0);
+  for (const s of userSteps) assert.equal(typeof s.noise, "boolean", "user step missing noise flag");
+  assert.ok(body.steps.filter((s) => s.role !== "user").every((s) => !("noise" in s)));
   assert.ok(body.requests.length >= 2, "per-pair wire rows expected");
   assert.equal(body.requests[0].seq, 0);
   assert.ok(Array.isArray(body.compactions));

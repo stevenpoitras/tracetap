@@ -4,6 +4,7 @@ import * as path from "path";
 import { spawn } from "child_process";
 import { AddressInfo } from "net";
 import { Store, defaultDbPath } from "./index";
+import { isNoiseStep } from "./title";
 import type {
   RequestRow,
   SearchFilters,
@@ -1453,7 +1454,13 @@ export async function handleRequest(
         sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
         return;
       }
-      const steps = store.listSteps(sessionId);
+      // User-role steps carry the harness's verdict on whether a PERSON typed
+      // them. The page used to keep its own copy of this skip list, and it
+      // drifted: output-style banners and task-tool nags were reported as the
+      // user's prompt on nearly every turn. One list, in title.ts, serves both.
+      const steps = store.listSteps(sessionId).map((s) =>
+        s.role === "user" ? { ...s, noise: isNoiseStep(String(s.message ?? "")) } : s,
+      );
       const requests = store.listRequests(sessionId);
       // Each of these backs exactly one pane. Isolate them: a throw in any one
       // degrades its own pane instead of 500-ing the endpoint and darkening all

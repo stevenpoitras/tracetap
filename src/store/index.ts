@@ -405,6 +405,30 @@ export interface ToolsetUsageRow {
 }
 
 /** Session columns the dashboard is allowed to sort by (guards against SQL injection). */
+/** How far a hook may sit outside a session's wire window and still belong to it. */
+const HOOK_WINDOW_SLACK_S = 600; // 10 minutes — long tool calls can lag the wire window
+
+/**
+ * The time window a session's hooks are matched in, or null when it has none.
+ *
+ * Shared by the hook time join and the Flow graph so the Hooks pane and the
+ * Stream grain can never disagree about which hooks a session owns.
+ *
+ * - No timestamps (0..0) is no window. The old fallback widened it to
+ *   0..MAX_SAFE_INTEGER — every hook ever captured — and the cwd fence passes
+ *   cwd-less hooks by design, so nothing else held the line.
+ * - An inverted window is no window: it is corrupt data, not a time range.
+ * - A POINT is a window. One API call stamps every step with the same time, so
+ *   a single-call session (or a live capture one call in) always has
+ *   started_at == ended_at, and its hooks sit inside the ±slack around it.
+ */
+function hookWindow(
+  session: { startedAt: number; endedAt: number } | null | undefined,
+): [number, number] | null {
+  if (!session || !(session.startedAt > 0) || !(session.endedAt >= session.startedAt)) return null;
+  return [session.startedAt - HOOK_WINDOW_SLACK_S, session.endedAt + HOOK_WINDOW_SLACK_S];
+}
+
 const SORTABLE_COLUMNS = new Set([
   "agent",
   "model",
@@ -426,12 +450,17 @@ const SORTABLE_COLUMNS = new Set([
 // reasoning as 9 — the rows already on disk were written by the old rule and
 // indexFile will not revisit a log whose content hash is unchanged, so without
 // a bump one real capture keeps 125 non-calls inside a session's waterfall.
-// 11: session ids are unique per source. A conversation key is a hash of what
+// 11: the trajectory walker no longer loses prompts and tool_results after a
+// resent-transcript reset (compaction, /clear). Steps already on disk were
+// built by the old high-water-mark cursor — one real session kept 9 of its
+// prompts and 37 of 1147 observations — and unchanged logs are never revisited.
+// 12: session ids are unique per source. A conversation key is a hash of what
 // the wire carries (system prompt + model for Claude), so two unrelated logs
 // with no system prompt shared one id, and the insert's delete-by-id let the
 // last-indexed log silently erase the other. The losers are gone from the rows
-// on disk, and only a full rebuild brings them back.
-const SCHEMA_VERSION = 11;
+// on disk, and only a full rebuild brings them back — including for indexes
+// already rebuilt at 11, which were rebuilt under the old id rule.
+const SCHEMA_VERSION = 12;
 
 /**
  * How long after a `PreCompact` hook its compacted call may arrive, and how far
@@ -2308,10 +2337,9 @@ export class Store {
     // A uuid is positive identity: if it resolved and still produced no rows,
     // this conversation simply has no hooks, and guessing by clock would serve
     // a neighbouring session's under it.
-    if (session && !byId.length && !claudeSessionId) {
-      const slack = 600; // 10 minutes — long tool calls can lag the wire window
-      const start = session.startedAt > 0 ? session.startedAt - slack : 0;
-      const end = session.endedAt > 0 ? session.endedAt + slack : Number.MAX_SAFE_INTEGER;
+    const window = hookWindow(session);
+    if (session && window && !byId.length && !claudeSessionId) {
+      const [start, end] = window;
       byTime = this.db
         .prepare(
           `SELECT id, session_id, ts, event, hook_name, duration_ms, decision,
@@ -2382,9 +2410,10 @@ export class Store {
    */
   sessionFlow(sessionId: string): FlowGraph {
     const session = this.getSession(sessionId);
-    const slack = 600; // same ±10 min the hook time join allows for lagging calls
-    const lo = session && session.startedAt > 0 ? session.startedAt - slack : -Infinity;
-    const hi = session && session.endedAt > 0 ? session.endedAt + slack : Infinity;
+    // The same window the hook time join uses. Here the hooks are already keyed
+    // by conversation identity, so with no window there is nothing to leak and
+    // the bound is simply lifted.
+    const [lo, hi] = hookWindow(session) ?? [-Infinity, Infinity];
     return deriveFlow({
       steps: this.listSteps(sessionId),
       hooks: this.listHooksForConversation(sessionId).filter((h) => h.ts >= lo && h.ts <= hi),
