@@ -574,6 +574,23 @@ function projectCwdFor(sourcePath: string): string {
 }
 
 /**
+ * The session id a conversation group from `sourcePath` is stored under: the
+ * adapter's conversation key scoped by its source path. A pure function of the
+ * two, so it never depends on what else is indexed or in what order: a rebuild
+ * reproduces every id, and `#session/<id>` links survive it.
+ *
+ * The key alone is a hash of wire content (system prompt + model for Claude),
+ * not an identity. Unrelated logs share it: every system-less call on one
+ * model, and separate Claude Code sessions with the same system prompt. The
+ * store never merged sessions across files (the insert's delete-by-id was
+ * last-wins), so scoping by path loses nothing and keeps every log's sessions.
+ * The trade-off: an id changes if its log is moved or renamed.
+ */
+function sessionIdFor(group: PairGroup, sourcePath: string): string {
+  return `${group.sessionId}~${sha256Hex(sourcePath).slice(0, 10)}`;
+}
+
+/**
  * Claude Code's own session uuid for a conversation, from the request headers.
  *
  * The join key to `~/.claude/projects/<slug>/<uuid>.jsonl`, where compactions
@@ -601,23 +618,6 @@ function projectCwdFor(sourcePath: string): string {
  *
  * @returns the uuid, or null for non-Claude agents and pre-header captures.
  */
-/**
- * The session id a conversation group from `sourcePath` is stored under: the
- * adapter's conversation key scoped by its source path. A pure function of the
- * two, so it never depends on what else is indexed or in what order: a rebuild
- * reproduces every id, and `#session/<id>` links survive it.
- *
- * The key alone is a hash of wire content (system prompt + model for Claude),
- * not an identity. Unrelated logs share it: every system-less call on one
- * model, and separate Claude Code sessions with the same system prompt. The
- * store never merged sessions across files (the insert's delete-by-id was
- * last-wins), so scoping by path loses nothing and keeps every log's sessions.
- * The trade-off: an id changes if its log is moved or renamed.
- */
-function sessionIdFor(group: PairGroup, sourcePath: string): string {
-  return `${group.sessionId}~${sha256Hex(sourcePath).slice(0, 10)}`;
-}
-
 function claudeSessionIdOf(group: PairGroup): string | null {
   const counts = new Map<string, number>();
   for (const pair of group.pairs) {
