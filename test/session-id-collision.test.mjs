@@ -6,14 +6,16 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Store } from "../dist/store/index.js";
-import { conversationIdOf, groupPairs } from "../dist/trajectory/index.js";
+import { conversationIdOf } from "../dist/trajectory/index.js";
 
 /**
  * Two unrelated captures with no system prompt reduce to the same conversation
  * key (`claude:` + hash of {system, model}). The indexer used to delete by
  * session id before inserting, so whichever log was indexed last erased the
  * other — a 1170-call reconstructed session vanished behind a 1-call quota
- * probe. Both must survive, under ids that do not depend on index order.
+ * probe. Keys with a system prompt collide too (separate Claude Code sessions
+ * sharing one prompt and model), so every id is scoped by its source path.
+ * Both must survive, under ids that do not depend on index order.
  */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -51,17 +53,54 @@ function idsAfter(files) {
 
 const KEY = conversationIdOf(pairsOf(A)[0]);
 
-test("the fixtures really do collide on the adapter key, and it is weak", () => {
+test("the no-system fixtures really do collide on the adapter key", () => {
   assert.equal(conversationIdOf(pairsOf(B)[0]), KEY);
-  assert.equal(groupPairs(pairsOf(A))[0].weakKey, true);
-  assert.equal(groupPairs(pairsOf(B))[0].weakKey, true);
 });
 
-test("a key built from a system prompt is strong, so its URL stays bare", () => {
-  const [g] = groupPairs(pairsOf(STRONG));
-  assert.equal(g.weakKey, false);
-  const ids = idsAfter([STRONG]);
-  assert.equal(ids.get(STRONG), g.sessionId);
+test("a session id is its conversation key scoped by source path", () => {
+  const strongKey = conversationIdOf(pairsOf(STRONG)[0]);
+  assert.notEqual(strongKey, KEY, "the strong fixture has a system prompt");
+  withStore((open) => {
+    const store = open();
+    try {
+      store.indexFile(STRONG);
+      const [s] = store.listSessions({});
+      assert.match(s.sessionId, new RegExp("^" + strongKey.replace(/[:]/g, "\\$&") + "~[0-9a-f]{10}$"));
+      assert.equal(s.conversationKey, strongKey);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("two different logs sharing a system-prompt key both survive", () => {
+  // Separate Claude Code sessions with the same system prompt and model hash to
+  // one key. A real index lost 707 requests this way, last-indexed-wins.
+  withStore((open, tmp) => {
+    const one = path.join(tmp, "one.jsonl");
+    const two = path.join(tmp, "two.jsonl");
+    const pairs = pairsOf(STRONG);
+    fs.copyFileSync(STRONG, one);
+    // Same key (same system + model), different content: only the first call.
+    fs.writeFileSync(two, JSON.stringify(pairs[0]) + "\n");
+    assert.equal(conversationIdOf(JSON.parse(fs.readFileSync(two, "utf8"))), conversationIdOf(pairs[0]));
+    const store = open();
+    try {
+      store.indexFile(one);
+      store.indexFile(two);
+      const sessions = store.listSessions({});
+      assert.equal(sessions.length, 2);
+      const bySource = new Map(sessions.map((s) => [s.sourcePath, s]));
+      assert.equal(store.listRequests(bySource.get(one).sessionId).length, pairs.length);
+      assert.equal(store.listRequests(bySource.get(two).sessionId).length, 1);
+      // Re-indexing one log must not touch the other's rows.
+      fs.appendFileSync(two, JSON.stringify(pairs[0]) + "\n");
+      store.indexFile(two);
+      assert.equal(store.listRequests(bySource.get(one).sessionId).length, pairs.length);
+    } finally {
+      store.close();
+    }
+  });
 });
 
 test("both colliding sessions survive with their own rows", () => {
@@ -74,7 +113,7 @@ test("both colliding sessions survive with their own rows", () => {
       assert.equal(sessions.length, 2, "neither log may erase the other");
       const bySource = new Map(sessions.map((s) => [s.sourcePath, s]));
       for (const s of sessions) {
-        assert.ok(s.sessionId.startsWith(KEY + "~"), "weak keys are always scoped by source");
+        assert.ok(s.sessionId.startsWith(KEY + "~"), "ids are scoped by source");
         assert.equal(s.conversationKey, KEY);
       }
       assert.notEqual(bySource.get(A).sessionId, bySource.get(B).sessionId);

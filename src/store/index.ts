@@ -229,8 +229,7 @@ export interface SessionSummary {
   /**
    * The key this session's pairs group under in `sourcePath` — what
    * `conversationIdOf` / `Trajectory.sessionId` return when the log is
-   * re-read. Equal to `sessionId` except for a weak key, whose id is suffixed
-   * with its source to keep it unique across logs.
+   * re-read. `sessionId` is this key scoped by the source path.
    */
   conversationKey: string;
   /** Number of agent turns (agent-role steps) in the session. */
@@ -463,7 +462,7 @@ const SORTABLE_COLUMNS = new Set([
 // 12: session ids are unique per source. A conversation key is a hash of what
 // the wire carries (system prompt + model for Claude), so two unrelated logs
 // with no system prompt shared one id, and the insert's delete-by-id let the
-// last-indexed log silently erase the other. Weak keys now carry their source
+// last-indexed log silently erase the other. Every id now carries its source
 // path (sessionIdFor), and byte-identical copies index once. The losers are gone from the rows
 // on disk, and only a full rebuild brings them back — including for indexes
 // already rebuilt at 11, which were rebuilt under the old id rule.
@@ -603,20 +602,19 @@ function projectCwdFor(sourcePath: string): string {
  * @returns the uuid, or null for non-Claude agents and pre-header captures.
  */
 /**
- * The session id a conversation group from `sourcePath` is stored under: a pure
- * function of the two, so it never depends on what else is indexed or in what
- * order — a rebuild reproduces every id, and `#session/<id>` links survive it.
+ * The session id a conversation group from `sourcePath` is stored under: the
+ * adapter's conversation key scoped by its source path. A pure function of the
+ * two, so it never depends on what else is indexed or in what order: a rebuild
+ * reproduces every id, and `#session/<id>` links survive it.
  *
- * A strong key (a system prompt, a harness-issued session id) stays bare, so
- * those URLs are what they have always been. A weak key is a hash of inputs
- * too generic to name a conversation: every system-less Claude call on one
- * model shares it, so unrelated logs collided and the last indexed erased the
- * rest. Those get the source path folded in. The trade-off: a weak-key
- * session's id changes if its log is moved or renamed, and the same weak-key
- * conversation captured into two differing logs shows twice instead of once.
+ * The key alone is a hash of wire content (system prompt + model for Claude),
+ * not an identity. Unrelated logs share it: every system-less call on one
+ * model, and separate Claude Code sessions with the same system prompt. The
+ * store never merged sessions across files (the insert's delete-by-id was
+ * last-wins), so scoping by path loses nothing and keeps every log's sessions.
+ * The trade-off: an id changes if its log is moved or renamed.
  */
 function sessionIdFor(group: PairGroup, sourcePath: string): string {
-  if (!group.weakKey) return group.sessionId;
   return `${group.sessionId}~${sha256Hex(sourcePath).slice(0, 10)}`;
 }
 
@@ -778,10 +776,9 @@ export class Store {
         -- RECORDED rather than inferred. Null for non-Claude agents and for
         -- logs captured before the header existed.
         claude_session_id   TEXT,
-        -- The adapter's conversationKey for this session's pairs. Equal to
-        -- session_id except for weak keys, where session_id carries a
-        -- per-source suffix (see sessionIdFor). Re-reading the source log
-        -- filters on THIS.
+        -- The adapter's conversationKey for this session's pairs: session_id
+        -- without its per-source suffix (see sessionIdFor). Re-reading the
+        -- source log filters on THIS.
         conversation_key    TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source_path);
@@ -949,8 +946,8 @@ export class Store {
     const contentHash = hashFile(sourcePath);
 
     // Byte-identical copies (a backup, a log copied between projects) are one
-    // capture and must count once. Weak keys are scoped by path, so without
-    // this a copy would index as a second session and double its spend. The
+    // capture and must count once. Ids are scoped by path, so without this a
+    // copy would index as a second session and double its spend. The
     // smallest path is the canonical one, whatever the index order: a copy
     // that sorts after an indexed twin is skipped, and one that sorts before
     // takes over from it. A skipped copy writes no watermark, so it is checked
@@ -1057,14 +1054,9 @@ export class Store {
     const endedAt = Number.isFinite(maxTs) ? maxTs : 0;
     const claudeSessionId = claudeSessionIdOf(group);
 
-    // A trajectory's session_id is its own; clear any prior rows for it. Only a
-    // strong key can be held by another source (weak ones carry this path, and
-    // byte-identical copies never get here): the same session captured into two
-    // differing logs, e.g. a copy taken mid-capture. That stays last-indexed-wins.
-    this.db.prepare("DELETE FROM steps_fts WHERE session_id = ?").run(traj.sessionId);
-    this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(traj.sessionId);
-    this.db.prepare("DELETE FROM requests WHERE session_id = ?").run(traj.sessionId);
-    this.db.prepare("DELETE FROM usage_events WHERE session_id = ?").run(traj.sessionId);
+    // No delete-by-id here: the id carries this source's path, and indexFile
+    // already dropped every row from this path. The old delete reached across
+    // sources and was how one log silently erased another.
 
     this.db
       .prepare(

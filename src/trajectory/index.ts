@@ -69,8 +69,6 @@ export function conversationIdOf(pair: RawPair): string | null {
 export interface PairGroup {
   adapter: AgentAdapter;
   sessionId: string;
-  /** {@link AgentAdapter.weakConversationKey} for this group's key. */
-  weakKey: boolean;
   pairs: RawPair[];
 }
 
@@ -106,13 +104,7 @@ export function groupPairs(pairs: RawPair[]): PairGroup[] {
   const out: PairGroup[] = [];
   for (const bucket of buckets) {
     for (const key of bucket.keys) {
-      const groupPairs = bucket.groups.get(key)!;
-      out.push({
-        adapter: bucket.adapter,
-        sessionId: key,
-        weakKey: bucket.adapter.weakConversationKey(groupPairs[0]),
-        pairs: groupPairs,
-      });
+      out.push({ adapter: bucket.adapter, sessionId: key, pairs: bucket.groups.get(key)! });
     }
   }
   return out;

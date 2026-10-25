@@ -140,15 +140,6 @@ export interface AgentAdapter {
   agentInfo(pair: RawPair): Agent;
   /** Conversation grouping key for the pair. */
   conversationKey(pair: RawPair): string;
-  /**
-   * True when {@link conversationKey} was built from inputs too generic to name
-   * one conversation: no system prompt, no harness-issued session id. Those keys
-   * collide across unrelated logs (every system-less Claude call on one model
-   * hashes alike), so the store scopes them by source file. A key that is weak
-   * for one pair of a conversation is weak for all of them, because the same
-   * inputs produced it.
-   */
-  weakConversationKey(pair: RawPair): boolean;
   /** The transcript-so-far carried by this pair's request, flattened. */
   parseRequestItems(pair: RawPair): WireItem[];
   /** The assistant turn produced by this pair's response. */

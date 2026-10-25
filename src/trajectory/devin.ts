@@ -43,12 +43,6 @@ export class DevinAdapter implements AgentAdapter {
     return "devin:" + djb2(String(body.model ?? "?") + "|" + textPreview(body.system));
   }
 
-  weakConversationKey(pair: RawPair): boolean {
-    // Devin's own session id names the conversation. The model + system
-    // fallback is shared by every import that lacks one.
-    return !pair?.request?.body?.session_id;
-  }
-
   parseRequestItems(pair: RawPair): WireItem[] {
     const body = pair?.request?.body ?? {};
     const transcript: any[] = Array.isArray(body.transcript) ? body.transcript : [];

@@ -500,6 +500,15 @@ derived data: on a schema upgrade it is dropped and rebuilt from your `.jsonl`
 logs on the next `tracetap index` — nothing to migrate, the logs are the source
 of truth.
 
+A session id is `<conversation key>~<source hash>`, for example
+`claude:aaec3dbe~acb00d48f1`. The key groups one log's calls into conversations
+(for Claude, a hash of the system prompt and model), and the suffix is a hash of
+the log's path. The key alone is not unique: unrelated logs share it whenever
+they have the same system prompt and model, or no system prompt at all. So two
+logs never share a session, and the same files always produce the same ids,
+whatever order they are indexed in. Moving or renaming a log changes its ids.
+A byte-identical copy of an indexed log is skipped and counted once.
+
 `tracetap search` returns ranked hits (FTS5 BM25) showing the session id, step
 number, a highlighted snippet, and the stitched tool_call ↔ observation. Filters:
 
