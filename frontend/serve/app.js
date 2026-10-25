@@ -817,11 +817,13 @@
    * "sessions" on a third line — and a grid row is as tall as its tallest card,
    * so one wrapping card added 40px to all seven.
    */
-  function card(k, v, alert, sub) {
+  function card(k, v, alert, sub, tip) {
     return (
       '<div class="card' +
       (alert ? " alert" : "") +
-      '"><div class="k">' +
+      '"' +
+      (tip ? ' title="' + esc(tip) + '"' : "") +
+      '><div class="k">' +
       k +
       '</div><div class="v">' +
       v +
@@ -1051,9 +1053,40 @@
     return el.getAttribute("data-trace-text") || "";
   }
 
+  /**
+   * Terminal escape sequences out of captured text.
+   *
+   * Slash-command stdout is captured exactly as the CLI printed it, colour codes
+   * included — `/model` echoes "Set model to \x1b[1mOpus 5\x1b[22m". A browser
+   * renders the ESC byte as nothing and the rest as literal "[1m", so the row
+   * read "Set model to [1mOpus 5[22m".
+   *
+   * Alternatives, in order:
+   *  - CSI in its full ECMA-48 form: parameter bytes 0x30–0x3F (digits and
+   *    `:;<=>?` — truecolour is "38:2::255:0:0", private modes use `>`/`=`),
+   *    intermediates 0x20–0x2F, one final byte 0x40–0x7E.
+   *  - OSC (window titles, hyperlinks) up to BEL or ST, or to end of string.
+   *  - Two-byte charset designation, e.g. "\x1b(B" from `tput sgr0`.
+   *  - A CSI clipped mid-sequence by a preview cut, then any stray ESC, so a
+   *    truncated escape never leaves its ESC byte behind.
+   */
+  var ANSI_RE = new RegExp(
+    [
+      "\\x1b\\[[0-?]*[ -\\/]*[@-~]",
+      "\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\|$)",
+      "\\x1b[()][0-9A-Za-z]",
+      "\\x1b\\[[0-?]*[ -\\/]*$",
+      "\\x1b",
+    ].join("|"),
+    "g",
+  );
+  function stripAnsi(s) {
+    return String(s == null ? "" : s).replace(ANSI_RE, "");
+  }
+
   /** One-line preview for an event label. */
   function evLine(s, n) {
-    var flat = String(s || "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
+    var flat = stripAnsi(s).replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
       .replace(/\s+/g, " ").trim();
     if (!flat) return "";
     return flat.length <= (n || 96) ? flat : flat.slice(0, n || 96) + "…";
@@ -1117,6 +1150,32 @@
     return true;
   }
 
+  /**
+   * A user-ROLE step that a person did NOT type — the harness talking. The exact
+   * complement of `isUserAsk` among user steps, so every grain draws the same
+   * line: what the Turns grain (and the chip, and the Prompts card) will not
+   * count as a prompt, Stream and Steps must not label PROMPT either. They
+   * render it under `INJECTED_KIND` instead, dimmed, rather than dropping it —
+   * "/model opus" did happen, it just is not an ask.
+   *
+   * Empty steps and the indexer's `<block>no…` placeholder land here too, on
+   * purpose: the server's isNoiseStep already calls an empty step noise, and a
+   * placeholder is not something anyone said. One bucket for "user role, not a
+   * prompt" is what keeps the three grains' counts equal.
+   */
+  function isHarnessStep(st) {
+    if (!st || st.role !== "user") return false;
+    return !isUserAsk(st);
+  }
+
+  /**
+   * The kind harness-injected user steps carry in the Stream and Steps grains.
+   * Deliberately NOT in TRACE_KINDS: it gets no chip, so pressing any chip
+   * (including "prompt") hides it, and with no chip pressed it shows, dimmed.
+   * The label matches the focused-turn anatomy's "injected context".
+   */
+  var INJECTED_KIND = "injected";
+
   function buildTurns(reqs, hooks, steps, compactSeqs) {
     var byStep = {};
     // The nearest USER step at or before each index — i.e. the prompt that
@@ -1134,6 +1193,9 @@
     var prevAsk = {};
     var lastUser = null;
     var lastAsk = null;
+    // Every ask, in transcript order. See the emission below for why the turn
+    // needs more than the nearest one.
+    var asks = [];
     (steps || [])
       .slice()
       .sort(function (a, b) {
@@ -1142,16 +1204,41 @@
       .forEach(function (st) {
         byStep[st.stepIndex] = st;
         if (st.role === "user") lastUser = st;
-        if (isUserAsk(st)) lastAsk = st;
+        if (isUserAsk(st)) {
+          lastAsk = st;
+          asks.push(st);
+        }
         prevUser[st.stepIndex] = lastUser;
         prevAsk[st.stepIndex] = lastAsk;
       });
-    // The prompt step of the PREVIOUS turn. A run of turns driven by one user
-    // message all resolve `prevUser` to the same step object, and emitting a
+    // Each ask is emitted ONCE, on the first turn that reaches it. A run of turns
+    // driven by one user message all resolve to the same ask, and emitting a
     // `prompt` event on every one of them would report 40 prompts for a session
-    // where the user typed twice. Emit it on the turn where it CHANGES.
-    var lastPromptStep = null;
-    return (reqs || []).map(function (r, i) {
+    // where the user typed twice.
+    //
+    // And EVERY ask, not just the nearest: two messages typed before the model
+    // answered (an ask, then `/model`, then a rephrased ask) both precede the
+    // first call. Emitting only the nearest dropped the first one, so the chip
+    // said 3 prompts while the Stream and Steps grains — which list user steps
+    // one by one — showed 4. Asks typed after the LAST call are attached to the
+    // last turn after the loop, so every ask the Stream/Steps grains (and the
+    // Prompts card) count is on exactly one turn and the chip agrees with them.
+    //
+    // ASSUMES requests' agentStepIndex is non-decreasing in `reqs` order; a
+    // request pointing back at an earlier step does not re-emit its ask.
+    var emittedAsk = {};
+    var mkPrompt = function (a) {
+      var ptext = stepBody(a);
+      if (!String(ptext || "").trim()) return null;
+      return {
+        kind: "prompt",
+        label: evLine(ptext),
+        detail: ptext,
+        n: String(ptext).length,
+        stepIndex: a.stepIndex,
+      };
+    };
+    var turns = (reqs || []).map(function (r, i) {
       var next = reqs[i + 1];
       // Hooks are timestamped, not seq-tagged, so a turn owns the hooks that
       // fired between its start and the next turn's. Imperfect where turns
@@ -1170,19 +1257,14 @@
       // with hook output and fed-back tool results would otherwise emit a fresh
       // "prompt" every time that machinery changed, reporting dozens of prompts
       // for one thing the person typed.
-      if (askStep && askStep !== lastPromptStep) {
-        var ptext = stepBody(askStep);
-        if (String(ptext || "").trim()) {
-          evs.push({
-            kind: "prompt",
-            label: evLine(ptext),
-            detail: ptext,
-            n: String(ptext).length,
-            stepIndex: askStep.stepIndex,
-          });
-        }
+      if (askStep && !emittedAsk[askStep.stepIndex]) {
+        asks.forEach(function (a) {
+          if (a.stepIndex > askStep.stepIndex || emittedAsk[a.stepIndex]) return;
+          emittedAsk[a.stepIndex] = true;
+          var pe = mkPrompt(a);
+          if (pe) evs.push(pe);
+        });
       }
-      if (askStep) lastPromptStep = askStep;
       if (st && String(st.reasoning || "").trim()) {
         evs.push({
           kind: "thinking",
@@ -1314,6 +1396,29 @@
         events: evs,
       };
     });
+    // Asks no turn reached — typed after the last call (a session that ended on
+    // a question, or whose reply was never captured). They go on the turn with
+    // the LATEST agent step, at the END of its events and flagged `trailing`,
+    // because that is where they fall in time: after that call, not inside it.
+    // Dropping them made the chip undercount what the Stream and Steps showed.
+    var lastTurn = null;
+    turns.forEach(function (t) {
+      var at = t.req.agentStepIndex;
+      if (at == null) return;
+      if (!lastTurn || at >= lastTurn.req.agentStepIndex) lastTurn = t;
+    });
+    if (!lastTurn && turns.length) lastTurn = turns[turns.length - 1];
+    if (lastTurn) {
+      asks.forEach(function (a) {
+        if (emittedAsk[a.stepIndex]) return;
+        emittedAsk[a.stepIndex] = true;
+        var pe = mkPrompt(a);
+        if (!pe) return;
+        pe.trailing = true;
+        lastTurn.events.push(pe);
+      });
+    }
+    return turns;
   }
 
   /** The one argument that most distinguishes a tool call from its siblings. */
@@ -1345,7 +1450,7 @@
 
   /** Collapse to a single line and clip, so a row can never grow a second line. */
   function oneLine(s, max) {
-    var t = String(s || "")
+    var t = stripAnsi(s)
       .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, " ")
       .replace(/\s+/g, " ")
       .trim();
@@ -1397,7 +1502,7 @@
         raw = o[keys[0]];
       }
     }
-    raw = raw
+    raw = stripAnsi(raw)
       .replace(/<command-name>\s*/g, "")
       .replace(/<\/command-name>/g, "")
       .replace(/<command-message>[\s\S]*?<\/command-message>/g, "")
@@ -1710,10 +1815,28 @@
       return b.events.length > a.events.length ? b : a;
     });
     if (busiest.events.length >= 5) {
+      // Said as its MIX, not "fired N events". The insight sat beside a
+      // "Hooks 0" card, and "fired 5 events" read as five hooks firing when it
+      // was really a prompt, a reply and three tool calls. Naming the kinds
+      // (biggest first) answers "busy with what?" in the same line.
+      var mix = {};
+      busiest.events.forEach(function (e) {
+        mix[e.kind] = (mix[e.kind] || 0) + 1;
+      });
+      var mixText = Object.keys(mix)
+        .sort(function (a, b) {
+          return mix[b] - mix[a] || TRACE_KIND_ORDER.indexOf(a) - TRACE_KIND_ORDER.indexOf(b);
+        })
+        .map(function (k) {
+          // "3 tool calls", but never "2 thinkings".
+          return mix[k] + " " + traceKindLabel(k) +
+            (mix[k] > 1 && k !== "thinking" ? "s" : "");
+        })
+        .join(" · ");
       push(
         "busy",
-        "Turn " + busiest.seq + " fired " + busiest.events.length + " events",
-        "the densest turn in the session",
+        "Turn " + busiest.seq + " is the busiest · " + busiest.events.length + " blocks",
+        mixText,
         busiest.seq,
         "info",
       );
@@ -1773,13 +1896,58 @@
    * Sampled at call START. Calls overlap, so no single instant has one true
    * context size; the start is the value the request was actually sent with.
    */
+  /**
+   * Split the strip's points (sorted by start) wherever the session sat idle
+   * for much longer than its own rhythm.
+   *
+   * "Idle" is measured from the latest END seen so far to the next START, so a
+   * long-running call is not mistaken for a gap. "Much longer" is relative to
+   * the session — 20x its median idle — with a 10-minute floor, so a burst of
+   * back-to-back calls (median ~0) does not break on every coffee-length pause
+   * and a slow session does not break on its normal spacing.
+   *
+   * Plus an absolute ceiling: any idle over an hour always breaks. The median is
+   * taken over the same gaps it judges, so on its own it can never split a
+   * session made OF long gaps — two calls 8h apart, or gaps [8h, 8h, 1s], have
+   * a median as large as the gap and would be drawn as one wedge across a day.
+   */
+  var CTX_GAP_FACTOR = 20;
+  var CTX_GAP_FLOOR_MS = 10 * 60 * 1000;
+  var CTX_GAP_CEIL_MS = 60 * 60 * 1000;
+  function ctxStripSegments(pts) {
+    if (!pts.length) return [];
+    var idle = [];
+    var end = pts[0].to;
+    for (var i = 1; i < pts.length; i++) {
+      idle.push(Math.max(0, pts[i].from - end));
+      end = Math.max(end, pts[i].to);
+    }
+    var sorted = idle.slice().sort(function (a, b) {
+      return a - b;
+    });
+    var median = sorted.length ? sorted[Math.floor((sorted.length - 1) / 2)] : 0;
+    var limit = Math.min(
+      CTX_GAP_CEIL_MS,
+      Math.max(CTX_GAP_FLOOR_MS, median * CTX_GAP_FACTOR),
+    );
+    var segs = [[pts[0]]];
+    for (var j = 1; j < pts.length; j++) {
+      if (idle[j - 1] > limit) segs.push([]);
+      segs[segs.length - 1].push(pts[j]);
+    }
+    return segs;
+  }
+
   function contextStripHtml(turns, t0, span, W) {
     var H = CTX_STRIP_H;
     var pts = turns
       .map(function (t) {
         var r = t.req;
+        var sp = reqSpanMs(r);
         return {
           x: ((r.ts * 1000 - t0) / span) * W,
+          from: sp.from,
+          to: sp.to,
           read: r.cacheRead || 0,
           write: r.cacheCreation || 0,
           fresh: r.promptTokens || 0,
@@ -1789,6 +1957,7 @@
         return a.x - b.x;
       });
     if (!pts.length) return "";
+    var segs = ctxStripSegments(pts);
     var max = 0;
     pts.forEach(function (p) {
       var tot = p.read + p.write + p.fresh;
@@ -1799,19 +1968,36 @@
     // Bands are cumulative, drawn back-to-front, so each polygon is the area
     // under a running total rather than a floating ribbon that has to be closed
     // along a second edge.
+    //
+    // One polygon per SEGMENT, not per session: across an idle gap there is no
+    // context to draw, and joining the last call before a night's break to the
+    // first one after it drew a long diagonal wedge implying the context grew
+    // steadily through hours when nothing ran.
     function band(keys, cls) {
-      var top = pts.map(function (p) {
-        var v = 0;
-        keys.forEach(function (k) {
-          v += p[k];
-        });
-        return p.x.toFixed(1) + "," + (H - (v / max) * (H - 2)).toFixed(1);
-      });
-      return (
-        '<polygon class="' + cls + '" points="' +
-        pts[0].x.toFixed(1) + "," + H + " " + top.join(" ") + " " +
-        pts[pts.length - 1].x.toFixed(1) + "," + H + '"></polygon>'
-      );
+      return segs
+        .map(function (seg) {
+          var top = seg.map(function (p) {
+            var v = 0;
+            keys.forEach(function (k) {
+              v += p[k];
+            });
+            return p.x.toFixed(1) + "," + (H - (v / max) * (H - 2)).toFixed(1);
+          });
+          var x0 = seg[0].x;
+          var x1 = seg[seg.length - 1].x;
+          // A lone call between two gaps would be a zero-width polygon, i.e.
+          // invisible. Give it a sliver so the call is still on the axis.
+          if (seg.length === 1) {
+            top.push((x0 + 2).toFixed(1) + top[0].slice(top[0].indexOf(",")));
+            x1 = x0 + 2;
+          }
+          return (
+            '<polygon class="' + cls + '" points="' +
+            x0.toFixed(1) + "," + H + " " + top.join(" ") + " " +
+            x1.toFixed(1) + "," + H + '"></polygon>'
+          );
+        })
+        .join("");
     }
 
     return (
@@ -1821,7 +2007,11 @@
       band(["read"], "ctx-read") +
       "</svg>" +
       '<div class="ctx-strip-note dim">context over time · peak ' +
-      fmtTok(max) + " · stacked by provenance</div>"
+      fmtTok(max) + " · stacked by provenance" +
+      (segs.length > 1
+        ? " · " + (segs.length - 1) + " idle gap" + (segs.length > 2 ? "s" : "") + " left blank"
+        : "") +
+      "</div>"
     );
   }
 
@@ -2021,10 +2211,9 @@
       cols + "</div>" +
       '<input class="jr-range" id="jr-range" type="range" min="0" max="' +
       (turns.length - 1) + '" value="0" step="1" aria-label="Scrub turns">' +
-      // `insert` is where the filter bar goes: BELOW the strip, which is a
-      // silhouette of the whole session and is deliberately never filtered, and
-      // ABOVE the focused turn, which is. A control has to sit above everything
-      // it changes, or it reads as applying to the strip too.
+      // `insert` is an optional slot between the strip and the focused turn. The
+      // Trace pane no longer uses it for the filter bar — that now shares a row
+      // with the grain switch, below the focused turn (see tracePaneHtml).
       (insert || "") +
       '<div class="jr-detail" id="jr-detail"></div>'
     );
@@ -2479,15 +2668,27 @@
       );
     }
     return (
-      // The filter bar is threaded INTO the strip block rather than appended
-      // after it, so it lands between the (unfiltered) silhouette and the
-      // (filtered) focused turn.
-      journeyHtml(turns, traceFilterBarHtml(turns)) +
-      '<div class="trace-switch"><span class="trace-switch-lab">grain</span>' +
+      journeyHtml(turns) +
+      // Grain switch and filter bar are ONE control row, directly above the
+      // content they drive. The filter used to sit up between the strip and the
+      // focused-turn anatomy, a screenful above the grain switch, so the two
+      // controls for "what am I looking at" were read and used apart. The
+      // focused turn's own steps panel still says when it is filtered (its
+      // "filtered" chip), so it does not need the bar above it to explain that.
+      //
+      // The anchor is a zero-height, NON-sticky marker at the row's natural
+      // position: a sticky element's rect reports where it is stuck, which is
+      // useless for keeping the scroll steady across a grain switch.
+      '<div class="trace-anchor" id="trace-anchor" aria-hidden="true"></div>' +
+      '<div class="trace-controls" id="trace-controls">' +
+      '<div class="trace-switch" role="group" aria-label="Trace grain">' +
+      '<span class="trace-switch-lab">grain</span>' +
       TRACE_DENSITIES.map(densityBtn).join("") +
       "</div>" +
+      traceFilterBarHtml(turns) +
+      "</div>" +
       densitySection("turns", turnSpineHtml(turns)) +
-      densitySection("stream", renderFlowPane(flow)) +
+      densitySection("stream", renderFlowPane(flow, steps)) +
       densitySection(
         "steps",
         '<h2 class="sec">Transcript <small>(' + steps.length +
@@ -2572,7 +2773,9 @@
             : "") +
           '<span class="turn-sum' + (repeat ? " ditto" : "") + '" title="' +
           esc(t.summary) + '">' +
-          (repeat ? "〃" : esc(t.summary || "—")) + "</span>" +
+          // Words, not the 〃 glyph: in the mono face it rendered as "//", which
+          // read as a blank or broken label rather than as "same as above".
+          (repeat ? "\u2191 same as above" : esc(t.summary || "—")) + "</span>" +
           "</span>" +
           contextBarHtml(t.req, maxCtx) +
           '<span class="turn-ctx">' + fmtTok(ctx) + "</span>" +
@@ -2972,6 +3175,90 @@
     );
   }
 
+  /**
+   * The session header's metric cards. Pulled out of drawSession so the two
+   * judgment calls in it — what counts as a "prompt", and how an unmeasured
+   * TTFT is shown — are testable without a DOM.
+   */
+  function sessionCardsHtml(s, reqs, steps, hooks, compactionList, recorded) {
+    var ttfts = reqs
+      .map(function (r) {
+        return r.ttftMs;
+      })
+      .filter(function (v) {
+        return v != null;
+      })
+      .sort(function (a, b) {
+        return a - b;
+      });
+    var ttftP50 = ttfts.length
+      ? ttfts[Math.floor((ttfts.length - 1) * 0.5)]
+      : null;
+    var errReqs = reqs.filter(function (r) {
+      return r.errored;
+    }).length;
+    // What a PERSON typed: `isUserAsk`, the test the prompt chip counts with —
+    // buildTurns attaches every ask (trailing ones included) to exactly one
+    // turn, so this and the chip are the same number by construction. This
+    // card used to be "Turns" from `session.turns`, which the store counts as
+    // API requests — so it always equalled the "API calls" card beside it, and
+    // a 1170-call session the user drove with four messages read "Turns 1170".
+    // It is not renamed "User turns" because the Trace pane's Turns grain is one
+    // row per API call; two different things both called Turns is the bug.
+    var asks = (steps || []).filter(isUserAsk).length;
+
+    return (
+      card("Cost", fmtCost(s.costUsd)) +
+      card("Duration", fmtDur(s.durationMs)) +
+      card(
+        "Prompts",
+        asks,
+        false,
+        null,
+        "Messages the user typed. Harness-injected user steps (slash-command " +
+          "output, hook context, fed-back tool results) are not counted.",
+      ) +
+      card(
+        "API calls",
+        reqs.length +
+          (errReqs
+            ? ' <small class="warn-text">' + errReqs + " failed</small>"
+            : ""),
+      ) +
+      card(
+        "Tokens in/out",
+        fmtTok(s.totalInTokens) +
+          " <small>/</small> " +
+          fmtTok(s.totalOutTokens),
+      ) +
+      card("Cache hit", fmtPct(cacheRate(s))) +
+      // A bare "—" read as "zero" or as a rendering bug. When no call carries a
+      // first-byte timestamp the metric is unavailable, not small, so say so
+      // and say why on hover.
+      (ttftP50 != null
+        ? card("TTFT p50", fmtDur(ttftP50))
+        : card(
+            "TTFT p50",
+            '<span class="dim">n/a</span>',
+            false,
+            "not captured",
+            "No call in this session recorded a first-byte timestamp (captures " +
+              "from before tracetap measured TTFT, or non-streamed responses), " +
+              "so time-to-first-token cannot be computed.",
+          )) +
+      // Headline the count that can actually tell you something. "Hooks 869"
+      // when all 869 are stubs is a number that reads as signal and is not.
+      card(
+        "Hooks",
+        signalHooks(hooks).length +
+          (signalHooks(hooks).length !== hooks.length
+            ? ' <small class="dim">of ' + hooks.length + "</small>"
+            : ""),
+      ) +
+      compactionCard(compactionList, recorded)
+    );
+  }
+
   function drawSession(data, stepN, initialPane) {
     var s = data.session,
       reqs = data.requests,
@@ -2997,52 +3284,7 @@
     // different session's ribbon. Drop it with the render that produced it.
     turnRange = null;
 
-    var ttfts = reqs
-      .map(function (r) {
-        return r.ttftMs;
-      })
-      .filter(function (v) {
-        return v != null;
-      })
-      .sort(function (a, b) {
-        return a - b;
-      });
-    var ttftP50 = ttfts.length
-      ? ttfts[Math.floor((ttfts.length - 1) * 0.5)]
-      : null;
-    var errReqs = reqs.filter(function (r) {
-      return r.errored;
-    }).length;
-
-    var cards =
-      card("Cost", fmtCost(s.costUsd)) +
-      card("Duration", fmtDur(s.durationMs)) +
-      card("Turns", s.turns || 0) +
-      card(
-        "API calls",
-        reqs.length +
-          (errReqs
-            ? ' <small class="warn-text">' + errReqs + " failed</small>"
-            : ""),
-      ) +
-      card(
-        "Tokens in/out",
-        fmtTok(s.totalInTokens) +
-          " <small>/</small> " +
-          fmtTok(s.totalOutTokens),
-      ) +
-      card("Cache hit", fmtPct(cacheRate(s))) +
-      card("TTFT p50", ttftP50 != null ? fmtDur(ttftP50) : "—") +
-      // Headline the count that can actually tell you something. "Hooks 869"
-      // when all 869 are stubs is a number that reads as signal and is not.
-      card(
-        "Hooks",
-        signalHooks(hooks).length +
-          (signalHooks(hooks).length !== hooks.length
-            ? ' <small class="dim">of ' + hooks.length + "</small>"
-            : ""),
-      ) +
-      compactionCard(compactionList, data.recordedCompactions);
+    var cards = sessionCardsHtml(s, reqs, steps, hooks, compactionList, data.recordedCompactions);
     recordedForPane = data.recordedCompactions || null;
 
     var pane = initialPane || "trace";
@@ -3175,6 +3417,13 @@
       "</aside>" +
       "</div>";
     setView(html);
+    // The Trace control row sticks UNDER the sticky topbar, whose height depends
+    // on fonts and wrapping, so it is measured rather than guessed in the CSS.
+    var topbar = document.querySelector(".topbar");
+    var rootStyle = document.documentElement && document.documentElement.style;
+    if (topbar && rootStyle && typeof rootStyle.setProperty === "function") {
+      rootStyle.setProperty("--topbar-h", topbar.getBoundingClientRect().height + "px");
+    }
     // After `setView`, because the strip is laid out at its measured width and
     // reads t0/span back off the ribbon it must align with — one source for the
     // axis, so the two can never drift apart.
@@ -4266,7 +4515,7 @@
     var dens = e.target.closest && e.target.closest("[data-trace-density]");
     if (dens) {
       traceDensity = dens.getAttribute("data-trace-density");
-      syncTraceDensity();
+      keepTraceScroll(syncTraceDensity);
       return;
     }
     var preset = e.target.closest && e.target.closest("[data-turn-preset]");
@@ -4341,6 +4590,30 @@
    * want to hide turns. Letting each write `hidden` directly means whichever
    * ran last silently undoes the other; they have to be ANDed in one pass.
    */
+  /**
+   * Run `swap` (a grain switch) without the page jumping.
+   *
+   * The grains differ wildly in height — 1,170 turn rows against 3,000 stream
+   * blocks against 1,179 transcript steps — so swapping one for another let the
+   * browser clamp or keep a scroll offset that now pointed somewhere unrelated.
+   * Pin the control row instead: if it was on screen, it stays exactly where it
+   * was; if the user had scrolled down into the old grain (the row stuck at the
+   * top), the new grain opens at its own start, under the row, rather than at
+   * an arbitrary depth inside it.
+   */
+  function keepTraceScroll(swap) {
+    var anchor = document.getElementById("trace-anchor");
+    if (!anchor || typeof window.scrollBy !== "function") return swap();
+    // The topbar is sticky too, so "the top" is its bottom edge, not 0.
+    var bar = document.querySelector(".topbar");
+    var top = bar ? bar.getBoundingClientRect().bottom : 0;
+    var before = anchor.getBoundingClientRect().top;
+    swap();
+    var want = before < top ? top : before;
+    var delta = anchor.getBoundingClientRect().top - want;
+    if (delta) window.scrollBy(0, delta);
+  }
+
   /** Show the grain `traceDensity` names: its switch button and its panel. */
   function syncTraceDensity() {
     document.querySelectorAll("[data-trace-density]").forEach(function (b) {
@@ -5020,11 +5293,19 @@
    * shows per-turn and the anatomy shows per-turn-opened-up, which is why all
    * three now live behind one density switch instead of three tabs.
    */
-  function renderFlowPane(flow) {
+  function renderFlowPane(flow, steps) {
     var nodes = (flow && flow.nodes) || [];
     if (!nodes.length) {
       return '<div class="empty-pane">No stream nodes yet — index a session with transcript steps.</div>';
     }
+    // The step behind each user node, so the Stream asks the SAME question the
+    // Turns grain does (`isUserAsk`) instead of trusting the node kind. The
+    // server's `noise` flag covers the shared skip list; the step check adds the
+    // page's local fallbacks (tool envelopes, transcript dumps).
+    var stepAt = {};
+    (steps || []).forEach(function (st) {
+      stepAt[st.stepIndex] = st;
+    });
     var html =
       '<div class="flow-layout"><div class="flow-graph" id="flow-graph">';
     nodes.forEach(function (n, i) {
@@ -5034,11 +5315,27 @@
       // The server's names are left alone (other consumers read them); the
       // translation happens here, at the edge.
       var tk = FLOW_KIND_MAP[n.kind] || n.kind;
-      var text = String(n.label || "") + " " +
+      var src = n.stepIndex != null ? stepAt[n.stepIndex] : null;
+      // With the step in hand its verdict is authoritative (it is what the chip
+      // and Steps grain use); without it, the server's node flag.
+      var harness = n.kind === "user" &&
+        (src ? isHarnessStep(src) : n.noise === true);
+      if (harness) tk = INJECTED_KIND;
+      // A user node's server label is a preview of the RAW message, envelope
+      // and command tags included ("<command-name>/clear</command-name>…").
+      // The step, when we have it, unwraps to what the Turns grain shows; an
+      // empty or placeholder step says so instead of showing "<block>no…".
+      var label = stripAnsi(
+        n.kind === "user" && src
+          ? oneLine(stepBody(src), 96) || "(empty user step)"
+          : n.label,
+      );
+      var text = String(label || "") + " " +
         (n.detail ? JSON.stringify(n.detail) : n.detailPreview || "");
       html +=
         '<div class="flow-node kind-' +
         esc(n.kind) +
+        (harness ? " is-noise" : "") +
         lane +
         err +
         '" data-kind="' +
@@ -5048,7 +5345,7 @@
         '"' +
         traceHayAttr("node:" + (n.id != null ? n.id : i), text) +
         ' data-label="' +
-        esc(n.label) +
+        esc(label) +
         '" data-node-id="' +
         esc(n.id) +
         '" data-inspect="flow:' +
@@ -5074,8 +5371,10 @@
         '<span class="flow-kind">' +
         esc(traceKindLabel(tk)) +
         "</span>" +
-        '<span class="flow-label">' +
-        esc(n.label) +
+        '<span class="flow-label"' +
+        (harness ? ' title="written by the harness, not typed by the user"' : "") +
+        ">" +
+        esc(label) +
         "</span>" +
         "</div>";
       // The connector is decorative and must not survive its neighbours being
@@ -5720,13 +6019,19 @@
   }
 
   function stepCard(st) {
-    var roleClass =
-      st.role === "user" ? "user" : st.role === "agent" ? "agent" : "system";
+    // Harness machinery on the user side (slash-command caveats and stdout, hook
+    // output, fed-back tool results) is drawn as the SYSTEM it is: dimmed, and
+    // labelled the way the focused-turn anatomy labels it, so the Steps grain
+    // stops presenting `<local-command-caveat>` as something the user said.
+    var harness = isHarnessStep(st);
+    var roleClass = harness
+      ? "system is-noise"
+      : st.role === "user" ? "user" : st.role === "agent" ? "agent" : "system";
     var head =
       '<div class="step-head"><span class="pill">#' +
       st.stepIndex +
       '</span><span class="role">' +
-      esc(st.role) +
+      esc(harness ? "injected · harness" : st.role) +
       "</span>" +
       (st.errored ? '<span class="pill err">errored</span>' : "") +
       "</div>";
@@ -5740,10 +6045,10 @@
         "</pre></details>";
     }
     if (st.message)
-      body += '<div class="step-body">' + renderMarkdown(st.message) + "</div>";
+      body += '<div class="step-body">' + renderMarkdown(stripAnsi(st.message)) + "</div>";
     body += toolCallsHtml(st);
     if (st.observation) {
-      var obs = clip(st.observation, 20000),
+      var obs = clip(stripAnsi(st.observation), 20000),
         obsInner;
       try {
         JSON.parse(obs);
@@ -5768,7 +6073,12 @@
     // already skips it, and messages-only must not keep tool-only steps by it.
     var said = String(st.message || "").trim();
     if (said.indexOf(EMPTY_STEP_MESSAGE) === 0) said = "";
-    if (st.role === "user" && said) kinds.push("prompt");
+    // Not "prompt" for harness steps: the chip count comes from the Turns grain,
+    // which only counts asks, and a filter for prompts that kept slash-command
+    // stdout would show more prompts than the chip claims exist.
+    // Every user step is exactly one of the two, empty or not — see
+    // isHarnessStep — so an empty step is still findable as "injected".
+    if (st.role === "user") kinds.push(harness ? INJECTED_KIND : "prompt");
     if (String(st.reasoning || "").trim()) kinds.push("thinking");
     if (st.role !== "user" && said) kinds.push("reply");
     if (String(st.toolName || "").trim()) kinds.push("tool_call");
@@ -8277,6 +8587,13 @@
       stepText: stepText,
       stepBody: stepBody,
       isUserAsk: isUserAsk,
+      isHarnessStep: isHarnessStep,
+      stripAnsi: stripAnsi,
+      tracePaneHtml: tracePaneHtml,
+      sessionCardsHtml: sessionCardsHtml,
+      sessionInsights: sessionInsights,
+      ctxStripSegments: ctxStripSegments,
+      contextStripHtml: contextStripHtml,
       // The filter PASS, not just the predicate. It reads and writes a live DOM,
       // so the test drives it against a constructed element graph — the same
       // code path a click takes, which is the only way to catch a selector that

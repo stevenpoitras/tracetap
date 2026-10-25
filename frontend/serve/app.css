@@ -1622,6 +1622,24 @@ h1 {
 .flow-node.kind-api_call {
   border-left: 3px solid var(--mid);
 }
+/* Harness-injected user steps (slash-command caveats/stdout, hook context):
+   present, because they happened, but visibly NOT the user talking. Same
+   treatment in the Stream and the Steps grain. */
+.flow-node.is-noise {
+  border-left-color: var(--muted);
+  border-left-style: dashed;
+  background: transparent;
+}
+.flow-node.is-noise .flow-kind,
+.flow-node.is-noise .flow-label {
+  color: var(--dim);
+}
+.flow-node.is-noise .flow-label { font-style: italic; }
+.step.system.is-noise {
+  border-left-style: dashed;
+  background: transparent;
+}
+.step.is-noise .step-body { color: var(--dim); }
 .flow-edge {
   width: 2px;
   height: 10px;
@@ -2124,6 +2142,22 @@ tr[data-inspect]:focus-visible {
 .head-link:hover {
   text-decoration: underline;
 }
+/* "user prompt" opens the inspector rather than navigating, so it is a button —
+   and the UA gave it a grey bordered chip that read as a stray filter. Give the
+   chrome back so it is the same object as "system prompt ↗" beside it. */
+button.head-link {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  font-family: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
+button.head-link:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
 /* A subagent's calls are interleaved with the main thread's in every session
    view; the dot is the only thing that says which conversation a row is. */
 .agent-dot {
@@ -2276,20 +2310,34 @@ tr[data-inspect]:focus-visible {
 
 /* Turn spine: one row per turn, its events nested underneath. */
 /* ---------------------------------------------------------------- trace filter
-   One bar for the whole Trace pane. It sits ABOVE the grain switch, because it
-   filters every grain — a bar that scrolled away with the spine would leave the
-   Stream and Steps grains looking unfiltered while they were not. */
-.turn-filters {
+   One bar for the whole Trace pane, sharing a row with the grain switch right
+   above the grain content (`.trace-controls`). The ROW is what sticks, because
+   it filters every grain — a bar that scrolled away with the spine would leave
+   the Stream and Steps grains looking unfiltered while they were not. It sticks
+   under the sticky topbar, not at 0, or the topbar (z 10) covers it. */
+/* The row's top margin lives on the anchor, so the anchor's top IS the row's
+   natural top and keepTraceScroll can line the row up under the topbar. */
+.trace-anchor { height: 0; margin-top: 10px; }
+.trace-controls {
   display: flex;
-  gap: 6px;
-  margin-bottom: 8px;
   flex-wrap: wrap;
   align-items: center;
+  gap: 6px 14px;
   position: sticky;
-  top: 0;
+  top: var(--topbar-h, 46px);
   z-index: 3;
   background: var(--bg);
   padding: 6px 0;
+  margin: 0 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+.turn-filters {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
 }
 .turn-filter-lab,
 .trace-switch-lab {
@@ -2361,7 +2409,6 @@ tr[data-inspect]:focus-visible {
   display: flex;
   align-items: center;
   gap: 4px;
-  margin: 10px 0 8px;
 }
 .trace-density {
   font-family: var(--font-chrome);
@@ -2508,7 +2555,9 @@ tr[data-inspect]:focus-visible {
   white-space: nowrap;
   color: var(--bright);
 }
-.turn-sum.ditto { color: var(--dim); }
+/* A repeat of the row above, said in words and kept quiet: it must read as
+   structure ("same run"), not as a label competing with the rows that differ. */
+.turn-sum.ditto { color: var(--dim); font-style: italic; font-size: var(--fs-200); }
 .turn-bar {
   display: flex;
   height: 6px;
