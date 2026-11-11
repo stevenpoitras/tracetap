@@ -1,6 +1,11 @@
 # Session debug mode: design and user flows
 
-Status: revised after spikes and review, 2026-11-02. Claude Code only.
+Status: revised after spikes and review, 2026-11-02; aligned with transcript
+import 2026-11-11. Not yet approved for a plan. Claude Code only.
+
+Related: [Claude Code transcript import](2026-11-11-claude-transcript-import-design.md),
+which gives every session, debugged or not, a place in the dashboard. See
+"Relationship to transcript import".
 
 ## Why
 
@@ -298,6 +303,9 @@ up. These are the designer's calls.
   login.
 - **`debug` still indexes its own run at exit**, so results are there immediately
   rather than after the next interval.
+- **The same loop runs the transcript import** (`tracetap claude-transcripts
+  import`), which already skips unchanged transcripts, so sessions that were
+  never debugged stay current too.
 - **Indexing gates on mtime and size before hashing.** `hashFile` reads every byte
   of every log today, which an interval can't afford.
 
@@ -375,8 +383,42 @@ Decided here, as the designer's call:
 - After this ships, the docs recommend `tracetap debug` for debugging.
   `hooks install` is described as optional background metadata.
 - `hooks install --full` keeps working, with a note pointing at `tracetap debug`.
-- The current machine has global `--full` taps from today's testing. Removing
-  them is a manual step for the owner.
+- The global `--full` taps installed during testing were removed on
+  2026-11-03, so nothing needs cleaning up before this ships.
+
+## Relationship to transcript import
+
+The two features answer different questions and should not be confused:
+
+| | Debug mode | Transcript import |
+| --- | --- | --- |
+| When | Chosen before or during one session | After the fact, for every session |
+| Covers | Sessions launched or attached through tracetap | Every Claude Code session, desktop app included |
+| System prompt and tool definitions | Exact, from the wire | Not recorded; shown as one "not recorded" X-Ray bucket |
+| Hooks | Full payloads | Hook runs only, no payloads |
+| Compactions | Wire inference plus Claude Code's records, with `PreCompact` confirming the trigger | Claude Code's records only |
+
+- **No double counting.** A debugged session also has a transcript. The import
+  marks the transcript copy as shadowed by the wire capture, so the debug run
+  is the one listed and counted.
+- **Attach-only results.** Hooks only display through a session with wire
+  data, so attach on a session with no proxy had nowhere to show its hook
+  payloads. An imported session is a candidate home for them. Not decided.
+- **Shared dependency.** Both need `serve` to keep itself indexed (goal 7);
+  the indexing loop above covers both.
+
+## Open questions
+
+- Is this design approved for an implementation plan?
+- In headless tests, sessions through the proxy used about 32% more prompt
+  tokens and had a slower first turn. Does that undermine context debugging,
+  and why does it happen? Comparing a wire capture with the transcript of the
+  same session should show where the difference comes from.
+- The live switch (attach) has only been confirmed headless and against a stub
+  API. It needs a run in a real interactive session on real auth, including how
+  auto mode treats `! tracetap debug attach`.
+- Where attach-only results appear (see above).
+- Ship `serve` auto-indexing on its own, ahead of debug mode?
 
 ## Left to the builder
 
