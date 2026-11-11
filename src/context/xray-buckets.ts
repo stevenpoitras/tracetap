@@ -17,7 +17,8 @@ export type XrayBucketId =
   | "assistant"
   | "tool_result"
   | "thinking"
-  | "other";
+  | "other"
+  | "unrecorded";
 
 export interface XrayBucketDef {
   id: XrayBucketId;
@@ -38,6 +39,16 @@ export const XRAY_BUCKETS: readonly XrayBucketDef[] = [
   { id: "thinking", label: "thinking", description: "Extended thinking blocks" },
   { id: "tool_result", label: "tool result", description: "Tool outputs carried forward" },
   { id: "other", label: "other", description: "Unclassified content" },
+  // Only a transcript-built X-Ray has this lane. A transcript does not record
+  // the system prompt or the tool declarations, so the part of the measured
+  // context the transcript cannot account for is shown as its own remainder
+  // rather than silently folded into a bucket it does not belong to.
+  {
+    id: "unrecorded",
+    label: "not accounted for",
+    description:
+      "Real context the transcript cannot account for: system prompt, tool definitions, thinking it does not keep, and chars/4 estimate error",
+  },
 ] as const;
 
 export const XRAY_BUCKET_IDS: readonly XrayBucketId[] = XRAY_BUCKETS.map((b) => b.id);

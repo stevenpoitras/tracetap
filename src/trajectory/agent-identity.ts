@@ -33,6 +33,8 @@ export interface IdentityPair {
     body?: {
       system?: unknown;
       messages?: unknown;
+      /** Set by the transcript importer: Claude Code's own record of who ran. */
+      meta?: { subagent?: { agentType?: string | null; description?: string | null } | null };
     };
   };
 }
@@ -201,6 +203,16 @@ export function identifyRequest(
   pair: IdentityPair,
   index: AgentSpawn[],
 ): AgentIdentity {
+  // A transcript-imported subagent is identified by Claude Code itself (its
+  // `subagents/agent-<id>.meta.json`), so there is nothing to join or guess.
+  const sub = pair?.request?.body?.meta?.subagent;
+  if (sub && typeof sub === "object") {
+    return {
+      isSubagent: true,
+      label: typeof sub.description === "string" && sub.description ? sub.description : null,
+      subagentType: typeof sub.agentType === "string" && sub.agentType ? sub.agentType : null,
+    };
+  }
   if (!isSubagentCall(pair)) {
     return { isSubagent: false, label: null, subagentType: null };
   }

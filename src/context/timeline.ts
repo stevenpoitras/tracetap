@@ -61,8 +61,29 @@ export interface CompactionEfficacy {
 
 export interface CompactionTrigger {
   kind: "auto" | "manual" | "unknown";
-  source: "hook" | "inferred";
+  /**
+   * `recorded`: Claude Code's own `compact_boundary` record, attached to a
+   * call because it came from the same transcript as the calls (imported
+   * sessions). `hook`: a PreCompact hook matched by time. `inferred`: the
+   * wire-side detector, with no trigger evidence at all.
+   */
+  source: "hook" | "inferred" | "recorded";
   hookTs?: number;
+}
+
+/**
+ * A recorded compaction to place on the timeline at a known call. Built by
+ * the store from the transcript's `compact_boundary` record.
+ */
+export interface RecordedCompactionInput {
+  ts: number;
+  trigger: string;
+  preTokens: number;
+  postTokens: number;
+  durationMs: number | null;
+  preservedMessages: number | null;
+  userContext: string | null;
+  cumulativeDroppedTokens: number | null;
 }
 
 export interface ContextTimelinePoint {
@@ -102,9 +123,26 @@ export interface ContextTimelinePoint {
     postApproxTokens: number;
     efficacy: CompactionEfficacy;
     trigger?: CompactionTrigger;
+    /**
+     * Present on a recorded compaction only. Item counts above are 0 there:
+     * a transcript request carries a delta, so it has no transcript length to
+     * compare, and the record's own sizes are the measurement.
+     */
+    recorded?: {
+      ts: number;
+      durationMs: number | null;
+      preservedMessages: number | null;
+      userContext: string | null;
+      cumulativeDroppedTokens: number | null;
+    };
   };
   /** Bucket → approx token counts (when body was parsed). */
   buckets?: Record<string, number>;
+  /**
+   * Transcript-built composition only: how far the estimated buckets EXCEED
+   * the call's real context, when they do. Flagged, not scaled.
+   */
+  estimateOvershootTokens?: number;
 }
 
 export interface ContextTimeline {
@@ -127,6 +165,8 @@ export interface ContextMetrics {
   totalChars: number;
   totalApproxTokens: number;
   buckets: Record<string, number>;
+  /** Transcript-built composition only; see ContextTimelinePoint.estimateOvershootTokens. */
+  overshootTokens?: number;
 }
 
 /**
@@ -422,6 +462,18 @@ export function buildContextTimeline(opts: {
    * caller. Absent seqs stay untriggered rather than being guessed at.
    */
   triggersBySeq?: Map<number, CompactionTrigger>;
+  /**
+   * seq → a compaction Claude Code recorded, attached to that call by the
+   * caller. Placed as-is with `source: "recorded"`.
+   */
+  recordedBySeq?: Map<number, RecordedCompactionInput>;
+  /**
+   * Run the wire-side detector. Default true. Off for transcript-imported
+   * sessions: their requests carry a delta, so `transcriptItems` rises and
+   * falls every turn, and a detector built on "items fell and context fell"
+   * reported 7 compactions on a session that had 1 (all 7 with after = 0).
+   */
+  inferCompactions?: boolean;
 }): ContextTimeline {
   // The SERIES is ordered by seq — that is the axis the chart and the transcript
   // are indexed on, and renumbering it would break every `ctp:<seq>` link.
@@ -431,7 +483,10 @@ export function buildContextTimeline(opts: {
   // `reqs[i-1]` is routinely a LATER turn. Diffing on that axis produced 53 of
   // the 209 false compactions on the live index all by itself.
   const byTime = [...opts.requests].sort((a, b) => a.ts - b.ts || a.seq - b.seq);
-  const compactBySeq = new Map(findCompactions(byTime).map((c) => [c.seq, c] as const));
+  const compactBySeq = new Map(
+    (opts.inferCompactions === false ? [] : findCompactions(byTime)).map((c) => [c.seq, c] as const),
+  );
+  const recordedBySeq = opts.recordedBySeq ?? new Map<number, RecordedCompactionInput>();
   // seq → the call that PRECEDED it in time. A compaction's "before" size has
   // to come from the call it was detected against, and that is this one, not
   // whatever happens to sit at `reqs[i-1]`.
@@ -448,10 +503,12 @@ export function buildContextTimeline(opts: {
     let approxTokens = 0;
     let buckets: Record<string, number> | undefined;
     const pre = opts.precomputedBySeq?.get(r.seq);
+    let overshoot: number | undefined;
     if (pre) {
       approxChars = pre.totalChars;
       approxTokens = pre.totalApproxTokens;
       buckets = pre.buckets;
+      if (pre.overshootTokens) overshoot = pre.overshootTokens;
     } else if (pair && opts.xrayFor) {
       const xray = opts.xrayFor(r.seq, pair, r.promptHash);
       approxChars = xray.totalChars;
@@ -481,6 +538,7 @@ export function buildContextTimeline(opts: {
       promptHash: r.promptHash,
       errored: r.errored,
       buckets,
+      ...(overshoot ? { estimateOvershootTokens: overshoot } : {}),
     };
 
     if (point.contextTokens > peakContext) peakContext = point.contextTokens;
@@ -495,9 +553,49 @@ export function buildContextTimeline(opts: {
   // while the timeline is still being laid down.
   const pointBySeq = new Map(points.map((p) => [p.seq, p] as const));
   const sizes = points.map((p) => p.approxTokens);
-  const isCompaction = (seq: number) => compactBySeq.has(seq);
+  const isCompaction = (seq: number) => compactBySeq.has(seq) || recordedBySeq.has(seq);
+  let recordedPlaced = 0;
   for (let i = 0; i < points.length; i++) {
     const point = points[i];
+    const rec = recordedBySeq.get(point.seq);
+    if (rec) {
+      // The record's own sizes ARE the measurement (Claude Code counted them),
+      // so pre/post come from it rather than from a neighbouring call.
+      const prevReq = timePredecessor.get(point.seq);
+      point.compaction = {
+        fromItems: 0,
+        toItems: 0,
+        droppedItems: 0,
+        preContextTokens: rec.preTokens,
+        postContextTokens: rec.postTokens,
+        droppedTokens: rec.preTokens - rec.postTokens,
+        preApproxTokens: rec.preTokens,
+        postApproxTokens: rec.postTokens,
+        efficacy: computeCompactionEfficacy({
+          reclaimedTokens: rec.preTokens - rec.postTokens,
+          preApproxTokens: rec.preTokens,
+          cacheRebuildTokens: reqs[i].cacheCreation,
+          cacheReadBefore: prevReq?.cacheRead ?? 0,
+          cacheReadAfter: reqs[i].cacheRead,
+          cacheBaseline: cacheRebuildBaseline(reqs, i, isCompaction),
+          callsToRegrow: callsToRegrow(sizes, i, rec.preTokens),
+          rebuildCostTokens: rebuildCostFor(reqs, i),
+        }),
+        trigger: {
+          kind: rec.trigger === "auto" || rec.trigger === "manual" ? rec.trigger : "unknown",
+          source: "recorded",
+        },
+        recorded: {
+          ts: rec.ts,
+          durationMs: rec.durationMs,
+          preservedMessages: rec.preservedMessages,
+          userContext: rec.userContext,
+          cumulativeDroppedTokens: rec.cumulativeDroppedTokens,
+        },
+      };
+      recordedPlaced++;
+      continue;
+    }
     const c = compactBySeq.get(point.seq);
     if (!c) continue;
     const prevReq = timePredecessor.get(point.seq);
@@ -539,7 +637,7 @@ export function buildContextTimeline(opts: {
 
   return {
     points,
-    compactionCount: compactBySeq.size,
+    compactionCount: compactBySeq.size + recordedPlaced,
     peakContextTokens: peakContext,
     peakApproxTokens: peakApprox,
     outOfOrderPairs: countOutOfOrder(reqs),

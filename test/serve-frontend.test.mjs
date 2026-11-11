@@ -932,3 +932,37 @@ test("empty and placeholder user steps are injected in every grain, never a prom
   assert.match(cards[2], /data-trace-kinds="prompt"/);
   assert.equal(chip, 1);
 });
+
+test("why panel renders the compaction payload; empty without one", () => {
+  assert.equal(app.compactionWhyPanel(null), "");
+  const html = app.compactionWhyPanel({
+    seq: 6,
+    ts: 1767607260,
+    trigger: "manual",
+    triggerSource: "recorded",
+    userContext: "keep the widget notes",
+    precedingPrompt: { text: "go on", stepIndex: 9 },
+    preTokens: 6400,
+    postTokens: 900,
+    droppedTokens: 5500,
+    durationMs: 4000,
+    preservedMessages: 1,
+    growth: { since: "session start", fromTs: 1767607201, calls: 4, wallMs: 59000, tokens: 5397 },
+    topToolResults: [{ tool: "Read", chars: 10000, approxTokens: 2500, stepIndex: 2, preview: "W" }],
+    largestUser: { stepIndex: 1, chars: 16, approxTokens: 4, preview: "build the widget" },
+    largestAssistant: null,
+  });
+  assert.match(html, /manual \(\/compact\)/);
+  assert.match(html, /keep the widget notes/);
+  assert.match(html, /go on/);
+  assert.match(html, /Read/);
+  assert.match(html, /since session start/);
+  assert.doesNotMatch(html, /session-wide/, "attached to a call, so not session-wide");
+});
+
+test("an imported session's recorded compactions are not labelled session-wide", () => {
+  const rec = { scope: "session", subagentOnly: false, records: [{ trigger: "manual", droppedTokens: 5500 }] };
+  assert.doesNotMatch(app.compactionPhrase(0, rec), /session-wide/);
+  const wire = { scope: "claude-session", subagentOnly: false, records: [{ trigger: "auto", droppedTokens: 1 }] };
+  assert.match(app.compactionPhrase(3, wire), /session-wide/);
+});

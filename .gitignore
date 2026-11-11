@@ -8,6 +8,7 @@ node_modules
 .codex-trace
 .gemini-trace
 .devin-trace
+.claude-transcripts-trace
 
 # Local agent working state, not repo content
 .cursor/

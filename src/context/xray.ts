@@ -44,6 +44,20 @@ export interface ContextXray {
   totalApproxTokens: number;
   /** Prompt tokens from the wire when available. */
   wirePromptTokens: number | null;
+  /**
+   * Set when this view was rebuilt from a Claude Code transcript rather than
+   * partitioned from a request body (see transcript-xray.ts). `realTokens` is
+   * the call's measured context; the `unrecorded` bucket is real minus the
+   * estimate, and `overshootTokens` is how far the estimate EXCEEDED the real
+   * size when it did — reported, never scaled away.
+   */
+  transcript?: {
+    measured: boolean;
+    realTokens: number | null;
+    estimatedTokens: number;
+    unrecordedTokens: number;
+    overshootTokens: number;
+  };
   buckets: XrayBucketSummary[];
   segments: XraySegment[];
   /** Present when a previous call was provided. */
@@ -69,7 +83,7 @@ export interface ContextXray {
   };
 }
 
-function approxTokens(chars: number): number {
+export function approxTokens(chars: number): number {
   return Math.max(0, Math.ceil(chars / 4));
 }
 
@@ -227,7 +241,7 @@ export function segmentsFromRequestBody(body: any): XraySegment[] {
   return segs;
 }
 
-function summarizeBuckets(segments: XraySegment[]): XrayBucketSummary[] {
+export function summarizeBuckets(segments: XraySegment[]): XrayBucketSummary[] {
   const byId = new Map<XrayBucketId, XrayBucketSummary>();
   for (const def of XRAY_BUCKETS) {
     byId.set(def.id, {
@@ -247,7 +261,7 @@ function summarizeBuckets(segments: XraySegment[]): XrayBucketSummary[] {
   return XRAY_BUCKETS.map((d) => byId.get(d.id)!).filter((b) => b.segments > 0 || b.chars > 0);
 }
 
-function diffSegments(prev: XraySegment[], curr: XraySegment[], prevSeq: number) {
+export function diffSegments(prev: XraySegment[], curr: XraySegment[], prevSeq: number) {
   const prevIds = new Map(prev.map((s) => [s.id, s]));
   const currIds = new Map(curr.map((s) => [s.id, s]));
   const items: XrayDelta[] = [];

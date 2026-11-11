@@ -47,6 +47,25 @@ If none are available, Step 3 fails loudly with instructions to set `HARBOR_PYTH
 8. **Explore/TUI seam** — verifies this document contains the keystroke smoke walkthrough, `tracetap explore --help` exposes the key map, and the non-TTY fallback lists sessions rather than crashing.
 9. **Regression sweep** — runs `npm run build`, `npm run typecheck`, and `npm test`; regenerates both legacy Claude and Codex HTML viewers and verifies their embedded data blocks still exist.
 
+### Covered outside the e2e gate
+
+`scripts/e2e.sh` predates the Claude Code transcript importer and does not
+exercise it. Its coverage is in `npm test`:
+
+- `test/claude-transcripts.test.mjs` — parsing, adapter isolation, usage
+  dedupe, wire-vs-transcript no-double-count, incremental re-import, tolerance.
+- `test/claude-transcripts-xray.test.mjs` — recorded compactions (no inference
+  on imported sessions), the why payload, transcript X-Ray and its
+  `unrecorded` remainder, index-time cost, import format versioning.
+
+All fixtures for these are synthetic. The real-data check for the importer is
+recorded in `docs/superpowers/specs/2026-11-11-claude-transcript-import-design.md`
+under "Validation".
+
+Last run 2026-11-11: `npm run typecheck` exit 0; `npm test` 455 tests, 453
+pass, 0 fail, 2 skipped. `scripts/e2e.sh` was not re-run (it needs the Harbor
+venv); the result below is from 2026-06-09.
+
 ## TUI keystroke smoke walkthrough
 
 The Ink UI is inherently interactive, so the exact keypress flow is documented here and the non-interactive seams are covered by `test/explore.test.mjs` plus Step 8 in `scripts/e2e.sh`.
