@@ -1782,6 +1782,10 @@ h1 {
 .bucket-assistant   { --bkt: 74, 222, 128; }
 .bucket-thinking    { --bkt: 167, 139, 250; }
 .bucket-tool_result { --bkt: 56, 189, 248; }
+/* Transcript X-Ray only: the measured context the transcript cannot account
+   for (system prompt, tool declarations). Neutral on purpose — it is a
+   remainder, not a kind of content. */
+.bucket-unrecorded  { --bkt: 100, 116, 139; }
 
 /* The previous comparison, held on screen while its replacement is fetched.
    Dimmed and inert so it reads as "being replaced" rather than as current. */
@@ -2934,6 +2938,11 @@ button.xray-seg:focus-visible {
   align-items: baseline;
 }
 .ceff-k { color: var(--dim); }
+/* The why-panel shares the efficacy box; only its ranked list is its own. */
+.cwhy-list {
+  margin: 0;
+  padding-left: 18px;
+}
 .ceff-v { font-variant-numeric: tabular-nums; }
 .ceff-why {
   margin-top: 6px;

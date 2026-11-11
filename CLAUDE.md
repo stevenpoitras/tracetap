@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`tracetap` captures the full API traffic of coding-agent harnesses (Claude Code, Codex CLI, Gemini CLI — Devin via local-store import instead, since it can't be proxied) into a JSONL log + self-contained HTML viewer, then builds cross-session tooling on top: a SQLite+FTS5 index, a local dashboard (`serve`), usage/spend reports, an egress secret audit, and ATIF export for Harbor/Terminal-Bench interop.
+`tracetap` captures the full API traffic of coding-agent harnesses (Claude Code, Codex CLI, Gemini CLI — Devin via local-store import instead, since it can't be proxied; Claude Code sessions that weren't wrapped, such as the desktop app, via Claude Code's own transcripts) into a JSONL log + self-contained HTML viewer, then builds cross-session tooling on top: a SQLite+FTS5 index, a local dashboard (`serve`), usage/spend reports, an egress secret audit, and ATIF export for Harbor/Terminal-Bench interop.
 
 The core trick (see README "Why this exists" / "Tracing Claude"): these harnesses ship as native single-binaries that can't be loader-patched, so tracetap hooks them at the network layer — it spawns the harness as a child process with its API base URL env var (`ANTHROPIC_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`) pointed at a local plaintext HTTP proxy, which forwards to the real API over TLS while teeing bytes into a JSONL log. No MITM, no certs.
 
@@ -30,7 +30,7 @@ There's no lint script currently wired up; `tsconfig.json` runs in `strict` mode
 
 ### Entry point and dispatch
 
-`src/tracetap.ts` is the CLI entry (`bin/tracetap`). It's a plain dispatcher: `claude`/`codex`/`gemini` route to per-tool runners (`src/claude-cli.ts`, `src/codex-cli.ts`, `src/gemini-cli.ts`); everything else (`index`, `search`, `usage`, `audit`, `explore`, `serve`, `hooks`, `devin`) is a **lazy dynamic `import()`** so commands that don't need `better-sqlite3` or the Ink/React TUI deps don't pay for loading them. Follow this pattern when adding a new subcommand.
+`src/tracetap.ts` is the CLI entry (`bin/tracetap`). It's a plain dispatcher: `claude`/`codex`/`gemini` route to per-tool runners (`src/claude-cli.ts`, `src/codex-cli.ts`, `src/gemini-cli.ts`); everything else (`index`, `search`, `usage`, `audit`, `explore`, `serve`, `hooks`, `devin`, `claude-transcripts`) is a **lazy dynamic `import()`** so commands that don't need `better-sqlite3` or the Ink/React TUI deps don't pay for loading them. Follow this pattern when adding a new subcommand.
 
 ### Capture layer: proxy + logger
 
@@ -39,9 +39,11 @@ There's no lint script currently wired up; `tsconfig.json` runs in `strict` mode
 
 Devin can't be proxied (no equivalent env-var hook into its binary), so `src/devin/importer.ts` reconstructs sessions from Devin's own local session store instead of live capture.
 
+`src/claude-transcripts/importer.ts` (CLI: `src/claude-transcripts-cli.ts`) does the same for Claude Code's own transcripts under `~/.claude/projects`, strictly read-only, writing to `.claude-transcripts-trace/`. Each synthetic request carries only the **delta** since the previous response (not the resent transcript), and usage is counted once per response id, so pairs that repeat an id carry `usage: null`. Two consequences any downstream code must respect: `transcriptItems` is not a transcript size for these sessions, and zero-usage rows are not separate API calls. When a wire capture carries the same `x-claude-code-session-id`, the wire session wins and the transcript copy is `shadowedByWire`. Design: `docs/superpowers/specs/2026-11-11-claude-transcript-import-design.md`.
+
 ### Trajectory: the agent-agnostic substrate
 
-`src/trajectory/` normalizes captured `RawPair`s from any of the four harnesses into one shape (`Trajectory`: ordered `Step[]` with `ToolCall`/`Observation` stitching and rolled-up token/cost metrics — see `types.ts`). `index.ts` holds an `adapterFor(pair)` registry that tries adapters in a specific order — **Devin first** (strict `provider: "devin"` marker), **Anthropic last** (its `messages[]` shape is the least specific and would false-match otherwise). Everything downstream — the store, analytics, diff, ATIF export, the explore TUI — consumes `Trajectory`, not raw `RawPair`s. When adding a new traced harness, this adapter registry plus a new `AgentAdapter` implementation is the extension point, not the store or serve layer.
+`src/trajectory/` normalizes captured `RawPair`s from any of the four harnesses into one shape (`Trajectory`: ordered `Step[]` with `ToolCall`/`Observation` stitching and rolled-up token/cost metrics — see `types.ts`). `index.ts` holds an `adapterFor(pair)` registry that tries adapters in a specific order — **Devin first** (strict `provider: "devin"` marker), the Claude transcript adapter on its `provider: "claude-transcript"` marker, **Anthropic last** (its `messages[]` shape is the least specific and would false-match otherwise). Everything downstream — the store, analytics, diff, ATIF export, the explore TUI — consumes `Trajectory`, not raw `RawPair`s. When adding a new traced harness, this adapter registry plus a new `AgentAdapter` implementation is the extension point, not the store or serve layer.
 
 ### Store: cross-session index (`src/store/`)
 
@@ -53,7 +55,9 @@ Devin can't be proxied (no equivalent env-var hook into its binary), so `src/dev
 
 Three related lenses over "what's actually filling the context window":
 - `xray.ts` + `xray-buckets.ts` — partitions each request body into a fixed bucket taxonomy (`XRAY_BUCKETS`: system, tools, skills, hook_inject, user, assistant, thinking, tool_result, other) with per-segment char/token estimates and deltas (new/carried/dropped) between consecutive calls in a session.
-- `timeline.ts` — per-API-call context-size timeline, annotating compaction events (pre/post size when the resent transcript shrinks).
+- `timeline.ts` — per-API-call context-size timeline, annotating compaction events. For wire sessions the detection is an inference (resent transcript and context both shrink between non-overlapping calls); it never runs on imported transcript sessions.
+- `compaction.ts` — compactions as Claude Code *records* them (`compact_boundary`: trigger auto/manual, exact pre/post, duration, focus text), joined by Claude session id. Recorded always wins over inferred, and the two are never merged.
+- `transcript-xray.ts` — X-Ray for imported sessions: a running composition rebuilt from transcript deltas, with an `unrecorded` ("not accounted for") bucket: real context minus the estimate. It holds the system prompt and tool definitions, but also unkept thinking and chars/4 error, so never present it as the system prompt's size. `compaction-why.ts` builds the per-compaction "why" payload.
 - `tooltax.ts` — "dead-tool-tax": since tool schemas ride on *every* request, a declared-but-never-invoked tool is paid for repeatedly. Diffs `body.tools[].name` against the session's actual tool-call histogram to surface the dead set, using the same chars/4 sizing heuristic as X-Ray so the numbers reconcile across features.
 
 ### Flow (`src/flow/derive.ts`)
@@ -76,6 +80,7 @@ Exports tracetap's `Trajectory` model to ATIF v1.7 (`ATIF_SCHEMA_VERSION`), a sc
 
 ## Conventions worth knowing
 
-- Fixtures live under `src/<module>/__fixtures__/*.jsonl` (real-shaped captured traffic, not synthetic) and are shared across trajectory/store/e2e tests.
-- New subcommands should be lazy-`import()`ed from `src/tracetap.ts` if they pull in `better-sqlite3` or Ink/React, matching the existing pattern for `index`/`search`/`usage`/`audit`/`explore`/`serve`/`hooks`/`devin`.
-- The adapter-order dependency in `src/trajectory/index.ts` (Devin-first, Anthropic-last) is load-bearing — don't reorder without checking shape-overlap between adapters.
+- Fixtures live under `src/<module>/__fixtures__/*.jsonl` (real-shaped captured traffic) and are shared across trajectory/store/e2e tests. The repo is public: `src/claude-transcripts/__fixtures__` is hand-built synthetic data, and new fixtures must never contain real prompts, paths or ids.
+- Design specs live in `docs/superpowers/specs/`; update the relevant spec when behaviour it describes changes.
+- New subcommands should be lazy-`import()`ed from `src/tracetap.ts` if they pull in `better-sqlite3` or Ink/React, matching the existing pattern for `index`/`search`/`usage`/`audit`/`explore`/`serve`/`hooks`/`devin`/`claude-transcripts`.
+- The adapter-order dependency in `src/trajectory/index.ts` (Devin-first, Claude-transcript on its marker, Anthropic-last) is load-bearing — don't reorder without checking shape-overlap between adapters.

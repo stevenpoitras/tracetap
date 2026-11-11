@@ -248,6 +248,9 @@ export function findCompactions(requests: RequestRow[]): { seq: number; from: nu
   return findCompactionPoints([...requests].sort((a, b) => a.ts - b.ts || a.seq - b.seq));
 }
 
+/** SQL predicate (over alias `s`) excluding transcript-imported sessions. */
+const NOT_TRANSCRIPT_SQL = "s.session_id NOT IN (SELECT session_id FROM transcript_sessions)";
+
 /**
  * Scope filters for {@link fleetAnalytics}. Deliberately the same three the
  * usage report accepts (`since`/`until`/`agent`) so ONE control set in the
@@ -555,8 +558,23 @@ function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilt
                   OVER (PARTITION BY r.session_id ORDER BY r.ts, r.seq) AS ctx_delta
          FROM requests r
          JOIN sessions s ON s.session_id = r.session_id
-         ${reqWhereSql}
+         ${reqWhereSql} AND ${NOT_TRANSCRIPT_SQL}
        ) WHERE item_delta < 0 AND ctx_delta < 0`,
+    )
+    .get(reqParams) as { total: number; sessions: number };
+  // Imported sessions are counted from their own records instead: their
+  // requests carry a delta, so the LAG above would read every turn's delta
+  // shrinking as a compaction (F1 in the transcript-import design).
+  const recWhere: string[] = [NOT_SHADOWED_SQL];
+  if (typeof since === "number") recWhere.push("c.ts >= @since");
+  if (typeof until === "number") recWhere.push("c.ts <= @until");
+  if (agent) recWhere.push("lower(s.agent) = lower(@agent)");
+  const recordedRow = store.db
+    .prepare(
+      `SELECT COUNT(*) AS total, COUNT(DISTINCT c.session_id) AS sessions
+         FROM transcript_compactions c
+         JOIN sessions s ON s.session_id = c.session_id
+        WHERE ${recWhere.join(" AND ")}`,
     )
     .get(reqParams) as { total: number; sessions: number };
 
@@ -639,7 +657,10 @@ function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilt
     toolsTotal,
     // 26 weeks of daily buckets — feeds the calendar heatmap.
     trend: [...trendByDay.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-182),
-    compactions: { totalCompactions: compactionRow.total, sessionsWithCompaction: compactionRow.sessions },
+    compactions: {
+      totalCompactions: compactionRow.total + recordedRow.total,
+      sessionsWithCompaction: compactionRow.sessions + recordedRow.sessions,
+    },
     topSessions,
   };
 }
@@ -1413,6 +1434,21 @@ export async function handleRequest(
         return;
       }
 
+      // /api/session/<id>/compactions — the "why" panel: per compaction, the
+      // trigger, focus text, preceding prompt, sizes, growth since the last
+      // one and the largest contributors. Computed here so the page renders.
+      const compactionsMatch = rest.match(/^(.*)\/compactions$/);
+      if (compactionsMatch) {
+        const sessionId = compactionsMatch[1];
+        const session = store.getSession(sessionId);
+        if (!session) {
+          sendJson(res, 404, { error: `No indexed session '${sessionId}'.` });
+          return;
+        }
+        sendJson(res, 200, { sessionId, ...store.compactionInsights(sessionId) });
+        return;
+      }
+
       // /api/session/<id>/tools — dead-tool-tax for one session: declared
       // toolsets (from the registry) crossed with the session's call histogram.
       const toolsMatch = rest.match(/^(.*)\/tools$/);
@@ -1494,7 +1530,10 @@ export async function handleRequest(
         // and captures that have no transcript. Never merged — a measurement
         // and a guess that disagree is information, and averaging them away
         // would be the worst of both.
-        compactions: findCompactions(requests),
+        // An imported session never runs the detector: its requests carry a
+        // delta, so it reported 7 compactions (all "after = 0") on a session
+        // that recorded 1. Its records are in recordedCompactions, per call.
+        compactions: session.origin === "transcript" ? [] : findCompactions(requests),
         recordedCompactions: paneSection(sectionErrors, "recordedCompactions", () =>
           store.recordedCompactions(sessionId),
         ),

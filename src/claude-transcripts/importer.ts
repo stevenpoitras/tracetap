@@ -3,6 +3,8 @@ import * as path from "path";
 import * as fs from "fs";
 import type { RawPair } from "../types";
 import { eachLineWithHash } from "../jsonl";
+import { compactBoundaryFromRecord } from "../context/compaction";
+import { responseBlockSize, type ContextBucket } from "../context/transcript-xray";
 
 /**
  * Claude Code local-transcript importer.
@@ -29,7 +31,9 @@ import { eachLineWithHash } from "../jsonl";
  *   request.headers = { "x-claude-code-session-id": <session uuid> }
  *   request.body    = { provider, session_id, agent_id?, model, meta,
  *                       anchor?,   // last item of the previous response
- *                       delta[] }  // user prompts / tool results since then
+ *                       delta[] }  // user prompts / tool results since then,
+ *                                  // plus sized context items and compaction
+ *                                  // boundaries (see DeltaItem)
  *   response.body   = { provider, id, model, content[], stop_reason, usage|null }
  *
  * Unlike the Devin importer the request carries only the DELTA since the
@@ -52,6 +56,19 @@ import { eachLineWithHash } from "../jsonl";
 
 export const TRANSCRIPT_PROVIDER = "claude-transcript";
 export const TRANSCRIPT_TRACE_DIR = ".claude-transcripts-trace";
+
+/**
+ * Version of the synthetic wire this module writes. The import skips a
+ * transcript whose size and mtime are unchanged, which is right for the
+ * transcript and wrong for a mirror built by an older importer: without this,
+ * a change to WHAT is written would only reach sessions that happened to grow.
+ * Bump it whenever the output for the same input changes; the import CLI
+ * rebuilds every mirror stamped with another version.
+ *
+ *   1  prompts, tool results, hooks
+ *   2  + sized context items, compact_boundary and compact-summary items
+ */
+export const IMPORT_FORMAT_VERSION = 2;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -271,7 +288,62 @@ interface OpenResponse {
 
 type DeltaItem =
   | { kind: "user"; text: string }
-  | { kind: "tool_result"; tool_use_id: string; content: string; is_error?: boolean };
+  | { kind: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }
+  | ContextItem
+  | BoundaryItem;
+
+/**
+ * Something the model read that is neither a prompt nor a tool result: a
+ * context attachment (skill listing, hook additionalContext, environment,
+ * deferred-tool records, ...), an isMeta injection, or the compact summary.
+ * SIZE AND LABEL ONLY. The text is not copied: the mirror is a second copy of
+ * the transcript, and X-Ray needs how big each piece was, not what it said.
+ * The trajectory adapter ignores these (they are not steps).
+ */
+interface ContextItem {
+  kind: "context";
+  bucket: ContextBucket;
+  label: string;
+  chars: number;
+}
+
+/**
+ * A `compact_boundary` record, in file order among the delta items, so the
+ * transcript X-Ray can reset its running composition at exactly this point
+ * and the store can attach the compaction to the first measured call after
+ * it. `kept` is the size, by bucket, of the messages the compaction preserved
+ * (`preservedMessages.uuids`), which survive the reset.
+ */
+interface BoundaryItem {
+  kind: "compact_boundary";
+  ts: number;
+  trigger: string;
+  preTokens: number;
+  postTokens: number;
+  cumulativeDroppedTokens: number | null;
+  durationMs: number | null;
+  preservedMessages: number | null;
+  userContext: string | null;
+  kept: Record<string, number>;
+}
+
+/**
+ * Where each context attachment type lands in the X-Ray taxonomy. Anything
+ * not listed (deferred_tools_*, mcp_instructions_delta, environment, date,
+ * edited_text_file, total_tokens_reminder, ...) goes to `other`: it was read,
+ * and an unclassified size is still a size.
+ */
+const ATTACHMENT_BUCKET: Record<string, ContextBucket> = {
+  skill_listing: "skills",
+  instructions: "skills",
+  hook_additional_context: "hook_inject",
+};
+
+/**
+ * Hook attachments that report an outcome rather than inject text. They are
+ * kept as hook rows; counting them as context would invent tokens.
+ */
+const HOOK_OUTCOME_ATTACHMENTS = new Set(["hook_success", "hook_non_blocking_error"]);
 
 type AnchorItem =
   | { kind: "tool_call"; id: string; name: string }
@@ -330,6 +402,16 @@ function synthesizeGroup(records: Rec[], ctx: GroupContext): GroupResult {
     }
   };
 
+  // Per-record size by bucket, so a compaction can say how much of what it
+  // preserved (by record uuid) survives the reset. Sizes only, never text.
+  const sizeByUuid = new Map<string, Record<string, number>>();
+  const noteSize = (rec: Rec, bucket: string, chars: number) => {
+    if (typeof rec.uuid !== "string" || !rec.uuid || chars <= 0) return;
+    let m = sizeByUuid.get(rec.uuid);
+    if (!m) sizeByUuid.set(rec.uuid, (m = {}));
+    m[bucket] = (m[bucket] ?? 0) + chars;
+  };
+
   const seenIds = new Set<string>();
   // Response bodies already emitted that carry an id's (counted) usage.
   const emittedUsage = new Map<string, any>();
@@ -360,6 +442,10 @@ function synthesizeGroup(records: Rec[], ctx: GroupContext): GroupResult {
       const blocks = Array.isArray(msg.content) ? msg.content : typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : [];
       const model = typeof msg.model === "string" ? msg.model : "";
       const synthetic = model === "<synthetic>" || rec.isApiErrorMessage === true;
+      for (const b of blocks) {
+        const sz = responseBlockSize(b);
+        if (sz) noteSize(rec, sz.bucket, sz.chars);
+      }
       if (current && current.id === id && id) {
         current.blocks.push(...blocks);
         current.lastTs = ts || current.lastTs;
@@ -411,7 +497,20 @@ function synthesizeGroup(records: Rec[], ctx: GroupContext): GroupResult {
       if (!msg || typeof msg !== "object") continue;
       seeTs(ts);
       const items = userItems(msg.content, rec);
+      for (const it of items) {
+        if (it.kind === "user") noteSize(rec, "user", it.text.length);
+        else if (it.kind === "tool_result") noteSize(rec, "tool_result", it.content.length);
+        else if (it.kind === "context") noteSize(rec, it.bucket, it.chars);
+      }
       if (!items.length) continue;
+      // A meta injection or the compact summary is context, handled like an
+      // attachment: it rides into the next request without ending the open
+      // response or moving the request's timestamp, so pairing and timing stay
+      // exactly what they were before these records were sized.
+      if (items.every((it) => it.kind === "context")) {
+        pending.push(...items);
+        continue;
+      }
       // A user record ends the open response: whatever it carries goes into the
       // NEXT request, exactly as on the wire.
       flush();
@@ -446,11 +545,55 @@ function synthesizeGroup(records: Rec[], ctx: GroupContext): GroupResult {
       continue;
     }
 
+    if (type === "system" && rec.subtype === "compact_boundary") {
+      const cb = compactBoundaryFromRecord(rec);
+      if (!cb) continue;
+      const kept: Record<string, number> = {};
+      const uuids: unknown[] = Array.isArray(rec.compactMetadata?.preservedMessages?.uuids)
+        ? rec.compactMetadata.preservedMessages.uuids
+        : [];
+      for (const u of uuids) {
+        const m = typeof u === "string" ? sizeByUuid.get(u) : undefined;
+        if (m) for (const [b, n] of Object.entries(m)) kept[b] = (kept[b] ?? 0) + n;
+      }
+      // Like an attachment, it rides into the next request and does not end
+      // the open response, so pairing is unchanged by recording it.
+      pending.push({
+        kind: "compact_boundary",
+        ts: cb.ts,
+        trigger: cb.trigger,
+        preTokens: cb.preTokens,
+        postTokens: cb.postTokens,
+        cumulativeDroppedTokens: cb.cumulativeDroppedTokens,
+        durationMs: cb.durationMs,
+        preservedMessages: cb.preservedMessages,
+        userContext: cb.userContext,
+        kept,
+      });
+      continue;
+    }
+
     if (type === "attachment" && rec.attachment && typeof rec.attachment === "object") {
       const a = rec.attachment;
       const at = String(a.type ?? "");
-      if (at !== "hook_success" && at !== "hook_additional_context" && at !== "hook_non_blocking_error") continue;
+      if (at && at !== "hook_additional_context" && !HOOK_OUTCOME_ATTACHMENTS.has(at)) {
+        // A context attachment rides into the NEXT request like a prompt does,
+        // but does not end the open response: it can land between the block
+        // records of one response.
+        const chars = attachmentChars(a);
+        if (chars > 0) {
+          const item: ContextItem = { kind: "context", bucket: ATTACHMENT_BUCKET[at] ?? "other", label: at, chars };
+          pending.push(item);
+          noteSize(rec, item.bucket, chars);
+        }
+        continue;
+      }
+      if (!at) continue;
       seeTs(ts);
+      if (at === "hook_additional_context") {
+        const chars = strLen(a.content);
+        if (chars > 0) pending.push({ kind: "context", bucket: "hook_inject", label: at, chars });
+      }
       pendingHooks.push({
         ts,
         event: String(a.hookEvent ?? "unknown"),
@@ -474,7 +617,8 @@ function synthesizeGroup(records: Rec[], ctx: GroupContext): GroupResult {
   // Trailing user prompts / tool results / hooks after the last response: one
   // final pair with an EMPTY response, so the walker still emits the trailing
   // user step and stitches the trailing results, without a phantom agent turn.
-  if (pending.length || pendingHooks.length) {
+  // Context items alone do not earn one: no call ever read them.
+  if (pending.some((d) => d.kind === "user" || d.kind === "tool_result") || pendingHooks.length) {
     const t = pendingTs || (Number.isFinite(maxTs) ? maxTs : 0);
     pairs.push({
       request: {
@@ -561,11 +705,28 @@ function anchorOf(blocks: any[]): AnchorItem | null {
   return null;
 }
 
-/** A user record's prompt text / tool results. Meta and compact-summary injections are not prompts. */
+/**
+ * A user record's prompt text / tool results. Meta and compact-summary
+ * injections are not prompts: they become sized context items (the summary
+ * in `other`, an isMeta injection in `user`, which is the role it is sent
+ * under), so X-Ray counts them without a phantom prompt step.
+ */
 function userItems(content: unknown, rec: Rec): DeltaItem[] {
   const items: DeltaItem[] = [];
+  if (rec.isCompactSummary || rec.isMeta) {
+    const chars = typeof content === "string" ? content.length : Array.isArray(content) ? textBlocksChars(content) : 0;
+    if (chars > 0) {
+      items.push(
+        rec.isCompactSummary
+          ? { kind: "context", bucket: "other", label: "compact summary", chars }
+          : { kind: "context", bucket: "user", label: "meta", chars },
+      );
+    }
+    // A meta record can still carry tool results (it never has, but a result
+    // is never dropped on a guess).
+    if (!Array.isArray(content)) return items;
+  }
   if (typeof content === "string") {
-    if (rec.isMeta || rec.isCompactSummary) return items;
     if (content.trim()) items.push({ kind: "user", text: content });
     return items;
   }
@@ -585,6 +746,24 @@ function userItems(content: unknown, rec: Rec): DeltaItem[] {
     }
   }
   return items;
+}
+
+function textBlocksChars(content: unknown[]): number {
+  let n = 0;
+  for (const b of content) if (b && typeof b === "object" && (b as any).type === "text") n += strLen((b as any).text);
+  return n;
+}
+
+/**
+ * Text size of a context attachment. `content` is the injected text on every
+ * type observed; for a shape without it, the string leaves are summed (minus
+ * the `type` tag) rather than guessing which field is the payload.
+ */
+function attachmentChars(a: Rec): number {
+  if (a.content != null) return typeof a.content === "string" ? a.content.length : toolResultText(a.content).length;
+  let n = 0;
+  for (const [k, v] of Object.entries(a)) if (k !== "type") n += strLen(v);
+  return n;
 }
 
 function toolResultText(content: unknown): string {

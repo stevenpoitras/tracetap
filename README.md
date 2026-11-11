@@ -38,6 +38,7 @@ tracetap codex exec "summarize this repo"    # non-interactive codex run
 tracetap codex "refactor this module"        # interactive codex session
 tracetap gemini -p "summarize this repo"     # non-interactive gemini run
 tracetap devin import                        # import Devin CLI sessions from its local store
+tracetap claude-transcripts import           # import Claude Code's own transcripts (desktop app, IDE, CLI)
 tracetap claude --generate-html log.jsonl    # re-render an existing log into HTML
 
 tracetap index                               # fold all logs into the local store
@@ -49,7 +50,7 @@ tracetap search "rate limit retry"           # full-text search across sessions
 
 Everything after the `<tool>` selector is handled by that tool's tracer: a small set of trace flags (below), and **any flag we don't recognize is forwarded verbatim to the underlying binary** — so most `claude`/`codex`/`gemini` invocations work just by prefixing them with `tracetap claude`/`tracetap codex`/`tracetap gemini`. Trace flags may also go _before_ the tool (`tracetap --log demo codex exec …`). Use `--run-with` if an agent flag ever collides with one of ours.
 
-Output lands in `./.claude-trace/` (claude), `./.codex-trace/` (codex), or `./.gemini-trace/` (gemini), as `<basename>.{jsonl,html}`, next to wherever you ran the command. **Devin** is the exception: it can't be proxied, so `tracetap devin import` reconstructs sessions from Devin's local store into `./.devin-trace/` (see [Importing Devin sessions](#importing-devin-sessions)).
+Output lands in `./.claude-trace/` (claude), `./.codex-trace/` (codex), or `./.gemini-trace/` (gemini), as `<basename>.{jsonl,html}`, next to wherever you ran the command. **Devin** is the exception: it can't be proxied, so `tracetap devin import` reconstructs sessions from Devin's local store into `./.devin-trace/` (see [Importing Devin sessions](#importing-devin-sessions)). Claude Code sessions you did not launch through `tracetap claude`, including every desktop-app session, can be imported from Claude Code's own transcripts into `~/.claude-transcripts-trace/` (see [Importing Claude Code transcripts](#importing-claude-code-transcripts)).
 
 ```
 $ tracetap claude
@@ -346,6 +347,70 @@ Run as `tracetap devin [import|list] [flag…]`.
 | `--no-open`               | Don't open the report on a single-session import.                                       |
 | `--generate-html <jsonl>` | Render an existing devin JSONL to HTML and exit. Optional `[output.html]`.              |
 
+## Importing Claude Code transcripts
+
+`tracetap claude` only sees sessions you launch through it. The Claude desktop
+app can't be wrapped at all, and IDE and SDK sessions usually aren't. Claude
+Code itself writes every session to
+`~/.claude/projects/<project>/<session>.jsonl` (subagents under
+`<session>/subagents/`), so `tracetap claude-transcripts` imports those files
+instead:
+
+```bash
+tracetap claude-transcripts list               # list transcripts found (no writes)
+tracetap claude-transcripts import             # mirror all → ~/.claude-transcripts-trace/ + index
+tracetap claude-transcripts import --session <uuid>   # just one session
+```
+
+The import is **strictly read-only** on `~/.claude/projects`. Each API response
+becomes one canonical request/response pair carrying the prompts and tool
+results since the previous response, the reply, and its token usage, so
+imported sessions flow through the same pipeline as live captures: searchable,
+servable, and in `tracetap usage`. The session list labels where each one came
+from (`transcript · claude-desktop`, `cli`, `claude-vscode`, …) and its git
+branch.
+
+- **Counted once.** Claude Code repeats a response's usage on every content
+  block; it is counted once per response. Records a resumed session copied
+  from its parent are counted only in the parent.
+- **Wire wins.** If the same Claude Code session was also captured with
+  `tracetap claude`, the wire copy is the one listed and counted; the
+  transcript copy is hidden and the wire session is marked `wire (+transcript)`.
+- **Compactions are Claude Code's own records.** Each `compact_boundary` in
+  the transcript gives the trigger (`auto` or a manual `/compact`, with any
+  focus text), exact before and after sizes and duration. Imported sessions
+  never use the wire-side guess.
+- **Incremental.** Unchanged transcripts are skipped; grown ones are rebuilt
+  and re-indexed in place. Re-run it to pick up new sessions; nothing runs it
+  automatically yet.
+
+> **What's captured vs not.** Transcripts don't record the system prompt or
+> the tool definitions, and they record hook runs without their payloads. The
+> Context X-Ray rebuilds each call's composition from what the transcript does
+> hold (messages, thinking, tool results, skill listings, hook-injected
+> context) and shows the rest as one **not accounted for** bucket: the call's
+> exact context size minus everything estimated. That bucket holds the system
+> prompt and tool definitions, but also thinking the transcript doesn't keep
+> and estimation error, so it grows over a long session. Each compaction gets
+> a **why** panel. For an exact window, capture the session with
+> `tracetap claude`.
+
+### Claude transcript import flags
+
+Run as `tracetap claude-transcripts [import|list] [flag…]`.
+
+| Flag               | Purpose                                                                                |
+| ------------------ | -------------------------------------------------------------------------------------- |
+| `--session <uuid>` | Import only this session (repeatable). Default: all.                                   |
+| `--source <dir>`   | Claude projects dir (default: `$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`). |
+| `--out <dir>`      | Write the `.jsonl` mirrors into `<dir>` (default: `~/.claude-transcripts-trace`).      |
+| `--here`           | Write into `./.claude-transcripts-trace` in the current directory.                     |
+| `--db <path>`      | Index into this store DB (default: `~/.tracetap/index.db`).                            |
+| `--no-index`       | Write the mirrors only; don't index them.                                              |
+| `--offline`        | Don't fetch the live price table; index-time costs use the built-in one.               |
+| `--force`          | Rebuild every mirror even when its transcript is unchanged.                            |
+| `--quiet`          | Print the summary only.                                                                |
+
 ## Token & cost analytics
 
 Every captured run already records exact per-call usage (Claude's
@@ -475,7 +540,8 @@ SQLite database at `~/.tracetap/index.db` with an FTS5 full-text index over
 per-step text. No cloud, no daemon, no embeddings model.
 
 ```bash
-# Index every .claude-trace/.codex-trace/.gemini-trace log under cwd + ~
+# Index every .claude-trace/.codex-trace/.gemini-trace/.devin-trace/
+# .claude-transcripts-trace log under cwd + ~
 tracetap index
 
 # Or index specific paths (files or directories)
@@ -567,7 +633,10 @@ Six views:
   ranked FTS5 hits (same engine as `tracetap search`). Click through to…
 - **Session detail** — flight-recorder for one session with five panes:
   **Trace**, **Hooks** (Claude Code hook timeline + payloads),
-  **Context X-Ray** (window composition + new/carried/dropped vs prior call),
+  **Context X-Ray** (window composition + new/carried/dropped vs prior call,
+  a context-size timeline, and a **why** panel per compaction: trigger,
+  focus text, the prompt before it, growth since the last one, and the
+  largest contributors),
   **Tool Tax** (declared vs invoked tools for this session's toolset), and
   **Related** (sibling sessions from the same capture).
 
@@ -643,7 +712,11 @@ JSON API (everything the UI uses is scriptable):
 | `GET /api/meta` | DB path, row counts, price source |
 | `GET /api/sessions` | Session list (`agent`/`model`/`project`/`tool`/`errored` filters, `sort`/`order`) |
 | `GET /api/search?q=…` | FTS5 search hits (`tool`/`agent`/`model`/`project`/`errored` filters) |
-| `GET /api/session/<id>` | One session: summary + transcript steps + per-request wire rows + compactions |
+| `GET /api/session/<id>` | One session: summary + transcript steps + per-request wire rows + compactions (recorded and inferred, never merged) |
+| `GET /api/session/<id>/timeline` | Per-call context-size timeline with compaction annotations |
+| `GET /api/session/<id>/context/<seq>` | Context X-Ray for one call (rebuilt from the transcript for imported sessions) |
+| `GET /api/session/<id>/compactions` | The "why" for each compaction: trigger, focus text, preceding prompt, growth, top contributors |
+| `GET /api/session/<id>/tools` | Dead-tool tax for one session |
 | `GET /api/usage` | Bucketed usage report (`granularity`/`breakdown`/`since`/`until`/`timezone`…) |
 | `GET /api/analytics` | Fleet rollups (per-model TTFT percentiles, error rates, tools, trend…), scoped by the same `since`/`until`/`agent` as `/api/usage` |
 | `GET /api/prompts` / `GET /api/prompt/<hash>` | Prompt registry list / full content + sessions (prefix hash ok) |

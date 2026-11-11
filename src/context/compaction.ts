@@ -83,7 +83,16 @@ export function parseCompactBoundary(line: string): CompactionRecord | null {
   } catch {
     return null; // a torn tail line is not worth failing a whole session over
   }
-  if (!j || j.subtype !== "compact_boundary") return null;
+  return compactBoundaryFromRecord(j);
+}
+
+/**
+ * The same parse over an already-decoded record. The transcript importer
+ * reads every line anyway, so it hands the object over rather than paying a
+ * second JSON round trip, and both paths share one definition of the fields.
+ */
+export function compactBoundaryFromRecord(j: any): CompactionRecord | null {
+  if (!j || typeof j !== "object" || j.subtype !== "compact_boundary") return null;
   const m = j.compactMetadata;
   if (!m || typeof m !== "object") return null;
 

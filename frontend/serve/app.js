@@ -2062,6 +2062,11 @@
     if (!recs.length || (recorded && recorded.subagentOnly)) {
       return inferredCount + " compaction(s) inferred here";
     }
+    // An imported session's records came from the same transcript as its
+    // calls, so each one IS attributable: it sits on the timeline as ⇣.
+    if (recorded.scope === "session") {
+      return recs.length + " compaction" + (recs.length === 1 ? "" : "s") + " recorded by Claude Code";
+    }
     return (
       recs.length + " compaction" + (recs.length === 1 ? "" : "s") +
       " recorded session-wide (not attributable to a single call)"
@@ -2093,7 +2098,8 @@
       "Compactions",
       recs.length +
         ' <small class="dim">' + esc(mix) + "</small>" +
-        '<div class="card-sub">' + fmtTok(dropped) + " dropped · session-wide</div>",
+        '<div class="card-sub">' + fmtTok(dropped) + " dropped · " +
+        (recorded.scope === "session" ? "recorded" : "session-wide") + "</div>",
       recs.length > 0,
     );
   }
@@ -5282,6 +5288,7 @@
       // Filled in by loadTimeline once /timeline responds — the session payload
       // no longer carries it.
       '<div id="timeline-host"><div class="dim">loading context timeline…</div></div>' +
+      '<div id="compaction-why-host"></div>' +
       '<div class="xray-controls">' +
       '<label class="chrome">API call <select id="xray-seq">' +
       opts +
@@ -5438,6 +5445,17 @@
         loadXray(sessionId, Number(col.getAttribute("data-seq")));
       });
     }
+    compactionWhyForPane = null;
+    // Its own fetch, so a failure here costs the why panels and nothing else.
+    fetchJSON("/api/session/" + encodeURIComponent(sessionId) + "/compactions")
+      .then(function (w) {
+        compactionWhyForPane = w;
+        renderSessionWideWhy();
+        refreshXrayHead();
+      })
+      .catch(function () {
+        compactionWhyForPane = null;
+      });
     fetchJSON("/api/session/" + encodeURIComponent(sessionId) + "/timeline")
       .then(function (tl) {
         timelineForPane = tl;
@@ -5493,6 +5511,8 @@
    * card and "0 compaction(s)" in the timeline heading at the same time.
    */
   var recordedForPane = null;
+  /** /api/session/<id>/compactions — the why panels, by seq (null = session-wide). */
+  var compactionWhyForPane = null;
   var toolTaxForPane = null;
   var stepsForPane = [];
   var turnsForPane = [];
@@ -5648,7 +5668,17 @@
       '<span class="dim xray-head-note">' +
       esc(note) +
       "</span></div>" +
-      (c
+      (c && c.trigger && c.trigger.source === "recorded"
+        ? '<div class="dim xray-head-sub">recorded compaction before this call — context ' +
+          fmtTok(c.preContextTokens) +
+          " → " +
+          fmtTok(c.postContextTokens) +
+          " tokens (dropped " +
+          fmtTok(c.droppedTokens) +
+          ")" +
+          (c.recorded && c.recorded.durationMs != null ? " · took " + fmtDur(c.recorded.durationMs) : "") +
+          "</div>"
+        : c
         ? '<div class="dim xray-head-sub">compacted at this call — items ' +
           c.fromItems +
           " → " +
@@ -5662,8 +5692,98 @@
           "</div>"
         : "") +
       compactionEfficacy(seq, c) +
+      compactionWhyPanel(compactionWhyAt(seq)) +
       "</div>"
     );
+  }
+
+  /** The why-panel entry attached to call `seq`, if the payload has one. */
+  function compactionWhyAt(seq) {
+    var list = (compactionWhyForPane && compactionWhyForPane.compactions) || [];
+    for (var i = 0; i < list.length; i++) if (list[i].seq === seq) return list[i];
+    return null;
+  }
+
+  /**
+   * "Why did this compaction happen, and what filled the context?"
+   *
+   * A renderer only: every figure is computed by /api/session/<id>/compactions
+   * (context/compaction-why.ts). Collapses to "" without data, like the
+   * efficacy box, so a session indexed before the endpoint existed shows
+   * nothing rather than an empty frame.
+   */
+  function compactionWhyPanel(w) {
+    if (!w || typeof w !== "object") return "";
+    var rows = "";
+    function row(k, v) {
+      rows +=
+        '<div class="ceff-row"><span class="ceff-k">' + esc(k) + '</span><span class="ceff-v">' + v + "</span></div>";
+    }
+    function stepRef(i) {
+      return i != null ? ' <span class="dim">step ' + esc(i) + "</span>" : "";
+    }
+    var trig =
+      w.trigger === "auto"
+        ? "auto (hit the context limit)"
+        : w.trigger === "manual"
+          ? "manual (/compact)"
+          : String(w.trigger || "unknown");
+    row("trigger", "<b>" + esc(trig) + "</b> " + '<span class="dim">(' + esc(w.triggerSource || "") + ")</span>");
+    if (w.userContext) row("focus", esc(w.userContext));
+    if (w.precedingPrompt) row("prompt before", esc(clip(w.precedingPrompt.text, 200)) + stepRef(w.precedingPrompt.stepIndex));
+    row(
+      "context",
+      "<b>" + fmtTok(w.preTokens) + "</b> → <b>" + fmtTok(w.postTokens) + "</b> tokens" +
+        ' <span class="dim">(dropped ' + fmtTok(w.droppedTokens) + ")</span>",
+    );
+    if (w.durationMs != null) row("took", fmtDur(w.durationMs));
+    if (w.preservedMessages != null) row("messages kept", fmtCount(w.preservedMessages));
+    var g = w.growth;
+    if (g) {
+      row(
+        "growth",
+        "+" + fmtTok(g.tokens) + " tokens over " + fmtCount(g.calls) + " call" + (g.calls === 1 ? "" : "s") +
+          " · " + fmtDur(g.wallMs) + ' <span class="dim">since ' + esc(g.since) + "</span>",
+      );
+    }
+    var tools = w.topToolResults || [];
+    if (tools.length) {
+      row(
+        "largest tool results",
+        '<ol class="cwhy-list">' +
+          tools
+            .map(function (t) {
+              return "<li><b>" + esc(t.tool) + "</b> " + fmtTok(t.approxTokens) + " tokens" + stepRef(t.stepIndex) + "</li>";
+            })
+            .join("") +
+          "</ol>",
+      );
+    }
+    if (w.largestUser) row("largest user item", fmtTok(w.largestUser.approxTokens) + " tokens" + stepRef(w.largestUser.stepIndex));
+    if (w.largestAssistant) {
+      row("largest assistant item", fmtTok(w.largestAssistant.approxTokens) + " tokens" + stepRef(w.largestAssistant.stepIndex));
+    }
+    return (
+      '<div class="ceff cwhy"><div class="ceff-head"><span class="ceff-title">why this compaction' +
+      (w.seq == null ? " · " + esc(fmtTime(w.ts)) + " · session-wide" : "") +
+      '</span></div><div class="ceff-rows">' + rows + "</div></div>"
+    );
+  }
+
+  /**
+   * Session-wide records (a wire session's transcript) attach to no call, so
+   * they have no column to open. Their panels are listed under the timeline.
+   */
+  function renderSessionWideWhy() {
+    var el = document.getElementById("compaction-why-host");
+    if (!el) return;
+    var list = ((compactionWhyForPane && compactionWhyForPane.compactions) || []).filter(function (c) {
+      return c.seq == null;
+    });
+    el.innerHTML = list.length
+      ? '<h2 class="sec">Recorded compactions <small>session-wide, not attributable to a single call</small></h2>' +
+        list.map(compactionWhyPanel).join("")
+      : "";
   }
 
   /** Redraw just the head in place, leaving the body (and any open segment) alone. */
@@ -5722,6 +5842,15 @@
           " chars" +
           (x.wirePromptTokens != null
             ? " · wire " + fmtTok(x.wirePromptTokens) + " prompt"
+            : "") +
+          // Rebuilt from a transcript: the buckets are estimates against a
+          // measured total, and an estimate above the total is said out loud
+          // rather than scaled to fit.
+          (x.transcript
+            ? " · from transcript" +
+              (x.transcript.overshootTokens > 0
+                ? " · ⚠ estimate exceeds measured context by " + fmtTok(x.transcript.overshootTokens)
+                : "")
             : "");
         if (status) status.textContent = summary;
         currentXrayNote = summary;
@@ -8619,6 +8748,8 @@
       // fetch can tell a working renderer from an orphaned one.
       loadXray: loadXray,
       drawXray: drawXray,
+      compactionWhyPanel: compactionWhyPanel,
+      compactionPhrase: compactionPhrase,
       setTurnRange: setTurnRange,
       userSetTurnExpanded: userSetTurnExpanded,
       tracePasses: tracePasses,

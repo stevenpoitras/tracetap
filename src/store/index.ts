@@ -1,5 +1,5 @@
 import * as fs from "fs";
-import { activityTitle, sessionTitle } from "./title.js";
+import { activityTitle, isNoiseStep, sessionTitle } from "./title.js";
 import { hashFile, parseJsonlFile } from "../jsonl.js";
 import * as os from "os";
 import * as path from "path";
@@ -20,6 +20,11 @@ import { buildContextXray } from "../context/xray";
 import type { ContextXray } from "../context/xray";
 import type { AuditFileScan } from "../audit";
 import { buildContextTimeline, findCompactions } from "../context/timeline";
+import type { RecordedCompactionInput } from "../context/timeline";
+import { transcriptCompositions, transcriptXrayWindow } from "../context/transcript-xray";
+import type { TranscriptCallComposition } from "../context/transcript-xray";
+import { explainCompactions } from "../context/compaction-why";
+import type { CompactionEventInput, CompactionInsights } from "../context/compaction-why";
 import { compactionsForSession } from "../context/compaction";
 import type { CompactionRecord } from "../context/compaction";
 import type {
@@ -31,6 +36,19 @@ import { toolsetFromBody } from "../context/tooltax";
 import { identifyRequest, spawnIndex } from "../trajectory/agent-identity";
 import type { AgentSpawn, IdentityPair } from "../trajectory/agent-identity";
 import type { ToolTokenEntry } from "../context/tooltax";
+
+/**
+ * A compaction Claude Code recorded. An imported session's records also carry
+ * the call they attach to (`seq`, null when no measured call followed) and
+ * the prompt typed before them, both resolved at index time.
+ */
+export interface RecordedCompaction extends CompactionRecord {
+  seq?: number | null;
+  precedingPrompt?: string | null;
+}
+
+/** The preceding prompt is a label, not a transcript: cap what is stored. */
+const PRECEDING_PROMPT_CHARS = 500;
 
 /**
  * Local cross-session trace store + search.
@@ -496,7 +514,13 @@ const SORTABLE_COLUMNS = new Set([
 // path (sessionIdFor), and byte-identical copies index once. The losers are gone from the rows
 // on disk, and only a full rebuild brings them back — including for indexes
 // already rebuilt at 11, which were rebuilt under the old id rule.
-const SCHEMA_VERSION = 12;
+// 13: transcript-imported sessions store their own compactions
+// (transcript_compactions), a transcript-built context composition with an
+// `unrecorded` remainder (ctx_* + ctx_overshoot_tokens), and which rows carry
+// no usage (`measured`), so a usage-null repeat stops reading as a 0-token
+// call. All of it is written at index time only, so existing rows need the
+// rebuild; the importer's own format bump rewrites the mirrors to match.
+const SCHEMA_VERSION = 13;
 
 /**
  * How long after a `PreCompact` hook its compacted call may arrive, and how far
@@ -844,6 +868,7 @@ export class Store {
         DROP TABLE IF EXISTS audit_scans;
         DROP TABLE IF EXISTS transcript_sessions;
         DROP TABLE IF EXISTS wire_claude_sessions;
+        DROP TABLE IF EXISTS transcript_compactions;
       `);
     }
 
@@ -926,6 +951,13 @@ export class Store {
         ctx_total_chars  INTEGER,
         ctx_total_tokens INTEGER,
         ctx_buckets_json TEXT,
+        -- Transcript-built composition only: how far the estimate exceeded the
+        -- measured context. Flagged here, never scaled into the buckets.
+        ctx_overshoot_tokens INTEGER,
+        -- 0 when the response carried no usage. On a transcript import that is
+        -- a repeat of a response already counted, not a separate call, and the
+        -- context timeline leaves it out instead of plotting a 0.
+        measured         INTEGER NOT NULL DEFAULT 1,
         -- Which conversation inside the session made this call. A session that
         -- spawns a fleet writes every agent into one log under one session id,
         -- so without these three columns every neighbour-diffing metric
@@ -1037,6 +1069,25 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS idx_transcript_source ON transcript_sessions(source_path);
       CREATE INDEX IF NOT EXISTS idx_transcript_claude ON transcript_sessions(claude_session_id);
+      -- Compactions an imported session RECORDED (compact_boundary), attached
+      -- to the first measured call at or after the record (seq; NULL when the
+      -- session ended before another call). Main thread only.
+      CREATE TABLE IF NOT EXISTS transcript_compactions (
+        session_id         TEXT NOT NULL,
+        seq                INTEGER,
+        ts                 REAL NOT NULL,
+        trigger            TEXT NOT NULL,
+        pre_tokens         INTEGER NOT NULL,
+        post_tokens        INTEGER NOT NULL,
+        cumulative_dropped INTEGER,
+        duration_ms        INTEGER,
+        preserved_messages INTEGER,
+        user_context       TEXT,
+        preceding_prompt   TEXT,
+        source_path        TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_tcompact_session ON transcript_compactions(session_id, ts);
+      CREATE INDEX IF NOT EXISTS idx_tcompact_source ON transcript_compactions(source_path);
       -- Every Claude Code session uuid a WIRE log carried (any request, not just
       -- the majority stamp), so a transcript import is shadowed even when its
       -- conversation was the minority inside a wire group.
@@ -1222,6 +1273,7 @@ export class Store {
     this.db.prepare("DELETE FROM requests WHERE source_path = ?").run(sourcePath);
     this.db.prepare("DELETE FROM usage_events WHERE source_path = ?").run(sourcePath);
     this.db.prepare("DELETE FROM transcript_sessions WHERE source_path = ?").run(sourcePath);
+    this.db.prepare("DELETE FROM transcript_compactions WHERE source_path = ?").run(sourcePath);
     this.db.prepare("DELETE FROM wire_claude_sessions WHERE source_path = ?").run(sourcePath);
     // Hook rows recovered from a transcript live under the transcript's own
     // path; tap logs index under theirs, so this never touches tapped hooks.
@@ -1353,6 +1405,9 @@ export class Store {
         meta.version,
         meta.agentId,
       );
+    // Subagent groups record none: a subagent's file is not the main thread's
+    // context, which is what a compaction record describes.
+    if (!meta.agentId) this.insertTranscriptCompactions(sessionId, group, sourcePath);
     if (!claudeSessionId) return;
     // Hook rows join on Claude's session uuid like tapped ones. Previews hold
     // structure and sizes only; the transcript's hook output is never copied.
@@ -1396,6 +1451,59 @@ export class Store {
     }
   }
 
+  /**
+   * The session's `compact_boundary` records, each attached to the first
+   * MEASURED call at or after it. Measured, because a usage-null pair repeats
+   * a response already counted and is not a call; at-or-after, because the
+   * record precedes the request it shrank in file order, which is the order
+   * the pairs are in. The prompt before it is taken here, from the deltas in
+   * file order, because steps carry no timestamps and the prompt typed after
+   * the boundary sits in the same delta as the boundary itself.
+   */
+  private insertTranscriptCompactions(sessionId: string, group: PairGroup, sourcePath: string): void {
+    const ins = this.db.prepare(
+      `INSERT INTO transcript_compactions(
+         session_id, seq, ts, trigger, pre_tokens, post_tokens, cumulative_dropped,
+         duration_ms, preserved_messages, user_context, preceding_prompt, source_path
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+    let lastPrompt: string | null = null;
+    let pending: { d: any; prompt: string | null }[] = [];
+    const write = (seq: number | null) => {
+      for (const { d, prompt } of pending) {
+        ins.run(
+          sessionId,
+          seq,
+          num(d.ts) ?? 0,
+          typeof d.trigger === "string" ? d.trigger : "unknown",
+          num(d.preTokens) ?? 0,
+          num(d.postTokens) ?? 0,
+          num(d.cumulativeDroppedTokens),
+          num(d.durationMs),
+          num(d.preservedMessages),
+          typeof d.userContext === "string" ? d.userContext : null,
+          prompt,
+          sourcePath,
+        );
+      }
+      pending = [];
+    };
+    group.pairs.forEach((pair, seq) => {
+      const delta: any[] = Array.isArray(pair?.request?.body?.delta) ? pair.request.body.delta : [];
+      for (const d of delta) {
+        if (!d || typeof d !== "object") continue;
+        if (d.kind === "user" && typeof d.text === "string" && d.text.trim() && !isNoiseStep(d.text)) {
+          lastPrompt = d.text.length > PRECEDING_PROMPT_CHARS ? d.text.slice(0, PRECEDING_PROMPT_CHARS) + "…" : d.text;
+        } else if (d.kind === "compact_boundary") {
+          pending.push({ d, prompt: lastPrompt });
+        }
+      }
+      if (pending.length && group.adapter.parseResponse(pair).usage != null) write(seq);
+    });
+    write(null);
+  }
+
   /** Write one wire-metrics row per captured pair + upsert prompt versions. */
   private insertRequests(
     group: PairGroup,
@@ -1416,8 +1524,8 @@ export class Store {
          reasoning_tokens, stop_reason, errored, transcript_items,
          prompt_hash, agent_step_index, source_path,
          ctx_total_chars, ctx_total_tokens, ctx_buckets_json, toolset_hash,
-         is_subagent, agent_label, agent_type
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         is_subagent, agent_label, agent_type, ctx_overshoot_tokens, measured
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const upsertPrompt = this.db.prepare(
       `INSERT INTO prompts(prompt_hash, agent, content, first_seen, last_seen)
@@ -1447,6 +1555,11 @@ export class Store {
            WHEN last_seen IS NULL THEN excluded.last_seen
            ELSE MAX(last_seen, excluded.last_seen) END`,
     );
+
+    // A transcript request carries a delta, not the resent transcript, so its
+    // composition is the RUNNING one over the whole conversation, built once.
+    const transcriptCtx =
+      group.adapter.name === "claude-transcript" ? transcriptCompositionsSafe(group.pairs) : null;
 
     group.pairs.forEach((pair, seq) => {
       const resp = group.adapter.parseResponse(pair);
@@ -1485,7 +1598,7 @@ export class Store {
       // Segment the prompt once, here. Doing it lazily meant every dashboard
       // load re-read and re-parsed every body in the session. A body that will
       // not segment is stored as NULL, and the read path falls back for it.
-      const ctx = contextMetricsForPair(seq, pair, promptHash);
+      const ctx = transcriptCtx ? transcriptMetrics(transcriptCtx[seq]) : contextMetricsForPair(seq, pair, promptHash);
       const identity = identifyRequest(pair as IdentityPair, spawns);
       const toolset = toolsetForPair(pair);
       if (toolset) {
@@ -1525,6 +1638,8 @@ export class Store {
         identity.isSubagent ? 1 : 0,
         identity.label,
         identity.subagentType,
+        ctx?.overshootTokens || null,
+        resp.usage != null ? 1 : 0,
       );
     });
   }
@@ -2203,11 +2318,29 @@ export class Store {
    */
   recordedCompactions(sessionId: string): {
     claudeSessionId: string | null;
-    scope: "claude-session";
+    /**
+     * `claude-session`: a wire session, read from the transcript on disk and
+     * NOT attributable to one call. `session`: a transcript-imported session,
+     * whose records came from the same file as its calls and each carry the
+     * `seq` they attach to.
+     */
+    scope: "claude-session" | "session";
     subagentOnly: boolean;
-    records: CompactionRecord[];
+    records: RecordedCompaction[];
   } {
     const claudeSessionId = this.claudeSessionId(sessionId);
+    const transcript = this.transcriptSessionInfo(sessionId);
+    if (transcript) {
+      // The mirror IS the transcript, already indexed: no read of
+      // ~/.claude/projects, and a subagent group shows none (see
+      // insertTranscriptCompactions).
+      return {
+        claudeSessionId,
+        scope: "session",
+        subagentOnly: transcript.agentId != null,
+        records: this.transcriptCompactionRows(sessionId).map((r) => ({ ...r, claudeSessionId: claudeSessionId ?? "" })),
+      };
+    }
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS n, SUM(is_subagent = 0) AS main
@@ -2220,6 +2353,101 @@ export class Store {
       subagentOnly: !!row?.n && !row?.main,
       records: claudeSessionId ? compactionsForSession(claudeSessionId) : [],
     };
+  }
+
+  /** Transcript-import side row for a session, or null for a wire session. */
+  transcriptSessionInfo(sessionId: string): { agentId: string | null } | null {
+    const row = this.db
+      .prepare("SELECT agent_id AS agentId FROM transcript_sessions WHERE session_id = ?")
+      .get(sessionId) as { agentId?: string | null } | undefined;
+    return row ? { agentId: row.agentId ? String(row.agentId) : null } : null;
+  }
+
+  /** An imported session's recorded compactions, in time order. */
+  private transcriptCompactionRows(sessionId: string): RecordedCompaction[] {
+    const rows = this.db
+      .prepare(
+        `SELECT seq, ts, trigger, pre_tokens, post_tokens, cumulative_dropped, duration_ms,
+                preserved_messages, user_context, preceding_prompt
+           FROM transcript_compactions WHERE session_id = ? ORDER BY ts, rowid`,
+      )
+      .all(sessionId) as any[];
+    const n = (v: unknown) => (v == null ? null : Number(v));
+    return rows.map((r) => ({
+      claudeSessionId: "",
+      ts: Number(r.ts ?? 0),
+      trigger: String(r.trigger ?? "unknown"),
+      preTokens: Number(r.pre_tokens ?? 0),
+      postTokens: Number(r.post_tokens ?? 0),
+      droppedTokens: Number(r.pre_tokens ?? 0) - Number(r.post_tokens ?? 0),
+      cumulativeDroppedTokens: n(r.cumulative_dropped),
+      durationMs: n(r.duration_ms),
+      preservedMessages: n(r.preserved_messages),
+      cwd: null,
+      userContext: r.user_context == null ? null : String(r.user_context),
+      seq: n(r.seq),
+      precedingPrompt: r.preceding_prompt == null ? null : String(r.preceding_prompt),
+    }));
+  }
+
+  /**
+   * Everything the "why did this compaction happen" panel shows, per
+   * compaction, computed here so the page stays a renderer. See
+   * context/compaction-why.ts for the rules.
+   *
+   * Provenance, in order: an imported session's own records (attributed to a
+   * call); a wire session's transcript records (session-wide, placed by time);
+   * the timeline's inferred compactions, which say the trigger is unknown.
+   */
+  compactionInsights(sessionId: string): CompactionInsights {
+    const timeline = this.sessionContextTimeline(sessionId);
+    const recorded = this.recordedCompactions(sessionId);
+    const steps = this.listSteps(sessionId).map((s) => ({
+      ...s,
+      noise: s.role === "user" ? isNoiseStep(s.message) : false,
+    }));
+    const requests = this.listRequests(sessionId);
+    const points = timeline.points;
+    let source: CompactionInsights["source"] = "none";
+    let events: CompactionEventInput[] = [];
+    if (recorded.records.length && !recorded.subagentOnly) {
+      source = "recorded";
+      events = recorded.records.map((r) => ({
+        seq: r.seq ?? null,
+        ts: r.ts,
+        trigger: r.trigger,
+        triggerSource: "recorded",
+        preTokens: r.preTokens,
+        postTokens: r.postTokens,
+        durationMs: r.durationMs,
+        preservedMessages: r.preservedMessages,
+        userContext: r.userContext,
+        precedingPrompt: r.precedingPrompt ?? undefined,
+      }));
+    } else {
+      // Never set on an imported session: its timeline does not infer.
+      const inferred = points.filter((p) => p.compaction && p.compaction.trigger?.source !== "recorded");
+      if (inferred.length) {
+        source = "inferred";
+        events = inferred.map((p) => ({
+          seq: p.seq,
+          ts: p.ts,
+          trigger: p.compaction!.trigger?.kind ?? "unknown",
+          triggerSource: p.compaction!.trigger?.source ?? "inferred",
+          preTokens: p.compaction!.preContextTokens,
+          postTokens: p.compaction!.postContextTokens,
+        }));
+      }
+    }
+    return explainCompactions({
+      source,
+      scope: source === "recorded" ? recorded.scope : "session",
+      subagentOnly: recorded.subagentOnly,
+      events,
+      points,
+      requests,
+      steps,
+    });
   }
 
   // -- wire metrics ----------------------------------------------------------
@@ -2851,6 +3079,14 @@ export class Store {
   sessionContextXrayWindow(sessionId: string, seq: number, radius = 0): ContextXray[] {
     const pairs = this.loadSessionPairs(sessionId);
     if (!pairs?.[seq]) return [];
+    if (this.transcriptSessionInfo(sessionId)) {
+      // A delta body has nothing to partition; rebuild the running
+      // composition from the transcript instead (context/transcript-xray.ts).
+      const promptHashes = new Map(this.listRequests(sessionId).map((r) => [r.seq, r.promptHash]));
+      const seqs: number[] = [];
+      for (let i = Math.max(0, seq - radius); i <= Math.min(pairs.length - 1, seq + radius); i++) seqs.push(i);
+      return transcriptXrayWindow(pairs, seqs, promptHashes);
+    }
     // One request row per pair, seq === pair index (see insertRequests), so the
     // previous call is simply pairs[i - 1].
     const promptHashes = new Map(this.listRequests(sessionId).map((r) => [r.seq, r.promptHash]));
@@ -2955,7 +3191,7 @@ export class Store {
     const out = new Map<number, ContextMetrics>();
     const rows = this.db
       .prepare(
-        `SELECT seq, ctx_total_chars, ctx_total_tokens, ctx_buckets_json
+        `SELECT seq, ctx_total_chars, ctx_total_tokens, ctx_buckets_json, ctx_overshoot_tokens
            FROM requests WHERE session_id = ? AND ctx_total_tokens IS NOT NULL`,
       )
       .all(sessionId) as any[];
@@ -2970,6 +3206,7 @@ export class Store {
         totalChars: Number(r.ctx_total_chars ?? 0),
         totalApproxTokens: Number(r.ctx_total_tokens ?? 0),
         buckets,
+        ...(r.ctx_overshoot_tokens ? { overshootTokens: Number(r.ctx_overshoot_tokens) } : {}),
       });
     }
     return out;
@@ -3026,6 +3263,8 @@ export class Store {
   }
 
   sessionContextTimeline(sessionId: string): ContextTimeline {
+    const transcript = this.transcriptSessionInfo(sessionId);
+    if (transcript) return this.transcriptContextTimeline(sessionId, transcript.agentId);
     const requests = this.listRequests(sessionId);
     const precomputedBySeq = this.contextMetricsFor(sessionId);
     // Only read bodies for calls the index run could not segment — normally
@@ -3068,6 +3307,69 @@ export class Store {
       },
     });
   }
+
+  /**
+   * The timeline of a transcript-imported session. Two rules differ from the
+   * wire path, both because an imported request is a delta:
+   *
+   *  - rows with no usage are not calls (a repeat of a response already
+   *    counted, or a client-side error placeholder) and are left out, rather
+   *    than plotted as 0-token calls that any neighbour appears to "drop" from;
+   *  - compactions are the session's own records, placed at the call they
+   *    were attached to at index time. The wire-side detector does not run.
+   *
+   * Composition always comes from the index (transcriptMetrics); a row
+   * without it falls back to the wire size, never to a body re-read.
+   */
+  private transcriptContextTimeline(sessionId: string, agentId: string | null): ContextTimeline {
+    const unmeasured = new Set(
+      (
+        this.db.prepare("SELECT seq FROM requests WHERE session_id = ? AND measured = 0").all(sessionId) as {
+          seq: number;
+        }[]
+      ).map((r) => Number(r.seq)),
+    );
+    const requests = this.listRequests(sessionId).filter((r) => !unmeasured.has(r.seq));
+    const recordedBySeq = new Map<number, RecordedCompactionInput>();
+    if (!agentId) {
+      for (const r of this.transcriptCompactionRows(sessionId)) {
+        if (r.seq == null || recordedBySeq.has(r.seq)) continue;
+        recordedBySeq.set(r.seq, r);
+      }
+    }
+    return buildContextTimeline({
+      requests,
+      precomputedBySeq: this.contextMetricsFor(sessionId),
+      recordedBySeq,
+      inferCompactions: false,
+    });
+  }
+}
+
+/** Transcript compositions for a group; null (fall back to no composition) on any failure. */
+function transcriptCompositionsSafe(pairs: RawPair[]): TranscriptCallComposition[] | null {
+  try {
+    return transcriptCompositions(pairs);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stored form of one call's transcript composition. The total includes the
+ * `unrecorded` remainder, so on a measured call it equals the real context
+ * whenever the estimate does not overshoot; chars keep X-Ray's 4:1 relation.
+ */
+function transcriptMetrics(c: TranscriptCallComposition | undefined): ContextMetrics | null {
+  if (!c) return null;
+  const totalApproxTokens = c.estimatedTokens + c.unrecordedTokens;
+  if (!totalApproxTokens) return null;
+  return {
+    totalChars: c.estimatedChars + c.unrecordedTokens * 4,
+    totalApproxTokens,
+    buckets: c.buckets,
+    ...(c.overshootTokens ? { overshootTokens: c.overshootTokens } : {}),
+  };
 }
 
 /**

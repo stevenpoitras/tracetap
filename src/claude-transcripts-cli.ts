@@ -4,7 +4,9 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import type { PriceTable } from "./analytics";
 import {
+  IMPORT_FORMAT_VERSION,
   TRANSCRIPT_TRACE_DIR,
   defaultClaudeProjectsDir,
   importTranscript,
@@ -58,6 +60,7 @@ ${colors.yellow}OPTIONS:${colors.reset}
   --db <path>          Index into this store DB (default: ~/.tracetap/index.db)
   --no-index           Write the mirrors only; don't index them
   --force              Rebuild every mirror even when its transcript is unchanged
+  --offline            Don't fetch the live price table (cache or built-ins)
   --quiet              Print the summary only
   --help, -h           Show this help
 
@@ -79,6 +82,7 @@ interface ParsedArgs {
   db?: string;
   index: boolean;
   force: boolean;
+  offline: boolean;
   quiet: boolean;
   help: boolean;
 }
@@ -90,6 +94,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     here: false,
     index: true,
     force: false,
+    offline: false,
     quiet: false,
     help: false,
   };
@@ -130,6 +135,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     } else if (a === "--here") parsed.here = true;
     else if (a === "--no-index") parsed.index = false;
     else if (a === "--force") parsed.force = true;
+    else if (a === "--offline") parsed.offline = true;
     else if (a === "--quiet" || a === "-q") parsed.quiet = true;
     else if (!a.startsWith("-")) {
       if (!sawCommand && (a === "list" || a === "import")) parsed.command = a;
@@ -158,6 +164,11 @@ function sourceSig(ref: TranscriptFileRef): string {
  */
 interface MirrorState {
   sig: string;
+  /**
+   * IMPORT_FORMAT_VERSION the mirror was written with. A mirror from another
+   * version is rebuilt even when its transcript is unchanged; absent = 1.
+   */
+  fmt?: number;
   startedAt: number;
   /** Ids counted by a full (unskipped) import — the cross-file ownership input. */
   ids: string[];
@@ -221,6 +232,13 @@ export async function importTranscripts(opts: {
   force?: boolean;
   index?: boolean;
   dbPath?: string;
+  /**
+   * Price table for the index-time cost estimates (`sessions.cost_usd`). The
+   * CLI passes the live table, as `tracetap index` does; without one the
+   * store falls back to the built-in table, which lags new models — that was
+   * why imported sessions showed no cost.
+   */
+  prices?: PriceTable;
   onSession?: (line: string) => void;
 }): Promise<ImportSummary> {
   const source = path.resolve(opts.source || defaultClaudeProjectsDir());
@@ -296,19 +314,26 @@ export async function importTranscripts(opts: {
     const prev = state.mirrors[name];
     const sig = sourceSig(ref);
     try {
-      if (!opts.force && prev && prev.sig === sig && (prev.empty || fs.existsSync(outPath))) {
+      const current = (prev?.fmt ?? 1) === IMPORT_FORMAT_VERSION;
+      if (!opts.force && prev && current && prev.sig === sig && (prev.empty || fs.existsSync(outPath))) {
         if (prev.empty) summary.empty++;
         else live.push({ ref, name, outPath });
         continue;
       }
       const res = build(ref, outPath);
       if (!res) {
-        state.mirrors[name] = { sig, startedAt: 0, ids: [], ceded: [], empty: true };
+        state.mirrors[name] = { sig, fmt: IMPORT_FORMAT_VERSION, startedAt: 0, ids: [], ceded: [], empty: true };
         summary.empty++;
         continue;
       }
       const { imported, ms, same } = res;
-      state.mirrors[name] = { sig, startedAt: imported.startedAt, ids: imported.countedIds, ceded: [] };
+      state.mirrors[name] = {
+        sig,
+        fmt: IMPORT_FORMAT_VERSION,
+        startedAt: imported.startedAt,
+        ids: imported.countedIds,
+        ceded: [],
+      };
       builtNow.add(name);
       summary.byEntrypoint[imported.meta.entrypoint] = (summary.byEntrypoint[imported.meta.entrypoint] ?? 0) + 1;
       summary.responses += imported.responses;
@@ -367,7 +392,8 @@ export async function importTranscripts(opts: {
 
   if (opts.index !== false && summary.files.length) {
     const { Store } = await import("./store");
-    const store = opts.dbPath ? new Store(opts.dbPath) : new Store();
+    const storeOpts = opts.prices ? { prices: opts.prices } : {};
+    const store = opts.dbPath ? new Store(opts.dbPath, storeOpts) : new Store(undefined, storeOpts);
     try {
       let sessions = 0;
       let steps = 0;
@@ -415,6 +441,13 @@ export async function run(argv: string[]): Promise<void> {
   log(`Output: ${outDir}`, "dim");
   let summary: ImportSummary;
   try {
+    // Same price source as `tracetap index`: fresh cache → network → stale
+    // cache → built-ins, never throwing. Skipped when nothing gets indexed.
+    let prices: PriceTable | undefined;
+    if (args.index) {
+      const { loadPrices } = await import("./pricing");
+      prices = (await loadPrices({ offline: args.offline })).prices;
+    }
     summary = await importTranscripts({
       source,
       outDir,
@@ -422,6 +455,7 @@ export async function run(argv: string[]): Promise<void> {
       force: args.force,
       index: args.index,
       dbPath: args.db,
+      prices,
       onSession: args.quiet ? undefined : (l) => log(l, "dim"),
     });
   } catch (err) {
