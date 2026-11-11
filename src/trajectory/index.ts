@@ -13,12 +13,14 @@ import { AnthropicAdapter } from "./anthropic";
 import { OpenAIAdapter } from "./openai";
 import { GeminiAdapter } from "./gemini";
 import { DevinAdapter } from "./devin";
+import { ClaudeTranscriptAdapter } from "./claude-transcript";
 
 export * from "./types";
 export { AnthropicAdapter } from "./anthropic";
 export { OpenAIAdapter } from "./openai";
 export { GeminiAdapter } from "./gemini";
 export { DevinAdapter } from "./devin";
+export { ClaudeTranscriptAdapter } from "./claude-transcript";
 
 /**
  * Registered wire-format adapters, checked in order. Mirrors hivemind's
@@ -32,6 +34,10 @@ const ADAPTERS: AgentAdapter[] = [
   // ahead of Anthropic guarantees the synthetic `transcript[]` wire is never
   // mistaken for the Messages API's `messages[]`.
   new DevinAdapter(),
+  // Same reasoning as Devin: a strict `provider: "claude-transcript"` marker on
+  // a synthetic wire (imported from Claude Code's local transcripts) that must
+  // be claimed before any shape-based adapter gets a look at it.
+  new ClaudeTranscriptAdapter(),
   new OpenAIAdapter(),
   new GeminiAdapter(),
   new AnthropicAdapter(),

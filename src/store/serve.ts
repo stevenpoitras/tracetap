@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { spawn } from "child_process";
 import { AddressInfo } from "net";
-import { Store, defaultDbPath } from "./index";
+import { Store, defaultDbPath, NOT_SHADOWED_SQL } from "./index";
 import { isNoiseStep } from "./title";
 import type {
   RequestRow,
@@ -286,7 +286,9 @@ function fleetAnalytics(store: Store, prices: PriceTable, filters: AnalyticsFilt
 
   // Requests predate usage events on old logs and can carry ts = 0/NULL, so
   // bound them by the owning session's start time rather than dropping them.
-  const reqWhere: string[] = [];
+  // A transcript import superseded by a wire capture of the same session has
+  // zero tokens already; excluding it also keeps its request COUNT out.
+  const reqWhere: string[] = [NOT_SHADOWED_SQL];
   const reqParams: Record<string, unknown> = {};
   const reqTs = "COALESCE(NULLIF(r.ts, 0), s.started_at)";
   if (typeof since === "number") {
@@ -1285,8 +1287,9 @@ export async function handleRequest(
                   COUNT(*)                                   AS sessions,
                   COALESCE(SUM(cost_usd), 0)                 AS cost,
                   COUNT(DISTINCT agent)                      AS agents
-             FROM sessions
+             FROM sessions s
             WHERE started_at > 0
+              AND ${NOT_SHADOWED_SQL}
               ${agent ? "AND lower(agent) = lower(@agent)" : ""}
             GROUP BY day
             ORDER BY day`,

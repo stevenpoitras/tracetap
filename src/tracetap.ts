@@ -57,6 +57,10 @@ ${colors.yellow}COMMANDS:${colors.reset}
   devin [import|list]         Import Devin CLI (Cognition) sessions from its
                               local store (it can't be proxied). Reconstructs
                               JSONL + HTML and indexes them (\`tracetap devin --help\`)
+  claude-transcripts [import|list]
+                              Import Claude Code's local transcripts
+                              (~/.claude/projects) — covers desktop-app and other
+                              unproxied sessions (\`tracetap claude-transcripts --help\`)
   diff <a.jsonl> <b.jsonl>    Structurally diff two captured runs
                               (system prompt, tool defs, model id, shape)
   index [path...]             Index trace logs into a local cross-session
@@ -94,6 +98,7 @@ ${colors.yellow}OUTPUT:${colors.reset}
   codex  → ./.codex-trace/<basename>.{jsonl,html}
   gemini → ./.gemini-trace/<basename>.{jsonl,html}
   devin  → <workdir>/.devin-trace/<session-id>.{jsonl,html}
+  claude-transcripts → ~/.claude-transcripts-trace/<session-uuid>.jsonl
 
 ${colors.yellow}OPTIONS:${colors.reset}
   --help, -h        Show this help
@@ -158,6 +163,15 @@ async function main(): Promise<void> {
   if (argv[0] === "devin") {
     const { run: runDevin } = await import("./devin-cli");
     await runDevin(argv.slice(1));
+    return;
+  }
+
+  // `claude-transcripts` imports Claude Code's own local transcripts — the way
+  // in for sessions that were never proxied (the desktop app above all).
+  // Lazy-loaded like `devin`: indexing pulls in better-sqlite3.
+  if (argv[0] === "claude-transcripts") {
+    const { run: runTranscripts } = await import("./claude-transcripts-cli");
+    await runTranscripts(argv.slice(1));
     return;
   }
 

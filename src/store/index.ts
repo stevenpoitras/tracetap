@@ -58,7 +58,14 @@ import type { ToolTokenEntry } from "../context/tooltax";
 // ---------------------------------------------------------------------------
 
 /** Directories tracetap writes captured logs into, per harness. */
-export const TRACE_DIRS = [".claude-trace", ".codex-trace", ".gemini-trace", ".devin-trace"];
+export const TRACE_DIRS = [
+  ".claude-trace",
+  ".codex-trace",
+  ".gemini-trace",
+  ".devin-trace",
+  // Imported from Claude Code's own local transcripts (`tracetap claude-transcripts`).
+  ".claude-transcripts-trace",
+];
 
 /** Which per-step text columns a query is matched against. */
 export type SearchField = "message" | "reasoning" | "tool-input" | "tool-output" | "all";
@@ -175,6 +182,13 @@ export interface SessionListFilters {
    * every other harness.
    */
   thread?: "main" | "subagent" | "any";
+  /**
+   * Include transcript-imported sessions that a wire capture of the same
+   * Claude Code session supersedes. Off by default (the wire copy is the one
+   * listed, flagged `hasTranscript`); a lookup by {@link sessionId} always
+   * resolves them.
+   */
+  includeShadowed?: boolean;
   /** Lower bound on the session start time (unix epoch seconds, inclusive). */
   since?: number;
   /** Upper bound on the session start time (unix epoch seconds, inclusive). */
@@ -262,6 +276,22 @@ export interface SessionSummary {
    * nameless is honest where inventing a name would not be.
    */
   unnamedAgentCalls: number;
+  /**
+   * Where the session's data came from: `"wire"` (proxied by a tracer) or
+   * `"transcript"` (imported from Claude Code's local transcript).
+   */
+  origin: "wire" | "transcript";
+  /** Claude Code entrypoint for transcript imports (claude-desktop, cli, ...); "" otherwise. */
+  entrypoint: string;
+  /** Git branch recorded by the transcript; "" when unknown. */
+  gitBranch: string;
+  /**
+   * Transcript import only: a wire capture of the same Claude Code session
+   * exists, so this session's usage is NOT counted (wire wins).
+   */
+  shadowedByWire: boolean;
+  /** Wire session only: a transcript import of the same Claude Code session also exists. */
+  hasTranscript: boolean;
   /**
    * Why this session is in the result set, when the list was filtered by a
    * free-text query — otherwise absent.
@@ -641,6 +671,75 @@ function claudeSessionIdOf(group: PairGroup): string | null {
   return best;
 }
 
+/** Every distinct Claude Code session uuid a group's request headers carried. */
+function claudeSessionIdsOf(group: PairGroup): Set<string> {
+  const out = new Set<string>();
+  for (const pair of group.pairs) {
+    const headers = pair?.request?.headers;
+    if (!headers) continue;
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() !== "x-claude-code-session-id") continue;
+      const s = String(v ?? "").trim();
+      if (/^[0-9a-fA-F-]{36}$/.test(s)) out.add(s);
+    }
+  }
+  return out;
+}
+
+/**
+ * SQL predicate (over alias `s`) excluding transcript imports that a wire
+ * capture supersedes. Their usage is already zeroed; hiding them as well keeps
+ * the conversation from being listed or searched twice.
+ */
+export const NOT_SHADOWED_SQL =
+  "s.session_id NOT IN (SELECT session_id FROM transcript_sessions WHERE shadowed = 1)";
+
+/** Marks hook rows recovered from a transcript (vs. captured by the tap). */
+export const TRANSCRIPT_HOOK_SOURCE = "claude-transcript";
+
+/**
+ * When a conversation has hooks from the live tap, drop the ones recovered from
+ * its transcript: they describe the same fires, and the tap's carry stdin/stdout
+ * previews the transcript summary does not. Transcript rows stand in only when
+ * nothing was tapped.
+ */
+function preferTappedHooks(rows: HookRow[]): HookRow[] {
+  const isTranscript = (r: HookRow) => (r.stdinPreview as any)?.source === TRANSCRIPT_HOOK_SOURCE;
+  if (!rows.some((r) => !isTranscript(r))) return rows;
+  return rows.filter((r) => !isTranscript(r));
+}
+
+interface TranscriptSideMeta {
+  cwd: string;
+  entrypoint: string;
+  title: string;
+  gitBranch: string;
+  version: string;
+  agentId: string | null;
+}
+
+/** Session metadata the transcript importer carried on `request.body.meta` (last pair wins). */
+function transcriptMetaOf(group: PairGroup): TranscriptSideMeta {
+  const last = group.pairs[group.pairs.length - 1];
+  const body = last?.request?.body ?? {};
+  const m = body.meta && typeof body.meta === "object" ? body.meta : {};
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const sub = m.subagent && typeof m.subagent === "object" ? m.subagent : null;
+  let title = str(m.title);
+  if (sub) {
+    const d = str(sub.description) || str(sub.agentType);
+    title = d ? `${d}${title ? " · " + title : ""}` : title;
+  }
+  return {
+    cwd: str(m.cwd),
+    entrypoint: str(m.entrypoint),
+    title,
+    gitBranch: str(m.gitBranch),
+    version: str(m.version),
+    agentId: body.agent_id ? String(body.agent_id) : null,
+  };
+}
+
 /**
  * Heuristic error detection over a step's stitched observation text. The
  * trajectory model does not carry a provider `is_error` flag, so the store
@@ -743,6 +842,8 @@ export class Store {
         DROP TABLE IF EXISTS hooks;
         DROP TABLE IF EXISTS hook_files;
         DROP TABLE IF EXISTS audit_scans;
+        DROP TABLE IF EXISTS transcript_sessions;
+        DROP TABLE IF EXISTS wire_claude_sessions;
       `);
     }
 
@@ -919,6 +1020,31 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_hooks_session ON hooks(session_id, ts);
       CREATE INDEX IF NOT EXISTS idx_hooks_ts ON hooks(ts);
       CREATE INDEX IF NOT EXISTS idx_hooks_source ON hooks(source_path);
+      -- Sessions imported from Claude Code's local transcripts (one row per
+      -- conversation group). Created IF NOT EXISTS, so existing indexes gain it
+      -- without a rebuild. shadowed = a wire capture of the same Claude Code
+      -- session exists, so this row's usage has been zeroed (wire wins).
+      CREATE TABLE IF NOT EXISTS transcript_sessions (
+        session_id        TEXT PRIMARY KEY,
+        source_path       TEXT NOT NULL,
+        claude_session_id TEXT,
+        entrypoint        TEXT NOT NULL DEFAULT '',
+        title             TEXT NOT NULL DEFAULT '',
+        git_branch        TEXT NOT NULL DEFAULT '',
+        cc_version        TEXT NOT NULL DEFAULT '',
+        agent_id          TEXT,
+        shadowed          INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_transcript_source ON transcript_sessions(source_path);
+      CREATE INDEX IF NOT EXISTS idx_transcript_claude ON transcript_sessions(claude_session_id);
+      -- Every Claude Code session uuid a WIRE log carried (any request, not just
+      -- the majority stamp), so a transcript import is shadowed even when its
+      -- conversation was the minority inside a wire group.
+      CREATE TABLE IF NOT EXISTS wire_claude_sessions (
+        claude_session_id TEXT NOT NULL,
+        source_path       TEXT NOT NULL,
+        PRIMARY KEY (claude_session_id, source_path)
+      );
     `);
     this.db
       .prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)")
@@ -963,6 +1089,7 @@ export class Store {
         this.deleteSourceRows(sourcePath);
         this.db.prepare("DELETE FROM files WHERE source_path = ?").run(sourcePath);
       })();
+      this.reconcileTranscriptShadows();
       return { sourcePath, skipped: true, sessions: 0, steps: 0, duplicateOf: canonical };
     }
 
@@ -1015,7 +1142,74 @@ export class Store {
     });
 
     const { sessions, steps } = run();
+    this.reconcileTranscriptShadows();
     return { sourcePath, skipped: false, sessions, steps };
+  }
+
+  /**
+   * Wire data wins: a transcript-imported session whose Claude Code session
+   * uuid also appears in a wire capture has its usage zeroed (requests,
+   * usage_events, session totals) so `usage` and every spend view count the
+   * conversation once. Runs after every index write, in both directions:
+   *
+   * - shadow: a newly indexed wire log (or a re-imported transcript) - zero the
+   *   transcript rows now;
+   * - unshadow: the wire log went away or stopped carrying the uuid - the
+   *   zeroed numbers cannot be restored in place, so the transcript's watermark
+   *   is dropped and the file re-indexed from disk.
+   *
+   * Session-level, not response-level: a wire capture that covered only part
+   * of a session (e.g. `tracetap claude --resume` of a session started
+   * without it) still wins for the whole session.
+   */
+  private reconcileTranscriptShadows(depth = 0): void {
+    const toShadow = this.db
+      .prepare(
+        `SELECT t.session_id AS id FROM transcript_sessions t
+          WHERE t.shadowed = 0 AND t.claude_session_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM wire_claude_sessions w WHERE w.claude_session_id = t.claude_session_id)`,
+      )
+      .all() as { id: string }[];
+    if (toShadow.length) {
+      this.db.transaction(() => {
+        const delUsage = this.db.prepare("DELETE FROM usage_events WHERE session_id = ?");
+        const zeroReq = this.db.prepare(
+          `UPDATE requests SET prompt_tokens = 0, completion_tokens = 0, cache_read = 0,
+                  cache_creation = 0, reasoning_tokens = 0 WHERE session_id = ?`,
+        );
+        const zeroSess = this.db.prepare(
+          `UPDATE sessions SET total_in_tokens = 0, total_out_tokens = 0, cache_read = 0,
+                  cache_creation = 0, cost_usd = 0 WHERE session_id = ?`,
+        );
+        const mark = this.db.prepare("UPDATE transcript_sessions SET shadowed = 1 WHERE session_id = ?");
+        for (const { id } of toShadow) {
+          delUsage.run(id);
+          zeroReq.run(id);
+          zeroSess.run(id);
+          mark.run(id);
+        }
+      })();
+    }
+    if (depth > 0) return;
+    const orphaned = this.db
+      .prepare(
+        `SELECT DISTINCT t.source_path AS p FROM transcript_sessions t
+          WHERE t.shadowed = 1
+            AND NOT EXISTS (SELECT 1 FROM wire_claude_sessions w WHERE w.claude_session_id = t.claude_session_id)`,
+      )
+      .all() as { p: string }[];
+    for (const { p } of orphaned) {
+      this.db.prepare("DELETE FROM files WHERE source_path = ?").run(p);
+      if (fs.existsSync(p)) {
+        try {
+          this.indexFile(p);
+        } catch {
+          // Leave it for the next pass; the dropped watermark guarantees a retry.
+        }
+      } else {
+        this.db.transaction(() => this.deleteSourceRows(p))();
+      }
+    }
   }
 
   private deleteSourceRows(sourcePath: string): void {
@@ -1027,6 +1221,11 @@ export class Store {
     this.db.prepare("DELETE FROM sessions WHERE source_path = ?").run(sourcePath);
     this.db.prepare("DELETE FROM requests WHERE source_path = ?").run(sourcePath);
     this.db.prepare("DELETE FROM usage_events WHERE source_path = ?").run(sourcePath);
+    this.db.prepare("DELETE FROM transcript_sessions WHERE source_path = ?").run(sourcePath);
+    this.db.prepare("DELETE FROM wire_claude_sessions WHERE source_path = ?").run(sourcePath);
+    // Hook rows recovered from a transcript live under the transcript's own
+    // path; tap logs index under theirs, so this never touches tapped hooks.
+    this.db.prepare("DELETE FROM hooks WHERE source_path = ?").run(sourcePath);
     // `prompts` rows are content-addressed and shared across sources; they are
     // never deleted here (a prompt seen once remains a known version).
   }
@@ -1053,6 +1252,12 @@ export class Store {
     const startedAt = Number.isFinite(minTs) ? minTs : 0;
     const endedAt = Number.isFinite(maxTs) ? maxTs : 0;
     const claudeSessionId = claudeSessionIdOf(group);
+    const transcriptMeta = group.adapter.name === "claude-transcript" ? transcriptMetaOf(group) : null;
+    if (transcriptMeta?.cwd && !(projectCwdOverride && projectCwdOverride.trim())) {
+      // The transcript records the real working directory; the JSONL's own
+      // location (a central mirror dir) says nothing about the project.
+      projectCwdOverride = transcriptMeta.cwd;
+    }
 
     // No delete-by-id here: the id carries this source's path, and indexFile
     // already dropped every row from this path. The old delete reached across
@@ -1112,7 +1317,83 @@ export class Store {
 
     this.insertRequests(group, traj, sourcePath, spawns);
     this.insertUsageEvents(traj, sourcePath);
+    if (transcriptMeta) {
+      this.insertTranscriptSide(traj.sessionId, group, sourcePath, claudeSessionId, transcriptMeta);
+    } else {
+      const ins = this.db.prepare(
+        "INSERT OR IGNORE INTO wire_claude_sessions(claude_session_id, source_path) VALUES (?, ?)",
+      );
+      for (const id of claudeSessionIdsOf(group)) ins.run(id, sourcePath);
+    }
     return steps;
+  }
+
+  /** Transcript side rows: session metadata + hook summaries recovered from the transcript. */
+  private insertTranscriptSide(
+    sessionId: string,
+    group: PairGroup,
+    sourcePath: string,
+    claudeSessionId: string | null,
+    meta: TranscriptSideMeta,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO transcript_sessions(
+           session_id, source_path, claude_session_id, entrypoint, title, git_branch,
+           cc_version, agent_id, shadowed
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      )
+      .run(
+        sessionId,
+        sourcePath,
+        claudeSessionId,
+        meta.entrypoint,
+        meta.title,
+        meta.gitBranch,
+        meta.version,
+        meta.agentId,
+      );
+    if (!claudeSessionId) return;
+    // Hook rows join on Claude's session uuid like tapped ones. Previews hold
+    // structure and sizes only; the transcript's hook output is never copied.
+    const ins = this.db.prepare(
+      `INSERT INTO hooks(
+         session_id, ts, event, hook_name, duration_ms, decision,
+         stdin_digest, stdin_preview, stdout_preview, outcome, exit_code,
+         payload_json, source_path
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const pair of group.pairs) {
+      const hooks: any[] = Array.isArray(pair?.request?.body?.hooks) ? pair.request.body.hooks : [];
+      for (const h of hooks) {
+        if (!h || typeof h !== "object") continue;
+        ins.run(
+          claudeSessionId,
+          typeof h.ts === "number" ? h.ts : 0,
+          String(h.event ?? "unknown"),
+          String(h.hookName ?? ""),
+          typeof h.durationMs === "number" ? Math.round(h.durationMs) : null,
+          h.outcome === "blocked" ? "block" : null,
+          "",
+          JSON.stringify({
+            source: TRANSCRIPT_HOOK_SOURCE,
+            ...(meta.cwd ? { cwd: meta.cwd } : {}),
+            ...(h.toolUseId ? { tool_use_id: h.toolUseId } : {}),
+            ...(meta.agentId ? { agent_id: meta.agentId } : {}),
+          }),
+          JSON.stringify({
+            stdoutChars: Number(h.stdoutChars ?? 0),
+            stderrChars: Number(h.stderrChars ?? 0),
+            additionalContextChars: Number(h.additionalContextChars ?? 0),
+            ...(typeof h.hookCount === "number" ? { hookCount: h.hookCount } : {}),
+          }),
+          h.outcome === "error" || h.outcome === "blocked" || h.outcome === "ok" ? h.outcome : null,
+          typeof h.exitCode === "number" ? h.exitCode : null,
+          null,
+          sourcePath,
+        );
+      }
+    }
   }
 
   /** Write one wire-metrics row per captured pair + upsert prompt versions. */
@@ -1340,7 +1621,7 @@ export class Store {
     const match = buildMatchExpr(query, cols);
     if (!match) return [];
 
-    const where: string[] = ["steps_fts MATCH @match"];
+    const where: string[] = ["steps_fts MATCH @match", NOT_SHADOWED_SQL];
     const params: Record<string, unknown> = { match, limit: filters.limit ?? 20 };
 
     if (filters.tool) {
@@ -1447,6 +1728,30 @@ export class Store {
    * envelopes) while keeping the scan bounded on permission-hook fan-outs,
    * where a session can carry hundreds of user steps and no ask at all.
    */
+  /**
+   * Agent-turn and errored-step counts per session, in ONE grouped pass.
+   *
+   * `steps_fts.session_id` is UNINDEXED, so the per-row correlated COUNT this
+   * replaces scanned the whole FTS table twice per listed session. Invisible at
+   * 86 sessions; at 551 (a transcript import of ~95 Claude Code sessions plus
+   * their subagents) the sessions list took 70 s, against 75 ms for one scan.
+   */
+  private stepCountsFor(sessionIds: string[]): Map<string, { turns: number; errors: number }> {
+    const out = new Map<string, { turns: number; errors: number }>();
+    if (!sessionIds.length) return out;
+    const wanted = new Set(sessionIds);
+    const rows = this.db
+      .prepare(
+        `SELECT session_id AS id, SUM(role = 'agent') AS turns, SUM(error_flag = '1') AS errors
+           FROM steps_fts GROUP BY session_id`,
+      )
+      .all() as { id: string; turns: number; errors: number }[];
+    for (const r of rows) {
+      if (wanted.has(String(r.id))) out.set(String(r.id), { turns: Number(r.turns ?? 0), errors: Number(r.errors ?? 0) });
+    }
+    return out;
+  }
+
   private titlesFor(sessionIds: string[]): Map<string, string> {
     const out = new Map<string, string>();
     if (!sessionIds.length) return out;
@@ -1626,6 +1931,9 @@ export class Store {
         "EXISTS (SELECT 1 FROM steps_fts f WHERE f.session_id = s.session_id AND f.error_flag = '1')",
       );
     }
+    if (!filters.sessionId && !filters.includeShadowed) {
+      where.push(NOT_SHADOWED_SQL);
+    }
     if (filters.thread === "main" || filters.thread === "subagent") {
       // A session is subagent traffic when it has requests and NONE of them are
       // main-thread. `is_subagent` is recorded from Claude Code's own marker,
@@ -1675,9 +1983,16 @@ export class Store {
         s.tool_histogram_json AS toolHistogramJson,
         s.source_path         AS sourcePath,
         s.conversation_key    AS conversationKey,
-        (SELECT COUNT(*) FROM steps_fts f WHERE f.session_id = s.session_id AND f.role = 'agent') AS turns,
-        (SELECT COUNT(*) FROM steps_fts f WHERE f.session_id = s.session_id AND f.error_flag = '1') AS errorCount
+        t.session_id          AS transcriptId,
+        t.entrypoint          AS entrypoint,
+        t.git_branch          AS gitBranch,
+        t.title               AS transcriptTitle,
+        t.shadowed            AS shadowed,
+        (CASE WHEN t.session_id IS NULL AND s.claude_session_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM transcript_sessions t2 WHERE t2.claude_session_id = s.claude_session_id)
+          THEN 1 ELSE 0 END) AS hasTranscript
       FROM sessions s
+      LEFT JOIN transcript_sessions t ON t.session_id = s.session_id
       ${whereSql}
       ORDER BY s.${sortCol} ${order}
       ${limitSql}
@@ -1687,6 +2002,7 @@ export class Store {
     const ids = rows.map((r) => String(r.sessionId));
     const titles = this.titlesFor(ids);
     const casts = this.agentCastFor(ids);
+    const counts = this.stepCountsFor(ids);
     // Only when a query is in play: an unfiltered list has no match to explain,
     // and this is a second FTS pass nobody should pay for by default.
     const matches =
@@ -1718,13 +2034,21 @@ export class Store {
         toolHistogram,
         // Falls back to what the session DID when nothing was typed in it —
         // see activityTitle. Still "" when it also called no tools.
-        title: titles.get(String(r.sessionId)) || activityTitle(toolHistogram),
+        title:
+          String(r.transcriptTitle ?? "") ||
+          titles.get(String(r.sessionId)) ||
+          activityTitle(toolHistogram),
         agentCast: casts.get(String(r.sessionId))?.cast ?? [],
         unnamedAgentCalls: casts.get(String(r.sessionId))?.unnamed ?? 0,
+        origin: r.transcriptId ? "transcript" : "wire",
+        entrypoint: String(r.entrypoint ?? ""),
+        gitBranch: String(r.gitBranch ?? ""),
+        shadowedByWire: Number(r.shadowed ?? 0) === 1,
+        hasTranscript: Number(r.hasTranscript ?? 0) === 1,
         sourcePath: String(r.sourcePath ?? ""),
         conversationKey: String(r.conversationKey ?? r.sessionId),
-        turns: Number(r.turns ?? 0),
-        errorCount: Number(r.errorCount ?? 0),
+        turns: counts.get(String(r.sessionId))?.turns ?? 0,
+        errorCount: counts.get(String(r.sessionId))?.errors ?? 0,
         ...(match ? { match } : {}),
       };
     });
@@ -2262,6 +2586,7 @@ export class Store {
         `SELECT s.session_id AS id
          FROM sessions s
          WHERE s.claude_session_id = ?
+           AND ${NOT_SHADOWED_SQL}
          ORDER BY (SELECT count(*) FROM requests r
                     WHERE r.session_id = s.session_id AND r.is_subagent = 0) DESC,
                   s.started_at ASC,
@@ -2292,7 +2617,7 @@ export class Store {
          FROM hooks WHERE session_id = ? ORDER BY ts, id`,
       )
       .all(claudeSessionId) as any[];
-    return this.fenceHookRows(rows.map(hookRowFromDb), this.getSession(sessionId)?.projectCwd);
+    return this.fenceHookRows(preferTappedHooks(rows.map(hookRowFromDb)), this.getSession(sessionId)?.projectCwd);
   }
 
   /**
@@ -2378,7 +2703,7 @@ export class Store {
     // Fenced on BOTH arms now. `claude_session_id` is a majority vote over a
     // group that can span conversations, so identity is strong evidence, not
     // proof — and a hook naming a different project is proof against it.
-    const rows: HookRow[] = this.fenceHookRows(byId.map(hookRowFromDb), session?.projectCwd);
+    const rows: HookRow[] = this.fenceHookRows(preferTappedHooks(byId.map(hookRowFromDb)), session?.projectCwd);
     const timeRows: HookRow[] = this.fenceHookRows(byTime.map(hookRowFromDb), session?.projectCwd);
     const hookSessions = new Set(timeRows.map((r) => r.sessionId));
     if (hookSessions.size > 1) {

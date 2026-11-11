@@ -316,6 +316,20 @@
     var a = esc(agent || "?");
     return '<span class="pill agent-' + a + '">' + a + "</span>";
   }
+  /**
+   * Where a session's data came from, as a short suffix for the meta line.
+   * Transcript imports name their Claude Code entrypoint (claude-desktop, cli,
+   * ...) so app and terminal sessions can be told apart; a wire session that
+   * also has a transcript says so, since only the wire copy is counted.
+   */
+  function originNote(s) {
+    if (!s) return "";
+    if (s.origin === "transcript") {
+      return " · transcript" + (s.entrypoint ? " · " + esc(s.entrypoint) : "") +
+        (s.gitBranch ? " · " + esc(s.gitBranch) : "");
+    }
+    return s.hasTranscript ? " · wire (+transcript)" : "";
+  }
 
   /**
    * Every agent that ran inside a session, as one plain-text roster.
@@ -3026,7 +3040,7 @@
           '<td class="s-title"><span class="s-ask">' +
           esc(s.title || "untitled session") +
           '</span><span class="s-meta">' +
-          esc(s.model || "—") +
+          esc(s.model || "—") + originNote(s) +
           "</span>" +
           matchLine(s.match) +
           "</td>" +
@@ -3310,7 +3324,7 @@
       esc(s.title || "untitled session") +
       "</h1>" +
       '<span class="dim">' +
-      agentPill(s.agent) + " " + esc(s.model) + " · " +
+      agentPill(s.agent) + " " + esc(s.model) + originNote(s) + " · " +
       esc(s.projectCwd) +
       " · " +
       fmtTime(s.startedAt) +
@@ -6866,7 +6880,7 @@
           '"><td class="s-title"><span class="s-ask">' +
           esc(s.title || "untitled session") +
           '</span><span class="s-meta">' +
-          esc(s.model || "—") +
+          esc(s.model || "—") + originNote(s) +
           "</span></td>" +
           '<td class="dim" title="' +
           esc(s.projectCwd) +
